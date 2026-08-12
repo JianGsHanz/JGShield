@@ -1,0 +1,633 @@
+# -*- coding: utf-8 -*-
+"""
+二进制 AndroidManifest.xml (AXML 格式) 编辑器。
+
+对外接口：
+    get_orig_app_class(manifest_data: bytes) -> str | None
+    patch_manifest(manifest_data: bytes, orig_app_class: str,
+                   shell_app_class: str = "com.jiagu.shield.ShieldApplication") -> bytes
+"""
+
+import struct
+
+
+# ─── 常量 ──────────────────────────────────────────────────────────────────────
+
+# Chunk 类型
+CHUNK_STRING_POOL     = 0x001C0001
+CHUNK_RESOURCE_MAP    = 0x00080180
+CHUNK_START_NAMESPACE = 0x00100100
+CHUNK_END_NAMESPACE   = 0x00100101
+CHUNK_START_ELEMENT   = 0x00100102
+CHUNK_END_ELEMENT     = 0x00100103
+
+# Res_value dataType
+TYPE_NULL       = 0x00
+TYPE_REFERENCE  = 0x01
+TYPE_STRING     = 0x03
+TYPE_INT_HEX    = 0x10
+
+# 文件头 magic
+AXML_MAGIC = 0x00080003  # bytes: 03 00 08 00
+
+# 命名空间 URI
+ANDROID_NS_URI = "http://schemas.android.com/apk/res/android"
+
+# Sentinel 值
+NO_ENTRY = 0xFFFFFFFF  # -1 的无符号表示
+
+
+# ─── 字符串池工具 ─────────────────────────────────────────────────────────────
+
+def _parse_string_pool(data, pool_start):
+    """
+    解析字符串池 chunk。
+
+    参数:
+        data: 完整文件数据 (bytes/bytearray)
+        pool_start: pool chunk 在 data 中的绝对偏移
+
+    返回:
+        dict: {
+            'strings':          [str, ...],          # 解码后的字符串列表
+            'is_utf8':          bool,                # True=UTF-8, False=UTF-16
+            'string_count':     int,
+            'style_count':      int,
+            'strings_start':    int,                 # stringsStart 字段值
+            'styles_start':     int,                 # stylesStart 字段值
+            'chunk_size':       int,                 # pool 总大小
+            'flag':             int,                 # flags 原始值
+            'string_data_offset': int,               # 字符串数据区在 data 中的绝对偏移
+            'string_ends':      [int, ...],           # 每个字符串在 data 中的绝对结束偏移(NUL 之后)
+        }
+    """
+    chunk_type = struct.unpack_from('<I', data, pool_start)[0]
+    if chunk_type != CHUNK_STRING_POOL:
+        raise ValueError(f"期望 STRING_POOL (0x001C0001)，得到 0x{chunk_type:08X}")
+
+    chunk_size     = struct.unpack_from('<I', data, pool_start + 4)[0]
+    string_count   = struct.unpack_from('<I', data, pool_start + 8)[0]
+    style_count    = struct.unpack_from('<I', data, pool_start + 12)[0]
+    flag           = struct.unpack_from('<I', data, pool_start + 16)[0]
+    strings_start  = struct.unpack_from('<I', data, pool_start + 20)[0]
+    styles_start   = struct.unpack_from('<I', data, pool_start + 24)[0]
+
+    is_utf8 = bool(flag & 0x0100)
+
+    # 偏移数组地址
+    offsets_start = pool_start + 28  # 8(hdr: type+size) + 5*4(stringCount..stylesStart)
+    string_data_abs = pool_start + strings_start
+
+    strings = []
+    string_ends_cache = []  # 每个字符串数据的结束绝对位置 (含 NUL 终止符之后的位置)
+
+    for i in range(string_count):
+        offset_in_pool = struct.unpack_from('<I', data, offsets_start + i * 4)[0]
+        abs_pos = pool_start + strings_start + offset_in_pool
+
+        if is_utf8:
+            decoded, next_pos = _decode_utf8_string(data, abs_pos)
+        else:
+            decoded, next_pos = _decode_utf16_string(data, abs_pos)
+
+        strings.append(decoded)
+        string_ends_cache.append(next_pos)
+
+    return {
+        'strings':            strings,
+        'is_utf8':            is_utf8,
+        'string_count':       string_count,
+        'style_count':        style_count,
+        'strings_start':      strings_start,
+        'styles_start':       styles_start,
+        'chunk_size':         chunk_size,
+        'flag':               flag,
+        'string_data_offset': string_data_abs,
+        'string_ends':        string_ends_cache,
+    }
+
+
+def _decode_utf8_string(data, abs_pos):
+    """解码 UTF-8 编码的字符串。返回 (str, 下一个字符串起始位置)。"""
+    b0 = data[abs_pos]
+    if b0 >= 0x80:
+        b1 = data[abs_pos + 1]
+        length = ((b0 & 0x7F) << 8) | b1
+        str_start = abs_pos + 2
+    else:
+        length = b0
+        str_start = abs_pos + 1
+    # 末尾有 NUL 终止符
+    end = str_start + length
+    return data[str_start:end].decode('utf-8'), end + 1
+
+
+def _decode_utf16_string(data, abs_pos):
+    """解码 UTF-16 编码的字符串。返回 (str, 下一个字符串起始位置)。"""
+    length = struct.unpack_from('<H', data, abs_pos)[0]
+    str_start = abs_pos + 2
+    utf16_data = data[str_start:str_start + length * 2]
+    # 末尾有 2 字节 NUL 终止符
+    return utf16_data.decode('utf-16-le'), str_start + length * 2 + 2
+
+
+def _encode_utf8_string(s):
+    """将 Python 字符串编码为字符串池的 UTF-8 格式。"""
+    utf8_bytes = s.encode('utf-8')
+    utf8_len = len(utf8_bytes)
+    if utf8_len > 0x7F:
+        length_bytes = bytes([(utf8_len >> 8) | 0x80, utf8_len & 0xFF])
+    else:
+        length_bytes = bytes([utf8_len])
+    return length_bytes + utf8_bytes + b'\x00'
+
+
+def _encode_utf16_string(s):
+    """将 Python 字符串编码为字符串池的 UTF-16 格式。"""
+    utf16_bytes = s.encode('utf-16-le')
+    char_count = len(s)  # 字符数，不是字节数
+    return struct.pack('<H', char_count) + utf16_bytes + b'\x00\x00'
+
+
+def _add_string_to_pool(data, pool_start, new_str, strings, is_utf8):
+    """
+    向字符串池追加新字符串。修改 data bytearray。
+
+    参数:
+        data:       bytearray，完整文件数据（原地修改）
+        pool_start: pool chunk 在 data 中的绝对偏移
+        new_str:    要添加的新字符串
+        strings:    当前已知的字符串列表（函数调用后会更新）
+        is_utf8:    pool 编码标志
+
+    返回:
+        int: 新字符串在池中的索引
+    """
+    # 检查是否已存在
+    for i, s in enumerate(strings):
+        if s == new_str:
+            return i
+
+    string_count = struct.unpack_from('<I', data, pool_start + 8)[0]
+    style_count  = struct.unpack_from('<I', data, pool_start + 12)[0]
+    strings_start = struct.unpack_from('<I', data, pool_start + 20)[0]
+    styles_start  = struct.unpack_from('<I', data, pool_start + 24)[0]
+
+    # 编码新字符串
+    if is_utf8:
+        encoded = _encode_utf8_string(new_str)
+    else:
+        encoded = _encode_utf16_string(new_str)
+
+    # 计算当前字符串数据区长度
+    if style_count > 0:
+        str_data_end = styles_start
+    else:
+        str_data_end = struct.unpack_from('<I', data, pool_start + 4)[0]  # chunkSize
+
+    str_data_len = str_data_end - strings_start
+    new_offset = str_data_len
+
+    # 插入新 offset 条目到 offset 数组末尾
+    insert_pos = pool_start + 28 + string_count * 4
+    data[insert_pos:insert_pos] = struct.pack('<I', new_offset)
+
+    # 偏移数组多 4 字节 → stringsStart / stylesStart 各 +4
+    struct.pack_into('<I', data, pool_start + 20, strings_start + 4)
+    struct.pack_into('<I', data, pool_start + 24, styles_start + 4)
+
+    # 在字符串数据区末尾追加编码数据
+    str_data_insert = pool_start + strings_start + 4 + str_data_len
+    data[str_data_insert:str_data_insert] = encoded
+
+    # stylesStart 因尾部追加再后移
+    struct.pack_into('<I', data, pool_start + 24, styles_start + 4 + len(encoded))
+
+    # 更新 string_count
+    struct.pack_into('<I', data, pool_start + 8, string_count + 1)
+
+    # 更新 chunk_size
+    old_chunk_size = struct.unpack_from('<I', data, pool_start + 4)[0]
+    new_chunk_size = old_chunk_size + 4 + len(encoded)
+    struct.pack_into('<I', data, pool_start + 4, new_chunk_size)
+
+    strings.append(new_str)
+    return string_count
+
+
+def _find_string_index(strings, target):
+    """在字符串列表中查找目标字符串，返回索引或 -1。"""
+    for i, s in enumerate(strings):
+        if s == target:
+            return i
+    return -1
+
+
+# ─── XML 块扫描 ───────────────────────────────────────────────────────────────
+
+def _iter_chunks(data, start_offset, end_offset=None):
+    """
+    遍历 data 中的 chunk。每个 chunk 必须从 start_offset 开始连续排列。
+
+    Yields: (chunk_type, chunk_start, chunk_size)
+    """
+    if end_offset is None:
+        end_offset = len(data)
+
+    pos = start_offset
+    while pos + 8 <= end_offset:
+        chunk_type = struct.unpack_from('<I', data, pos)[0]
+        chunk_size = struct.unpack_from('<I', data, pos + 4)[0]
+        if chunk_size < 8:
+            break
+        yield chunk_type, pos, chunk_size
+        pos += chunk_size
+
+
+def _find_xml_start(data, pool_start):
+    """找到 XML 树起始位置（跳过 StringPool 和可选的 ResourceMap）。"""
+    pool_chunk_size = struct.unpack_from('<I', data, pool_start + 4)[0]
+    pos = pool_start + pool_chunk_size
+
+    # 跳过可选的 ResourceMap chunk
+    if pos + 8 <= len(data):
+        chunk_type = struct.unpack_from('<I', data, pos)[0]
+        if chunk_type == CHUNK_RESOURCE_MAP:
+            chunk_size = struct.unpack_from('<I', data, pos + 4)[0]
+            pos += chunk_size
+    return pos
+
+
+# ─── StartElement 解析 / 构造 ─────────────────────────────────────────────────
+
+def _parse_start_element(data, chunk_start):
+    """
+    解析一个 StartElement chunk。
+
+    chunk_start 指向 chunk 的 type 字段。
+
+    返回:
+        dict: {
+            'ns': int,                # 元素命名空间索引
+            'name': int,              # 元素名索引
+            'attribute_count': int,
+            'attributes': [
+                {
+                    'ns': int,        # 属性命名空间索引
+                    'name': int,      # 属性名索引
+                    'raw_value': int, # 原始字符串值索引
+                    'data_type': int, # Res_value dataType
+                    'data': int,      # Res_value data
+                }, ...
+            ],
+            'chunk_size': int,
+            'line': int,
+        }
+    """
+    chunk_size = struct.unpack_from('<I', data, chunk_start + 4)[0]
+    line       = struct.unpack_from('<I', data, chunk_start + 8)[0]
+    # comment 在 offset 12
+    ns_val   = struct.unpack_from('<I', data, chunk_start + 16)[0]
+    name_val = struct.unpack_from('<I', data, chunk_start + 20)[0]
+    attr_start = struct.unpack_from('<H', data, chunk_start + 24)[0]
+    attr_size  = struct.unpack_from('<H', data, chunk_start + 26)[0]
+    attr_count = struct.unpack_from('<H', data, chunk_start + 28)[0]
+
+    attributes = []
+
+    # attr_start 是从 ns 字段开始的偏移
+    # ns 字段在 chunk_start + 16
+    # 所以属性从 chunk_start + 16 + attr_start 开始
+    attr_pos = chunk_start + 16 + attr_start
+
+    for _ in range(attr_count):
+        attr_ns   = struct.unpack_from('<I', data, attr_pos)[0]
+        attr_name = struct.unpack_from('<I', data, attr_pos + 4)[0]
+        raw_value = struct.unpack_from('<I', data, attr_pos + 8)[0]
+        # Res_value: size(uint16) + res0(uint8) + dataType(uint8) + data(uint32)
+        rv_size, rv_res0, data_type, rv_data = struct.unpack_from('<HBB I', data, attr_pos + 12)
+
+        attributes.append({
+            'ns':        attr_ns,
+            'name':      attr_name,
+            'raw_value': raw_value,
+            'data_type': data_type,
+            'data':      rv_data,
+        })
+        attr_pos += attr_size
+
+    return {
+        'ns':              ns_val,
+        'name':            name_val,
+        'attribute_count': attr_count,
+        'attributes':      attributes,
+        'chunk_size':      chunk_size,
+        'line':            line,
+    }
+
+
+def _pack_start_element_chunk(elem_ns, elem_name, attributes, line=0):
+    """
+    构造一个完整的 StartElement chunk（含 8 字节 chunk header）。
+
+    参数:
+        elem_ns:    元素命名空间索引（-1 = NO_ENTRY）
+        elem_name:  元素名索引
+        attributes: [{ns, name, raw_value, data_type, data}, ...]
+        line:       行号
+
+    返回:
+        bytes: 完整的 chunk 数据
+    """
+    attr_count = len(attributes)
+    attr_size = 20
+    attr_start = 20  # 从 ns 字段算起的偏移（标准值）
+
+    # chunk body 大小: 28 字节头 + 属性区
+    body_size = 28 + attr_count * attr_size
+    chunk_size = 8 + body_size
+
+    buf = bytearray()
+    # Chunk header
+    buf += struct.pack('<II', CHUNK_START_ELEMENT, chunk_size)
+    # line, comment
+    buf += struct.pack('<II', line, NO_ENTRY)
+    # ns, name
+    buf += struct.pack('<II', elem_ns, elem_name)
+    # attributeStart, attributeSize, attributeCount, idIndex, classIndex, styleIndex
+    buf += struct.pack('<HHHHHH', attr_start, attr_size, attr_count, 0xFFFF, 0xFFFF, 0xFFFF)
+
+    for attr in attributes:
+        buf += struct.pack('<III', attr['ns'], attr['name'], attr['raw_value'])
+        buf += struct.pack('<HBB I', 8, 0, attr['data_type'], attr['data'])
+
+    return bytes(buf)
+
+
+def _pack_end_element_chunk(elem_ns, elem_name, line=0):
+    """
+    构造 EndElement chunk。
+
+    返回:
+        bytes: 完整的 chunk 数据
+    """
+    chunk_size = 8 + 16  # header(8) + 4*uint32(16)
+    buf = bytearray()
+    buf += struct.pack('<II', CHUNK_END_ELEMENT, chunk_size)
+    buf += struct.pack('<II', line, NO_ENTRY)
+    buf += struct.pack('<II', elem_ns, elem_name)
+    return bytes(buf)
+
+
+# ─── 查找 application 元素 ────────────────────────────────────────────────────
+
+def _find_application_in_chunks(data, xml_start, strings):
+    """
+    扫描 XML 块，查找名称 == 'application' 的 StartElement。
+
+    返回:
+        (chunk_start, parsed_element_dict) 或 (None, None)
+    """
+    for chunk_type, chunk_start, chunk_size in _iter_chunks(data, xml_start):
+        if chunk_type == CHUNK_START_ELEMENT:
+            name_idx = struct.unpack_from('<I', data, chunk_start + 20)[0]
+            if name_idx < len(strings) and strings[name_idx] == 'application':
+                elem = _parse_start_element(data, chunk_start)
+                return chunk_start, elem
+    return None, None
+
+
+# ─── 工具 ─────────────────────────────────────────────────────────────────────
+
+def _update_file_size(data, new_size):
+    """更新文件头中的 file_size 字段（offset 4）。"""
+    struct.pack_into('<I', data, 4, new_size)
+
+
+def _update_chunk_size(data, chunk_start, new_size):
+    """更新某个 chunk 的 chunkSize 字段（offset +4 相对 chunk 头）。"""
+    struct.pack_into('<I', data, chunk_start + 4, new_size)
+
+
+def _validate_axml(data):
+    """验证文件头是否为 AXML 格式。"""
+    if len(data) < 8:
+        raise ValueError("文件过小，不是有效的 AXML 文件")
+    magic = struct.unpack_from('<I', data, 0)[0]
+    if magic != AXML_MAGIC:
+        raise ValueError(f"AXML magic 不匹配: 期望 0x00080003, 得到 0x{magic:08X}")
+
+
+# ─── 公开接口 ─────────────────────────────────────────────────────────────────
+
+def get_orig_app_class(manifest_data):
+    """
+    从二进制 AndroidManifest.xml 中提取原始 application 类的 android:name。
+
+    参数:
+        manifest_data: APK 中读取的原始二进制 Manifest 数据 (bytes)
+
+    返回:
+        str | None: application 类名，如果未找到 attribute 则返回 None
+    """
+    _validate_axml(manifest_data)
+    data = manifest_data  # 不修改，用 bytes 即可
+
+    pool_info = _parse_string_pool(data, 8)
+    strings = pool_info['strings']
+
+    android_uri_idx = _find_string_index(strings, ANDROID_NS_URI)
+    name_attr_idx   = _find_string_index(strings, 'name')
+
+    xml_start = _find_xml_start(data, 8)
+    _, app_elem = _find_application_in_chunks(data, xml_start, strings)
+
+    if app_elem is None:
+        return None
+
+    for attr in app_elem['attributes']:
+        # 检查属性是否为 android:name
+        is_android_name = (
+            attr['ns'] == android_uri_idx and
+            attr['name'] == name_attr_idx
+        )
+        if is_android_name:
+            if attr['data_type'] == TYPE_STRING and attr['data'] < len(strings):
+                return strings[attr['data']]
+            elif attr['data_type'] == TYPE_REFERENCE:
+                # 资源引用 → 无法直接获取类名，返回 None
+                return None
+            elif attr['raw_value'] != NO_ENTRY and attr['raw_value'] < len(strings):
+                return strings[attr['raw_value']]
+            return None
+
+    return None
+
+
+def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shield.ShieldApplication"):
+    """
+    修改二进制 AndroidManifest.xml：
+
+    1. 将 <application android:name="原始类名"> 改为 shell_app_class
+    2. 在 <application> 内注入 <meta-data android:name="JG_ORIG_APP"
+       android:value="原始类名"/>
+
+    参数:
+        manifest_data:  原始二进制 Manifest 数据 (bytes)
+        orig_app_class: 原始 Application 类名 (字符串)
+        shell_app_class: 要替换为的壳 Application 类名
+
+    返回:
+        bytes: 修改后的 Manifest 数据
+    """
+    _validate_axml(manifest_data)
+
+    data = bytearray(manifest_data)
+
+    # 1. 解析字符串池 (总是在 offset 8)
+    pool_start = 8
+    # 确认 offset 8 处确实是字符串池
+    if struct.unpack_from('<I', data, pool_start)[0] != CHUNK_STRING_POOL:
+        raise ValueError(f"偏移 8 处不是字符串池 chunk")
+    pool_info = _parse_string_pool(data, pool_start)
+    strings = pool_info['strings']
+    is_utf8 = pool_info['is_utf8']
+
+    android_uri_idx = _find_string_index(strings, ANDROID_NS_URI)
+    name_attr_idx   = _find_string_index(strings, 'name')
+    value_attr_idx  = _find_string_index(strings, 'value')
+    meta_data_idx   = _find_string_index(strings, 'meta-data')
+
+    # 2. 找到 application 元素
+    xml_start = _find_xml_start(data, 8)
+    app_chunk_start, app_elem = _find_application_in_chunks(data, xml_start, strings)
+
+    if app_elem is None:
+        raise ValueError("未找到 <application> 元素")
+
+    # 3. 确定需要新增的字符串
+    new_strings_needed = []
+    for s in [shell_app_class, orig_app_class, 'com.jiagu.orig_app']:
+        if _find_string_index(strings, s) == -1:
+            new_strings_needed.append(s)
+    if _find_string_index(strings, 'name') == -1:
+        new_strings_needed.append('name')
+    if _find_string_index(strings, 'value') == -1:
+        new_strings_needed.append('value')
+    if _find_string_index(strings, 'meta-data') == -1:
+        new_strings_needed.append('meta-data')
+
+    # 4. 向字符串池追加新字符串（在 XML 修改前完成，避免偏移追踪困扰）
+    for s in new_strings_needed:
+        _add_string_to_pool(data, pool_start, s, strings, is_utf8)
+
+    # 4.5 一次性补齐字符串池 chunk 到 4 字节对齐（AXML 要求）
+    sp_chunk_size = struct.unpack_from('<I', data, pool_start + 4)[0]
+    while sp_chunk_size % 4 != 0:
+        data.insert(pool_start + sp_chunk_size, 0)
+        sp_chunk_size += 1
+    struct.pack_into('<I', data, pool_start + 4, sp_chunk_size)
+
+    # 重新获取更新后的字符串索引
+    android_uri_idx = _find_string_index(strings, ANDROID_NS_URI)
+    name_attr_idx   = _find_string_index(strings, 'name')
+    value_attr_idx  = _find_string_index(strings, 'value')
+    meta_data_idx   = _find_string_index(strings, 'meta-data')
+    shell_class_idx = _find_string_index(strings, shell_app_class)
+    orig_class_idx  = _find_string_index(strings, orig_app_class)
+    jg_orig_idx     = _find_string_index(strings, 'com.jiagu.orig_app')
+
+    # 重新定位 application（字符串池修改后位置可能后移）
+    xml_start = _find_xml_start(data, 8)
+    app_chunk_start, app_elem = _find_application_in_chunks(data, xml_start, strings)
+    if app_elem is None:
+        raise ValueError("字符串池修改后未找到 <application> 元素")
+
+    # 5. 修改 application 的 android:name 属性
+    attr_pos = app_chunk_start + 16 + 20  # ns(offset 16) + attrStart(20)
+    modified = False
+
+    for i in range(app_elem['attribute_count']):
+        attr_ns   = struct.unpack_from('<I', data, attr_pos)[0]
+        attr_name = struct.unpack_from('<I', data, attr_pos + 4)[0]
+
+        if attr_ns == android_uri_idx and attr_name == name_attr_idx:
+            # 修改 raw_value（原始字符串值索引）
+            struct.pack_into('<I', data, attr_pos + 8, shell_class_idx)
+            # 修改 Res_value: dataType=TYPE_STRING, data=shell_class_idx
+            struct.pack_into('<HBB I', data, attr_pos + 12, 8, 0, TYPE_STRING, shell_class_idx)
+            modified = True
+            break
+
+        attr_pos += 20
+
+    # 记录 application chunk 的增长量，用于后续更新 chunkSize
+    app_size_growth = 0
+
+    if not modified:
+        # 没有 android:name 属性 → 需要新建该属性并添加到元素中
+        new_attr = struct.pack('<III', android_uri_idx, name_attr_idx, shell_class_idx)
+        new_attr += struct.pack('<HBB I', 8, 0, TYPE_STRING, shell_class_idx)
+
+        # 插入位置：最后一个属性之后
+        insert_pos = app_chunk_start + 16 + 20 + app_elem['attribute_count'] * 20
+        data[insert_pos:insert_pos] = new_attr
+
+        # 更新 attribute_count
+        struct.pack_into('<H', data, app_chunk_start + 28, app_elem['attribute_count'] + 1)
+        app_elem['attribute_count'] += 1
+        app_size_growth += 20
+
+    # 6. 构造 meta-data 子元素
+    meta_attrs = [
+        {
+            'ns':        android_uri_idx,
+            'name':      name_attr_idx,
+            'raw_value': jg_orig_idx,
+            'data_type': TYPE_STRING,
+            'data':      jg_orig_idx,
+        },
+        {
+            'ns':        android_uri_idx,
+            'name':      value_attr_idx,
+            'raw_value': orig_class_idx,
+            'data_type': TYPE_STRING,
+            'data':      orig_class_idx,
+        },
+    ]
+
+    meta_start_chunk = _pack_start_element_chunk(
+        elem_ns=NO_ENTRY,
+        elem_name=meta_data_idx,
+        attributes=meta_attrs,
+        line=app_elem['line'],
+    )
+    meta_end_chunk = _pack_end_element_chunk(
+        elem_ns=NO_ENTRY,
+        elem_name=meta_data_idx,
+        line=app_elem['line'],
+    )
+
+    insertion = meta_start_chunk + meta_end_chunk
+    insertion_size = len(insertion)
+    # 注意：meta-data 是独立的子 chunk，不计入 application StartElement 的 chunkSize
+    # app_size_growth 仅记录 application 元素自身的变化（如新增属性），不包含子元素
+
+    # 插入位置：application StartElement 之后（属性区末尾）
+    app_attr_end = app_chunk_start + 16 + 20 + app_elem['attribute_count'] * 20
+    data[app_attr_end:app_attr_end] = insertion
+
+    # 7. 更新大小（AXML 要求所有 chunk 和文件大小均为 4 字节对齐）
+    new_app_size = app_elem['chunk_size'] + app_size_growth
+    #   应用 chunk 内部补齐
+    while new_app_size % 4 != 0:
+        data.insert(app_chunk_start + new_app_size, 0)
+        new_app_size += 1
+    _update_chunk_size(data, app_chunk_start, new_app_size)
+
+    #   文件尾部补齐
+    while len(data) % 4 != 0:
+        data.append(0)
+    _update_file_size(data, len(data))
+
+    return bytes(data)

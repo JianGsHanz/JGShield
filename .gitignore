@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Build / dist artifacts (regenerable) ----
+_build_venv/
+_noop_sc/
+build/
+dist/
+output/
+
+# ---- Temp & scratch ----
+temp/
+work/
+_batch_b2.txt
+
+# ---- Test samples (regenerable via gen_samples.py) ----
+test_apks/
+gen_samples/
+
+# ---- External tool binaries (not source; place locally to run harden.py) ----
+tools/
+
+# ---- Keystores (never commit keys) ----
+*.jks
+*.keystore
+
+# ---- WorkBuddy project data ----
+.workbuddy/
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini
+ehthumbs.db
