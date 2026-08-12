@@ -28,6 +28,9 @@ import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import java.net.InetSocketAddress;
+import java.net.Socket;
+
 import javax.crypto.Cipher;
 import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
@@ -52,6 +55,15 @@ public class ShieldApplication extends Application {
     private static final String MAGIC = "JGS1";
     private static final String META_ORIG = "com.jiagu.orig_app";
     static final String PAYLOAD_ENTRY = "jg";
+
+    // ===== 反篡改（保命版）开关 =====
+    // 改为 false 并重新编译 stub.dex 即可完全关闭反篡改；响应方式 / 轮询间隔同理。
+    static final boolean ANTI_TAMPER_ENABLED = true;
+    // 发现篡改时的响应："exit"=静默退出进程（默认，仅在被篡改环境触发）；"none"=仅打印日志便于调试
+    static final String ANTI_TAMPER_RESPONSE = "exit";
+    // 后台轮询间隔（毫秒）
+    static final long ANTI_TAMPER_INTERVAL_MS = 2000;
+
     private Application realApp;
     private boolean realOnCreateCalled = false;
     private File shellDir;
@@ -67,6 +79,15 @@ public class ShieldApplication extends Application {
             Log.e(TAG, "init failed", t);
             if (realApp == null) {
                 throw new RuntimeException("JG init failed: " + t, t);
+            }
+        }
+
+        // 启动反篡改后台守护线程：与加载器完全隔离，异常不向外传播，绝不导致 App 闪退
+        if (ANTI_TAMPER_ENABLED) {
+            try {
+                AntiTamper.start();
+            } catch (Throwable t) {
+                Log.w(TAG, "anti-tamper start skipped", t);
             }
         }
     }
@@ -352,6 +373,154 @@ class AntiDebug {
             }
         }
         br.close();
+    }
+}
+
+/**
+ * 反篡改守护（保命版，纯只读检测，与加载器物理隔离）
+ *
+ * 设计红线（保证不引入新崩溃）：
+ *   1. 仅做只读检测：扫 /proc/self/maps、探测 frida 默认端口、检查 re.frida.server 文件、
+ *      读 /proc/self/status 的 TracerPid。任何检测异常都被吞掉，绝不外抛。
+ *   2. 运行在独立守护线程，不阻塞启动、不进入 DEX 加载路径。
+ *   3. 后台周期轮询（不只启动那一次），可捕获延迟注入的 Frida。
+ *   4. 响应（退出/降级）只在“确认被篡改”时触发；干净设备永远走不到这一步。
+ *
+ * 说明：本版不做 DEX 分段解密+清零（会动加载器，风险高），故不能“绝对”防内存 dump，
+ *      只能屏蔽用于 dump 的主流框架（Frida/Substrate/Xposed 等）。要更强需后续独立验证。
+ */
+class AntiTamper {
+    private static final String TAG = "JG-AT";
+
+    // 扩展特征库：覆盖改名后的 frida-gadget / magisk / 各类 hook 框架
+    private static final String[] MAP_KEYWORDS = {
+        "frida", "gadget", "libfrida", "frida-agent", "substrate",
+        "xposed", "libsandhook", "libmsaoaidsec", "libnativehook",
+        "cydia", "magisk", "re.frida", "frida-server"
+    };
+
+    // frida-server 默认监听端口
+    private static final int[] FRIDA_PORTS = {27042, 27043};
+
+    /** 启动独立守护线程，整段 try-catch，任何异常都不向外传播 */
+    static void start() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    loop();
+                } catch (Throwable ignored) {
+                    Log.w(TAG, "guard loop ended", ignored);
+                }
+            }
+        });
+        t.setName("jg-anti-tamper");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void loop() {
+        // 启动即查一次；之后周期轮询
+        if (detect()) respond();
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                Thread.sleep(ShieldApplication.ANTI_TAMPER_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (detect()) {
+                respond();
+                // respond() 在默认 "exit" 模式下已退出进程；"none" 模式则继续轮询
+            }
+        }
+    }
+
+    /** 综合检测，任一命中即视为被篡改。每个子检测独立 try-catch，互不影响。 */
+    private static boolean detect() {
+        return scanMaps() || probeFridaPorts() || checkFridaServerFile() || checkTracerPid();
+    }
+
+    private static boolean scanMaps() {
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new FileReader("/proc/self/maps"));
+            String line;
+            while ((line = br.readLine()) != null) {
+                String l = line.toLowerCase();
+                for (String k : MAP_KEYWORDS) {
+                    if (l.contains(k)) {
+                        Log.w(TAG, "tamper: maps hit '" + k + "' -> " + line.trim());
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 读取失败不视为篡改
+        } finally {
+            if (br != null) try { br.close(); } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static boolean probeFridaPorts() {
+        for (int port : FRIDA_PORTS) {
+            Socket s = null;
+            try {
+                s = new Socket();
+                s.connect(new InetSocketAddress("127.0.0.1", port), 200);
+                Log.w(TAG, "tamper: frida port " + port + " open");
+                return true;
+            } catch (Throwable t) {
+                // 连接失败 = 未监听，属正常
+            } finally {
+                if (s != null) try { s.close(); } catch (Throwable ignored) {}
+            }
+        }
+        return false;
+    }
+
+    private static boolean checkFridaServerFile() {
+        try {
+            if (new File("/data/local/tmp/re.frida.server").exists()) {
+                Log.w(TAG, "tamper: /data/local/tmp/re.frida.server exists");
+                return true;
+            }
+        } catch (Throwable t) { /* ignore */ }
+        return false;
+    }
+
+    private static boolean checkTracerPid() {
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new FileReader("/proc/self/status"));
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith("TracerPid:")) {
+                    int pid = Integer.parseInt(line.split(":")[1].trim());
+                    if (pid != 0) {
+                        Log.w(TAG, "tamper: TracerPid=" + pid);
+                        return true;
+                    }
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            // 读取失败不视为篡改
+        } finally {
+            if (br != null) try { br.close(); } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static void respond() {
+        if ("none".equals(ShieldApplication.ANTI_TAMPER_RESPONSE)) {
+            Log.w(TAG, "tamper detected but response=none (debug mode)");
+            return;
+        }
+        // 默认静默退出进程（仅被篡改环境触发；干净设备永远走不到这里）
+        Log.w(TAG, "tamper confirmed -> System.exit");
+        try { System.exit(1); } catch (Throwable ignored) {}
     }
 }
 

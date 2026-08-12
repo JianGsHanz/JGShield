@@ -52,9 +52,16 @@ flowchart LR
 - **密钥派生**：`seed = SHA256(签名证书DER)`；`per-dex key = HMAC-SHA256(seed, "JG|dex"+i)`。换签即解密失败。
 - **载荷藏匿**：自定义顶层 ZIP 条目 `jg` + 魔数 `JGS1`；`classes.dex` 保持干净壳 DEX。
 - **反调试**：`/proc/self/maps` 特征扫描（frida / substrate / xposed / libsandhook / libmsaoaidsec）+ `Debug.isDebuggerConnected`。
+- **反篡改守护（AntiTamper，保命版）**：独立后台守护线程，与加载器物理隔离、整段 try-catch、绝不导致 App 闪退。周期轮询：
+  - `/proc/self/maps` 扩展特征扫描（frida / gadget / libfrida / frida-agent / substrate / xposed / libsandhook / libmsaoaidsec / libnativehook / cydia / magisk / re.frida / frida-server）
+  - frida 默认端口 `27042 / 27043` 探测
+  - `/data/local/tmp/re.frida.server` 文件存在性
+  - `/proc/self/status` 的 `TracerPid`（ptrace 检测）
+  - 命中即按 `ANTI_TAMPER_RESPONSE` 响应（默认 `exit`，仅在被篡改环境触发；干净设备零影响）
+  - 开关：`ShieldApplication.ANTI_TAMPER_ENABLED`（改 `false` + 重编 stub.dex 即全关）
 - **多进程竞态防护**：解密 DEX 先检查已有文件直接复用；`writeFileAtomic` 用 `.tmp + sync + rename` 原子写入，防止并发写导致 DEX 验证器 SIGBUS。
 
-> ⚠️ **已知短板**：当前**运行时防护**较弱——Frida 改名注入 / 延迟注入、以及内存中明文 DEX 被 dump 暂未防护（详见「已知局限」）。加密链路本身是扎实的。
+> ⚠️ **仍存在的短板**：反 Frida 已从「启动期一次性」升级为「后台周期轮询 + 多维检测」；但**内存 dump 仍只做了一半**——当前能屏蔽用于 dump 的主流框架（Frida/Substrate/Xposed），却未做 DEX 分段解密+执行+清零（该方案会动加载器，属高风险，刻意避开）。一旦攻击者绕过检测直接从 `/proc/self/mem` dump，明文 DEX 仍可被抓（详见「已知局限」）。加密链路本身扎实。
 
 ---
 
@@ -174,9 +181,10 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
 
 ## ⚠️ 已知局限 / 规划中的补强
 
-1. **运行时防护短板（待补强）**：当前反调试为启动期一次性扫描，且解密后的明文 DEX 驻留内存。
-   对 *frida-gadget 改名注入 / 延迟注入 / hook 检测函数* 与 *内存 dump* 暂未防护。
-   补强方向：反 Frida 周期轮询（端口 27042 / `/data/local/tmp/re.frida.server`） + DEX 分段加载即时清零 + 关键逻辑 native 化。
+1. **运行时防护（部分已补强）**：
+   - ✅ **反 Frida 已补强（保命版）**：启动期一次性扫描 → 升级为 `AntiTamper` 后台守护线程周期轮询（maps 扩展特征 / frida 端口 27042·27043 / `/data/local/tmp/re.frida.server` / `TracerPid`），可捕获改名注入与延迟注入；命中即退出，干净设备零影响。
+   - ❌ **内存 dump 仍仅半防护**：未做 DEX 分段解密+执行+清零（会动加载器，高风险，刻意避开）。当前只能屏蔽用于 dump 的主流框架；攻击者绕过检测直接 dump `/proc/self/mem` 仍可拿到明文 DEX。
+   - 待规划：DEX 分段加载即时清零（需独立真机验证）、关键逻辑 native 化（NDK `.so` 反调试，需逐机型验证加载）。
 2. **`logcat` 中的 `ClassNotFoundException: androidx.core.app.CoreComponentFactory`**：无害。
    Android 9+ 系统在 `makeApplication()` 早于 `attachBaseContext` 加载 `android:appComponentFactory` 指定的类，
    此时 DEX 尚未注入，被系统 catch 后回退默认工厂，不影响运行。

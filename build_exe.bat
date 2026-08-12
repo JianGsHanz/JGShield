@@ -33,7 +33,7 @@ echo [2/4] 安装依赖 pyinstaller + pycryptodome ...
 REM 1. 编译壳 stub.dex
 echo [3/4] 编译壳 stub.dex ...
 if not exist build\classes mkdir build\classes
-javac --release 8 -d build\classes src\java\com\jiagu\shield\ShieldApplication.java
+javac --release 8 -encoding UTF-8 -d build\classes src\java\com\jiagu\shield\ShieldApplication.java
 if errorlevel 1 (echo [ERR] javac 失败 & exit /b 1)
 java -cp tools\d8.jar com.android.tools.r8.D8 --output build\dex --lib tools\android.jar --min-api 21 build\classes
 if errorlevel 1 (echo [ERR] d8 失败 & exit /b 1)
