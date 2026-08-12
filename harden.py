@@ -192,7 +192,10 @@ def read_dexes(apk_path, names):
     return out
 
 # --------------------------------------------------------------------------
-# Manifest 改写
+# Manifest 改写（【已弃用】）
+# 这是早期基于正则的文本流改写方案，已被 axml_editor.py 的二进制编辑取代。
+# 二进制方案可绕开 apktool 解码/重编资源、避免大包长路径崩溃，且对原 App 的
+# android:name 是资源引用（非字符串）时也能正确处理。保留仅供对照，harden() 不会调用。
 # --------------------------------------------------------------------------
 def edit_manifest(manifest_path, package):
     with open(manifest_path, "r", encoding="utf-8") as f:
@@ -226,8 +229,10 @@ def edit_manifest(manifest_path, package):
     return orig_name
 
 # --------------------------------------------------------------------------
-# 重打包：剔除原 classes*.dex 与 META-INF，写入 stub.dex(classes.dex) 与 jg 载荷
-# 载荷以自定义顶层 ZIP 条目 "jg" 注入，classes.dex 保持为标准干净壳 DEX
+# 重打包（【已弃用】）
+# 早期基于 apktool 解码产物的重新打包方案，已被 repackage_direct() 取代。
+# repackage_direct() 直接用 zipfile 重建 APK，确保 AndroidManifest.xml 为 ZIP 首条
+# 且 STORED，避免安装器对压缩/乱序 Manifest 的排斥。保留仅供对照，harden() 不会调用。
 # --------------------------------------------------------------------------
 def repackage(unsigned_apk, stub_dex_bytes, payload, out_apk):
     with zipfile.ZipFile(unsigned_apk, "r") as zin:

@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+test_repack.py —— 临时诊断脚本（非交付物，含硬编码路径）。
+
+用途：在不经过完整加固流程的情况下，快速验证「把原始 Manifest 原样打包 +
+壳 stub.dex + jg 载荷」这条路是否能产出可被 aapt/apksigner 识别的 APK，
+用于定位真机崩溃是与 Manifest 改写有关、还是与加密载荷有关。
+
+注意：
+  - 本脚本直接写死了本地 APK 路径与签名密钥，仅作者本机排障可用，
+    未纳入正常构建流程；clone 后的仓库运行它需要自行修改路径。
+  - 它对应的是早期「repack 原 Manifest」的实验，与正式加固（axml_editor.py
+    二进制改写 + 加密载荷）无关，不要当作加固入口使用。
+"""
 import zipfile, os, re, subprocess, tempfile, shutil
 
 APK = 'D:/APK/test_ylsn_1.5.0/app-huawei-1.5.0-2026-08-10.apk'
