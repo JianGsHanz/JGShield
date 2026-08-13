@@ -61,7 +61,7 @@ flowchart LR
   - 开关：`ShieldApplication.ANTI_TAMPER_ENABLED`（改 `false` + 重编 stub.dex 即全关）
 - **多进程竞态防护**：解密 DEX 先检查已有文件直接复用；`writeFileAtomic` 用 `.tmp + sync + rename` 原子写入，防止并发写导致 DEX 验证器 SIGBUS。
 
-> ⚠️ **仍存在的短板**：反 Frida 已从「启动期一次性」升级为「后台周期轮询 + 多维检测」；但**内存 dump 仍只做了一半**——当前能屏蔽用于 dump 的主流框架（Frida/Substrate/Xposed），却未做 DEX 分段解密+执行+清零（该方案会动加载器，属高风险，刻意避开）。一旦攻击者绕过检测直接从 `/proc/self/mem` dump，明文 DEX 仍可被抓（详见「已知局限」）。加密链路本身扎实。
+> ⚠️ **已补强 P1/P2，但仍有的边界**：反 Frida（P1 native 层 + Java 周期轮询）与 DEX fileless 内存加载（P2，磁盘不落明文、不生成 odex）已完成；但**运行期内存 dump 仍未 100% 防护**——DEX 被 ART 加载后优化代码必在进程内存，frida-dexdump 仍可扫到。要做到"运行期明文不驻留内存"需 P3 指令抽取（native hook ART，高风险，未做）。加密链路本身扎实。
 
 ---
 
@@ -224,10 +224,12 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
 
 ## ⚠️ 已知局限 / 规划中的补强
 
-1. **运行时防护（部分已补强）**：
+1. **运行时防护（已补强 P1 + P2）**：
    - ✅ **反 Frida 已补强（保命版）**：启动期一次性扫描 → 升级为 `AntiTamper` 后台守护线程周期轮询（maps 扩展特征 / frida 端口 27042·27043 / `/data/local/tmp/re.frida.server` / `TracerPid`），可捕获改名注入与延迟注入；命中即退出，干净设备零影响。
-   - ❌ **内存 dump 仍仅半防护**：未做 DEX 分段解密+执行+清零（会动加载器，高风险，刻意避开）。当前只能屏蔽用于 dump 的主流框架；攻击者绕过检测直接 dump `/proc/self/mem` 仍可拿到明文 DEX。
-   - 待规划：DEX 分段加载即时清零（需独立真机验证）、关键逻辑 native 化（NDK `.so` 反调试，需逐机型验证加载）。
+   - ✅ **原生层反篡改（P1）**：`libjgguard.so`（NDK 编译，JNI 守护线程）下沉到 native，比 Java `AntiTamper` 更难被 frida hook，二者互为备份；加载失败仅降级，不影响启动。
+   - ✅ **DEX fileless 内存加载（P2）**：API≥26 时解密进 `ByteBuffer`，经公开 API `InMemoryDexClassLoader` 在内存中加载并注入框架 `sysLoader`（保留原生库命名空间），**磁盘不落明文 DEX 文件、不生成 odex**（关掉了"读明文文件/备份"这一类最易利用的泄漏）；解密后源 `byte[]` 立即清零。API<26 自动回退原文件方案（不回归）。
+   - ❌ **运行期内存 dump 仍未 100% 防护**：DEX 一旦被 ART 加载运行，优化后的代码必存在于进程内存，frida-dexdump 等仍可扫到。当前 P2 已关闭**磁盘明文**与**启动期整段明文大块**两个泄漏点，但要做到"运行期明文 DEX 不驻留内存"，必须做 **DEX 指令抽取（native 层 hook ART 方法，按需解密/还原方法字节码）**——该方案版本相关、极易崩，属独立的**高风险 P3**，暂未做，需独立真机压测。
+   - 待规划：P3 指令抽取（需独立真机验证）、关键逻辑 native 化深化。
 2. **`logcat` 中的 `ClassNotFoundException: androidx.core.app.CoreComponentFactory`**：无害。
    Android 9+ 系统在 `makeApplication()` 早于 `attachBaseContext` 加载 `android:appComponentFactory` 指定的类，
    此时 DEX 尚未注入，被系统 catch 后回退默认工厂，不影响运行。

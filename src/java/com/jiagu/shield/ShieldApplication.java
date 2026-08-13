@@ -16,8 +16,11 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -105,11 +108,24 @@ public class ShieldApplication extends Application {
         File dexDir = new File(shellDir, "dex");
         if (!dexDir.exists()) dexDir.mkdirs();
 
-        List<File> dexFiles = Decryptor.decrypt(base, dexDir);
-        Log.i(TAG, "load: dexFiles=" + dexFiles.size());
-
         ClassLoader sysLoader = getClass().getClassLoader();
-        Loader.injectDexElements(sysLoader, dexFiles);
+
+        // P2：fileless 内存加载（API>=26）。解密进 ByteBuffer 直接注入 sysLoader，
+        // 磁盘不落明文文件；解密后源 byte[] 立即清零。失败（含 OEM 限制）自动回退文件方案。
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            try {
+                List<ByteBuffer> bufs = Decryptor.decryptBuffers(base);
+                Loader.injectDexFromBuffers(sysLoader, bufs);
+                Log.i(TAG, "load: fileless inject OK (no plaintext on disk)");
+            } catch (Throwable t) {
+                Log.w(TAG, "load: fileless failed, fallback to file", t);
+                List<File> dexFiles = Decryptor.decrypt(base, dexDir);
+                Loader.injectDexElements(sysLoader, dexFiles);
+            }
+        } else {
+            List<File> dexFiles = Decryptor.decrypt(base, dexDir);
+            Loader.injectDexElements(sysLoader, dexFiles);
+        }
         Log.i(TAG, "load: injectDexElements OK");
 
         Loader.setClassLoader(base, sysLoader);
@@ -240,6 +256,51 @@ class Decryptor {
             File f = new File(dexDir, "c" + i + ".dex");
             writeFileAtomic(f, dex);
             out.add(f);
+        }
+        return out;
+    }
+
+    /**
+     * P2：fileless 解密。与 decrypt() 相同解密流程，但明文 DEX 不落盘，
+     * 直接写入直接 ByteBuffer（ART 在构造 DexFile 时会拷贝进自身内存），
+     * 随后把源 byte[] 清零。返回的 ByteBuffer 由 Loader 注入 sysLoader 后整体弃用。
+     *
+     * 安全性边界：DEX 被 ART 加载运行后，优化代码仍存在于进程内存，无法仅靠此步
+     * 做到 100% 防内存 dump（那需要 native 指令抽取，属 P3）。本步关闭的是
+     * “磁盘明文文件 + 启动期整段明文大块”两个泄漏点。
+     */
+    static List<ByteBuffer> decryptBuffers(Context ctx) throws Exception {
+        byte[] seed = DeriveKeys.seed(ctx);
+        String apk = ctx.getApplicationInfo().sourceDir;
+        byte[] payload = readPayload(apk);
+        if (payload == null || payload.length < 8) {
+            throw new IllegalStateException("payload missing");
+        }
+        int p = 0;
+        for (int i = 0; i < 4; i++) {
+            if (payload[p] != (byte) "JGS1".charAt(i)) {
+                throw new IllegalStateException("bad magic");
+            }
+            p++;
+        }
+        int count = readInt(payload, p);
+        p += 4;
+        List<ByteBuffer> out = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            int len = readInt(payload, p);
+            p += 4;
+            byte[] blob = Arrays.copyOfRange(payload, p, p + len);
+            p += len;
+            byte[] key = DeriveKeys.keyFor(seed, "dex" + i);
+            byte[] comp = aesGcmDecrypt(key, blob);
+            byte[] dex = inflate(comp);
+            // 直接缓冲区：ART 的 DexFile(ByteBuffer) 要求 direct buffer
+            ByteBuffer buf = ByteBuffer.allocateDirect(dex.length);
+            buf.put(dex);
+            buf.position(0);
+            // 源明文立即清零（缓冲区随后由 ART 拷贝，加载后可被 GC 回收）
+            Arrays.fill(dex, (byte) 0);
+            out.add(buf);
         }
         return out;
     }
@@ -394,8 +455,11 @@ class AntiDebug {
  *   3. 后台周期轮询（不只启动那一次），可捕获延迟注入的 Frida。
  *   4. 响应（退出/降级）只在“确认被篡改”时触发；干净设备永远走不到这一步。
  *
- * 说明：本版不做 DEX 分段解密+清零（会动加载器，风险高），故不能“绝对”防内存 dump，
- *      只能屏蔽用于 dump 的主流框架（Frida/Substrate/Xposed 等）。要更强需后续独立验证。
+ * 说明：本版 Java 层已做 fileless 加载（DEX 不落盘、源缓冲区清零，见 Decryptor.decryptBuffers /
+ *      Loader.injectDexFromBuffers），关闭了“磁盘明文文件 + 启动期整段明文大块”两个泄漏点。
+ *      但 DEX 一旦被 ART 加载运行，优化代码仍存在于进程内存，无法仅靠 Java 层做到 100% 防内存
+ *      dump（那需要 native 指令抽取，属 P3，高风险）。本层只屏蔽用于 dump 的主流框架
+ *      （Frida/Substrate/Xposed 等）；native 层由 libjgguard.so 补充。
  */
 class AntiTamper {
     private static final String TAG = "JG-AT";
@@ -606,6 +670,50 @@ class Loader {
                 elementClass, newElements.length + existing.length);
         System.arraycopy(newElements, 0, merged, 0, newElements.length);
         System.arraycopy(existing, 0, merged, newElements.length, existing.length);
+        fDexElements.set(pathList, merged);
+    }
+
+    /**
+     * P2：fileless 注入。用公开 API InMemoryDexClassLoader 在内存中加载 DEX（不产生 odex 文件，
+     * 因此磁盘不落明文），再偷取其 dexElements 注入 sysLoader 的 pathList。
+     * 定义加载器仍是 sysLoader（Element 在其 pathList 内），原生库命名空间不变（方案 B 延续）。
+     *
+     * 之所以用 InMemoryDexClassLoader 而非 dalvik.system.DexFile(ByteBuffer)：后者是隐藏构造器，
+     * 在部分 OEM（如华为 EMUI）的 ART 上被阉割（NoSuchMethodException），且编译期静态引用
+     * 隐藏类会让校验器拒绝整个 Loader 类。InMemoryDexClassLoader 是 API 26+ 公开标准 API，
+     * 跨 OEM 可靠。构造器通过 Class.forName 反射获取，避免编译期静态引用隐藏 API。
+     */
+    @SuppressWarnings("unchecked")
+    static void injectDexFromBuffers(ClassLoader loader, List<ByteBuffer> bufs) throws Exception {
+        Class<?> bdc = Class.forName("dalvik.system.BaseDexClassLoader");
+        Field fPathList = bdc.getDeclaredField("pathList");
+        fPathList.setAccessible(true);
+        Object pathList = fPathList.get(loader);
+        Class<?> dpl = pathList.getClass();
+
+        Field fDexElements = dpl.getDeclaredField("dexElements");
+        fDexElements.setAccessible(true);
+        Object[] existing = (Object[]) fDexElements.get(pathList);
+        if (existing == null) existing = new Object[0];
+
+        // InMemoryDexClassLoader(ByteBuffer[], ClassLoader) —— 内存加载，无 odex 文件
+        Class<?> imdcClass = Class.forName("dalvik.system.InMemoryDexClassLoader");
+        Constructor<?> imdcCtor = imdcClass.getConstructor(ByteBuffer[].class, ClassLoader.class);
+        ByteBuffer[] arr = bufs.toArray(new ByteBuffer[0]);
+        Object imdc = imdcCtor.newInstance(arr, loader);
+
+        // 偷取内存加载器的 dexElements，注入 sysLoader（保留定义加载器 = sysLoader）
+        Object imPathList = fPathList.get(imdc);
+        Object[] imElements = (Object[]) fDexElements.get(imPathList);
+        if (imElements == null || imElements.length == 0) {
+            throw new IOException("InMemoryDexClassLoader produced no dex elements");
+        }
+
+        Class<?> elementClass = existing.getClass().getComponentType();
+        Object[] merged = (Object[]) java.lang.reflect.Array.newInstance(
+                elementClass, imElements.length + existing.length);
+        System.arraycopy(imElements, 0, merged, 0, imElements.length);
+        System.arraycopy(existing, 0, merged, imElements.length, existing.length);
         fDexElements.set(pathList, merged);
     }
 
