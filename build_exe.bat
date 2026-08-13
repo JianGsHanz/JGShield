@@ -52,6 +52,9 @@ if errorlevel 1 goto ERR_COPY
 echo [4/4] packaging
 taskkill /f /im jiagu_gui.exe >nul 2>nul
 if exist "%~dp0_noop_sc" (set "PYTHONPATH=%~dp0_noop_sc")
+rem rename old exe away first; if it is locked by another process, rename still
+rem succeeds (unlike delete) so pyinstaller will not hit os.remove PermissionError
+if exist dist\jiagu_gui.exe move /y dist\jiagu_gui.exe dist\jiagu_gui.bak.exe >nul 2>nul
 "%VENV%\Scripts\pyinstaller.exe" jiagu_gui.spec
 if errorlevel 1 goto ERR_PYI
 
