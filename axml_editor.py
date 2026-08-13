@@ -471,6 +471,9 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
     1. 将 <application android:name="原始类名"> 改为 shell_app_class
     2. 在 <application> 内注入 <meta-data android:name="JG_ORIG_APP"
        android:value="原始类名"/>
+    3. 将 <application android:appComponentFactory="..."> 指向空串，使框架用默认
+       AppComponentFactory（消除 AndroidX 应用加固后 LoadedApk 的
+       ClassNotFoundException 报错，运行时行为不变）
 
     参数:
         manifest_data:  原始二进制 Manifest 数据 (bytes)
@@ -516,6 +519,11 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
         new_strings_needed.append('value')
     if _find_string_index(strings, 'meta-data') == -1:
         new_strings_needed.append('meta-data')
+    # appComponentFactory 中和用：属性名本身 + 空串(指向空串即让框架用默认工厂，消除难看的报错)
+    if _find_string_index(strings, 'appComponentFactory') == -1:
+        new_strings_needed.append('appComponentFactory')
+    if _find_string_index(strings, '') == -1:
+        new_strings_needed.append('')
 
     # 4. 向字符串池追加新字符串（在 XML 修改前完成，避免偏移追踪困扰）
     for s in new_strings_needed:
@@ -577,6 +585,24 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
         struct.pack_into('<H', data, app_chunk_start + 28, app_elem['attribute_count'] + 1)
         app_elem['attribute_count'] += 1
         app_size_growth += 20
+
+    # 5.5 中和 android:appComponentFactory
+    # 壳把 classes.dex 整体替换为 stub.dex 后，原 AppComponentFactory(通常 androidx.core.app.CoreComponentFactory)
+    # 位于被加密、运行时才注入 sysLoader 的原始 DEX。系统在 LoadedApk 构造期就用 base classloader 查找它，
+    # 此时尚未注入 → ClassNotFoundException；但 LoadedApk 会 catch 并回退 AppComponentFactory.DEFAULT(无害、App 不崩)。
+    # 为消除这条难看的 E 级日志，直接把该属性指向空串：框架判定 length()==0 即用 DEFAULT，运行时行为完全一致(零回归)。
+    _acf_idx = _find_string_index(strings, 'appComponentFactory')
+    _empty_idx = _find_string_index(strings, '')
+    if _acf_idx != -1 and _empty_idx != -1:
+        _ap = app_chunk_start + 16 + 20  # ns(offset 16) + attrStart(20)
+        for _i in range(app_elem['attribute_count']):
+            _ans = struct.unpack_from('<I', data, _ap)[0]
+            _anm = struct.unpack_from('<I', data, _ap + 4)[0]
+            if _ans == android_uri_idx and _anm == _acf_idx:
+                struct.pack_into('<I', data, _ap + 8, _empty_idx)              # raw_value
+                struct.pack_into('<HBB I', data, _ap + 12, 8, 0, TYPE_STRING, _empty_idx)
+                break
+            _ap += 20
 
     # 6. 构造 meta-data 子元素
     meta_attrs = [
