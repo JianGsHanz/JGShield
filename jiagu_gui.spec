@@ -11,7 +11,11 @@ import sys
 block_cipher = None
 
 # 仓库根目录（spec 所在目录），避免硬编码绝对路径（如 E:/jiagu）
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller 执行 spec 时不会定义 __file__，但会注入 SPECPATH（spec 目录绝对路径）作为兜底
+try:
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    ROOT = SPECPATH
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
