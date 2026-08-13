@@ -471,9 +471,11 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
     1. 将 <application android:name="原始类名"> 改为 shell_app_class
     2. 在 <application> 内注入 <meta-data android:name="JG_ORIG_APP"
        android:value="原始类名"/>
-    3. 将 <application android:appComponentFactory="..."> 指向空串，使框架用默认
-       AppComponentFactory（消除 AndroidX 应用加固后 LoadedApk 的
-       ClassNotFoundException 报错，运行时行为不变）
+    3. 删除 <application> 的 android:appComponentFactory 属性（而非设为空串）。
+       华为等定制 ROM 的 PackageParser 对空串 appComponentFactory 报 "Empty class name"
+       → INSTALL_PARSE_FAILED_MANIFORMED 硬失败；直接删除该属性后，框架读到
+       ai.appComponentFactory == null 即用默认 AppComponentFactory，运行时行为与之前的
+       "回退 DEFAULT" 完全一致（零回归），且不再产生 ClassNotFoundException 的 E 级日志。
 
     参数:
         manifest_data:  原始二进制 Manifest 数据 (bytes)
@@ -519,11 +521,7 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
         new_strings_needed.append('value')
     if _find_string_index(strings, 'meta-data') == -1:
         new_strings_needed.append('meta-data')
-    # appComponentFactory 中和用：属性名本身 + 空串(指向空串即让框架用默认工厂，消除难看的报错)
-    if _find_string_index(strings, 'appComponentFactory') == -1:
-        new_strings_needed.append('appComponentFactory')
-    if _find_string_index(strings, '') == -1:
-        new_strings_needed.append('')
+    # 注：删除 appComponentFactory 属性时无需把 appComponentFactory / 空串 加入字符串池
 
     # 4. 向字符串池追加新字符串（在 XML 修改前完成，避免偏移追踪困扰）
     for s in new_strings_needed:
@@ -586,21 +584,27 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
         app_elem['attribute_count'] += 1
         app_size_growth += 20
 
-    # 5.5 中和 android:appComponentFactory
+    # 5.5 删除 android:appComponentFactory 属性（消除硬失败 + 难看 E 日志）
     # 壳把 classes.dex 整体替换为 stub.dex 后，原 AppComponentFactory(通常 androidx.core.app.CoreComponentFactory)
-    # 位于被加密、运行时才注入 sysLoader 的原始 DEX。系统在 LoadedApk 构造期就用 base classloader 查找它，
-    # 此时尚未注入 → ClassNotFoundException；但 LoadedApk 会 catch 并回退 AppComponentFactory.DEFAULT(无害、App 不崩)。
-    # 为消除这条难看的 E 级日志，直接把该属性指向空串：框架判定 length()==0 即用 DEFAULT，运行时行为完全一致(零回归)。
+    # 位于被加密、运行时才注入 sysLoader 的原始 DEX。系统在 LoadedApk 构造期用 base classloader 查找它失败 →
+    # 若其值为空串，华为等 ROM 的 PackageParser 会报 "Empty class name" →
+    # INSTALL_PARSE_FAILED_MANIFEST_MALFORMED 硬失败(之前误判为无害)。
+    # 干净做法：直接删除该属性。框架读到 ai.appComponentFactory == null 即用 AppComponentFactory.DEFAULT，
+    # 运行时行为等价于之前的"回退 DEFAULT"(零回归)，无 ClassNotFoundException 日志、可正常安装。
     _acf_idx = _find_string_index(strings, 'appComponentFactory')
-    _empty_idx = _find_string_index(strings, '')
-    if _acf_idx != -1 and _empty_idx != -1:
+    if _acf_idx != -1:
         _ap = app_chunk_start + 16 + 20  # ns(offset 16) + attrStart(20)
         for _i in range(app_elem['attribute_count']):
             _ans = struct.unpack_from('<I', data, _ap)[0]
             _anm = struct.unpack_from('<I', data, _ap + 4)[0]
             if _ans == android_uri_idx and _anm == _acf_idx:
-                struct.pack_into('<I', data, _ap + 8, _empty_idx)              # raw_value
-                struct.pack_into('<HBB I', data, _ap + 12, 8, 0, TYPE_STRING, _empty_idx)
+                # 删除该 20 字节属性项（后续所有数据整体前移 20 字节）
+                del data[_ap:_ap + 20]
+                # 更新 attribute_count
+                struct.pack_into('<H', data, app_chunk_start + 28,
+                                 app_elem['attribute_count'] - 1)
+                app_elem['attribute_count'] -= 1
+                app_size_growth -= 20
                 break
             _ap += 20
 
