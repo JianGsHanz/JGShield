@@ -49,6 +49,15 @@ if errorlevel 1 goto ERR_D8B
 copy /y build\dex_out\classes.dex build\dex\stub.dex
 if errorlevel 1 goto ERR_COPY
 
+echo [3.5/4] compiling native guard (.so)
+call build_native.bat
+if errorlevel 1 (
+  echo [WARN] native guard 编译失败，exe 仍会正常构建，但内置的 libjgguard.so 缺失；
+  echo        加固时 harden.py 会跳过 native 注入（仅失去 native 层防护）。请检查 NDK 路径。
+) else (
+  echo [OK] native guard 编译完成
+)
+
 echo [4/4] packaging
 taskkill /f /im jiagu_gui.exe >nul 2>nul
 if exist "%~dp0_noop_sc" (set "PYTHONPATH=%~dp0_noop_sc")

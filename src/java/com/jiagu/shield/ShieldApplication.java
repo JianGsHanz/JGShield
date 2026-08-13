@@ -90,6 +90,14 @@ public class ShieldApplication extends Application {
                 Log.w(TAG, "anti-tamper start skipped", t);
             }
         }
+
+        // 启动 native 反篡改守护线程（下沉到 .so，更难被 hook；与 Java 层互为备份）。
+        // 加载/调用全程已 try-catch，失败仅跳过 native 防护，不影响 App 启动。
+        try {
+            JgGuard.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "native guard start skipped", t);
+        }
     }
 
     private void load(Context base) throws Exception {

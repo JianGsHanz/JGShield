@@ -56,6 +56,14 @@ java -cp tools/d8.jar com.android.tools.r8.D8 --output build/dex_out --lib tools
 mkdir -p build/dex
 cp -f build/dex_out/classes.dex build/dex/stub.dex
 
+# 3.5) 编译 native 反篡改库 (.so)
+echo "[3.5/4] 编译 native 反篡改库"
+if bash build_native.sh; then
+  echo "[OK] native 反篡改库编译完成"
+else
+  echo "[WARN] native 库编译失败，exe/app 仍会构建，但加固时 harden.py 跳过 native 注入"
+fi
+
 # 4) 打包
 echo "[4/4] 打包"
 if [ -d dist/jiagu_gui.app ]; then

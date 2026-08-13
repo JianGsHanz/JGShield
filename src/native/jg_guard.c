@@ -1,0 +1,195 @@
+/*
+ * JGShield native 反篡改 / 反调试守护层 (jg_guard.c)
+ * --------------------------------------------------------------------------
+ * 设计原则（与 Java 反篡改一致，且更难点 hook）：
+ *   1. fail-safe：任何异常（文件读不到、socket 失败、线程创建失败）都「视为未篡改」，
+ *      绝不因自身错误导致 App 崩溃或退出。
+ *   2. 与加载器物理隔离：仅做后台周期检测 + 命中即静默 exit，不碰解密/加载逻辑。
+ *   3. 纯 C + JNI + liblog，无 C++/STL 依赖，ABI 稳定、体积小。
+ *   4. 不引入自 ptrace(PTRACE_TRACEME)：避免影响开发者正常调试自己的 App，
+ *      调试器检测仍由 TracerPid 扫描覆盖。
+ *
+ * 检测项（与 Java AntiTamper 对齐，但运行在 native，hook 难度更高）：
+ *   - /proc/self/maps 关键字（frida/gadget/substrate/xposed/magisk/...）
+ *   - /proc/self/status 与 /proc/self/task 下各线程 status 的 TracerPid != 0
+ *   - frida-server 默认端口 27042/27043 是否监听
+ *   - /data/local/tmp/re.frida.server 文件是否存在
+ * 命中 -> 静默 exit(1)（与 Java 端默认行为一致，干净设备永远走不到这里）。
+ */
+#include <jni.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <android/log.h>
+
+#define TAG "JG-Native"
+
+/* 扩展特征库：覆盖改名后的 frida-gadget / magisk / 各类 hook 框架 */
+static const char *MAP_KEYWORDS[] = {
+    "frida", "gadget", "libfrida", "frida-agent", "substrate",
+    "xposed", "libsandhook", "libmsaoaidsec", "libnativehook",
+    "cydia", "magisk", "re.frida", "frida-server", NULL
+};
+
+static const int FRIDA_PORTS[] = {27042, 27043};
+static const int POLL_MS = 2000;          /* 周期轮询间隔 */
+static volatile int g_stop = 0;
+
+/* 防御式读文件：成功返回读取字节数(>=0)，失败返回 -1；buf 末尾补 \0 */
+static int read_file(const char *path, char *buf, size_t buflen) {
+    if (!path || !buf || buflen == 0) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, buflen - 1, f);
+    if (ferror(f)) { fclose(f); return -1; }
+    buf[n] = '\0';
+    fclose(f);
+    return (int)n;
+}
+
+/* 逐行扫描 maps，命中任一关键字即视为篡改 */
+static int scan_maps(void) {
+    char buf[16384];
+    if (read_file("/proc/self/maps", buf, sizeof(buf)) < 0) return 0;
+    char *p = buf;
+    while (*p) {
+        for (int k = 0; MAP_KEYWORDS[k]; k++) {
+            if (strstr(p, MAP_KEYWORDS[k])) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "maps hit: %s", MAP_KEYWORDS[k]);
+                return 1;
+            }
+        }
+        char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
+
+/* 检查单个 status 文件中的 TracerPid 字段 */
+static int check_status_tracerpid(const char *path) {
+    char buf[4096];
+    if (read_file(path, buf, sizeof(buf)) < 0) return 0;
+    char *p = buf;
+    while (*p) {
+        if (strncmp(p, "TracerPid:", 11) == 0) {
+            char *v = p + 11;
+            while (*v == ' ' || *v == '\t') v++;
+            int pid = atoi(v);
+            if (pid != 0) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "TracerPid=%d @ %s", pid, path);
+                return 1;
+            }
+            return 0;   /* TracerPid 字段读到且为 0，无需继续 */
+        }
+        char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
+
+/* 检查自身进程与所有线程的 TracerPid */
+static int check_tracerpid(void) {
+    if (check_status_tracerpid("/proc/self/status")) return 1;
+    /* 遍历 /proc/self/task/<tid>/status，任一线程被 trace 即视为篡改 */
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/task/%s/status", e->d_name);
+        if (check_status_tracerpid(path)) {
+            closedir(d);
+            return 1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+/* 探测本地端口是否监听（阻塞 connect + 短超时），命中视为 frida 在跑 */
+static int probe_port(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;   /* 200ms */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    close(fd);
+    if (r == 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "frida port %d open", port);
+        return 1;
+    }
+    return 0;
+}
+
+static int check_frida_server_file(void) {
+    struct stat st;
+    if (stat("/data/local/tmp/re.frida.server", &st) == 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "frida server file exists");
+        return 1;
+    }
+    return 0;
+}
+
+/* 综合检测：任一命中即视为被篡改。各子检测独立，互不影响。 */
+static int detect(void) {
+    return scan_maps()
+        || check_tracerpid()
+        || check_frida_server_file()
+        || probe_port(FRIDA_PORTS[0])
+        || probe_port(FRIDA_PORTS[1]);
+}
+
+static void respond(void) {
+    __android_log_print(ANDROID_LOG_WARN, TAG, "tamper confirmed -> exit");
+    /* 与 Java AntiTamper 默认行为一致：静默退出进程 */
+    exit(1);
+}
+
+static void *guard_thread(void *arg) {
+    (void)arg;
+    /* 启动即查一次；之后周期轮询 */
+    if (detect()) respond();
+    while (!g_stop) {
+        usleep((useconds_t)POLL_MS * 1000);
+        if (detect()) respond();
+    }
+    return NULL;
+}
+
+/* JNI 入口：由 Java 侧 JgGuard.nativeStart() 调用，启动守护线程 */
+JNIEXPORT void JNICALL
+Java_com_jiagu_shield_JgGuard_nativeStart(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, guard_thread, NULL) != 0) {
+        /* 线程创建失败：优雅降级，不抛异常、不影响 App */
+        return;
+    }
+    pthread_detach(tid);
+}
+
+JNIEXPORT jint JNICALL
+JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void)vm; (void)reserved;
+    return JNI_VERSION_1_6;
+}

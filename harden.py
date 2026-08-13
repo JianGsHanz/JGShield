@@ -302,9 +302,26 @@ def _stored(name):
     return info
 
 
-def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path):
+def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path,
+                     native_libs_dir=None):
     """直接用 zipfile 重建 APK（Manifest 首条 + STORED，保持原资源+lib 顺序 + stub.dex + jg）。
-    剔除原 classes*.dex、原 META-INF、原 AndroidManifest.xml。"""
+    剔除原 classes*.dex、原 META-INF、原 AndroidManifest.xml。
+
+    native_libs_dir：若提供，则把其中的 libjgguard.so 注入到输出 APK 的 lib/<abi>/，
+    与原 App 自身的 .so 并列（ZIP_STORED 不压缩，Android 要求）。
+    """
+    # 确定要注入的 ABI 集合：优先取原包已有的 lib/<abi>/，没有则补 arm64-v8a/armeabi-v7a
+    abis = set()
+    with zipfile.ZipFile(input_apk, 'r') as z:
+        for n in z.namelist():
+            m = re.match(r'lib/([^/]+)/', n)
+            if m:
+                abis.add(m.group(1))
+    if not abis:
+        abis = {'arm64-v8a', 'armeabi-v7a'}
+
+    have_native = bool(native_libs_dir) and os.path.isdir(native_libs_dir)
+
     with zipfile.ZipFile(input_apk, 'r') as zin:
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
             # 1) 先写 Manifest（二进制 + STORED，首条保序）
@@ -324,6 +341,25 @@ def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path
             # 3) 壳 DEX + 载荷
             zout.writestr(zipfile.ZipInfo('classes.dex'), stub_dex)
             zout.writestr(zipfile.ZipInfo("jg"), payload)
+            # 4) 注入 native 反篡改库（与原 App .so 并列；STORED 不压缩）
+            if have_native:
+                injected = 0
+                for abi in sorted(abis):
+                    src = os.path.join(native_libs_dir, abi, 'libjgguard.so')
+                    if not os.path.isfile(src):
+                        continue
+                    with open(src, 'rb') as f:
+                        data = f.read()
+                    zi = zipfile.ZipInfo('lib/%s/libjgguard.so' % abi)
+                    zi.compress_type = zipfile.ZIP_STORED
+                    zout.writestr(zi, data)
+                    injected += 1
+                if injected:
+                    print("[*] 注入 native 反篡改库 libjgguard.so 到 %d 个 ABI: %s"
+                          % (injected, ', '.join(sorted(abis))), flush=True)
+                else:
+                    print("[!] 未找到任何 ABI 的 libjgguard.so，跳过 native 注入（需先 build_native）",
+                          flush=True)
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError("zip 直打包失败")
 
@@ -399,7 +435,8 @@ def harden(input_apk, output_apk=None, keep=False,
 
     # 4) zip 直打包（原资源 + patched Manifest + stub.dex + jg，跳过 apktool b）
     unsigned = os.path.join(work, "unsigned.apk")
-    repackage_direct(input_apk, patched_manifest, stub, payload, unsigned)
+    repackage_direct(input_apk, patched_manifest, stub, payload, unsigned,
+                     native_libs_dir=config.LIBJGGUARD_DIR)
     _lap(sw, "zip打包")
 
     # 5) 签名

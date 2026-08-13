@@ -33,6 +33,12 @@ _datas = [
     ('tools/apksigner.jar',       'tools'),
     ('build/dex/stub.dex',        'build/dex'),
 ]
+# native 反篡改库（按 ABI 分目录），加固时注入 APK 的 lib/<abi>/；不存在时不影响打包
+if os.path.isdir(os.path.join(ROOT, 'tools', 'libjgguard')):
+    for _abi in sorted(os.listdir(os.path.join(ROOT, 'tools', 'libjgguard'))):
+        _so = os.path.join('tools', 'libjgguard', _abi, 'libjgguard.so')
+        if os.path.isfile(os.path.join(ROOT, _so)):
+            _datas.append((_so, 'tools/libjgguard/%s' % _abi))
 if IS_WINDOWS:
     _datas += [
         ('tools/aapt.exe',            'tools'),
