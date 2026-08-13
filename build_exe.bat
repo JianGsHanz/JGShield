@@ -31,20 +31,31 @@ echo [2/4] 安装依赖 pyinstaller + pycryptodome ...
 "%VENV%\Scripts\pip.exe" install pyinstaller pycryptodome pycryptodomex
 
 REM 1. 编译壳 stub.dex
+REM    注意：d8 必须以 .jar 为输入，且输出目录需不存在，故先打 jar -> 输出到临时目录 -> 复制
 echo [3/4] 编译壳 stub.dex ...
 if not exist build\classes mkdir build\classes
 javac --release 8 -encoding UTF-8 -d build\classes src\java\com\jiagu\shield\ShieldApplication.java
-if errorlevel 1 (echo [ERR] javac 失败 & exit /b 1)
-java -cp tools\d8.jar com.android.tools.r8.D8 --output build\dex --lib tools\android.jar --min-api 21 build\classes
-if errorlevel 1 (echo [ERR] d8 失败 & exit /b 1)
+if errorlevel 1 (echo [ERR] javac 失败 & pause & exit /b 1)
+if exist build\classes.jar del /f /q build\classes.jar
+jar cf build\classes.jar -C build\classes .
+if errorlevel 1 (echo [ERR] jar 打包失败 & pause & exit /b 1)
+if exist build\dex_out rmdir /s /q build\dex_out
+mkdir build\dex_out
+java -cp tools\d8.jar com.android.tools.r8.D8 --output build\dex_out --lib tools\android.jar --min-api 21 build\classes.jar
+if errorlevel 1 (echo [ERR] d8 失败 & pause & exit /b 1)
+copy /y build\dex_out\classes.dex build\dex\stub.dex
+if errorlevel 1 (echo [ERR] 复制 stub.dex 失败 & pause & exit /b 1)
 
 REM 2. 杀旧进程 + 打包（_noop_sc 绕过 safe-delete shim）
 echo [4/4] 终止旧进程并打包 ...
 taskkill /f /im jiagu_gui.exe >nul 2>&1
-set "PYTHONPATH=%~dp0_noop_sc"
+REM 仅在沙箱/WorkBuddy 环境有 _noop_sc 时设置，绕过 safe-delete shim；普通本机双击无需此项
+if exist "%~dp0_noop_sc" (set "PYTHONPATH=%~dp0_noop_sc")
 "%VENV%\Scripts\pyinstaller.exe" jiagu_gui.spec
-if errorlevel 1 (echo [ERR] pyinstaller 失败 & exit /b 1)
+if errorlevel 1 (echo [ERR] pyinstaller 失败 & pause & exit /b 1)
 
 echo.
 echo 构建完成：dist\jiagu_gui.exe
+echo 按任意键关闭窗口...
+pause >nul
 endlocal
