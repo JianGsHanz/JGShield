@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 REM JGShield GUI one-click build. Double-click to run in repo root E:/jiagu.
-REM Whole output is saved to build\build_exe.log then shown and paused at end.
+REM All output is saved to build\build_exe.log and shown at the end.
 
 call :run > build\build_exe.log 2>&1
 echo.
@@ -52,17 +52,15 @@ if errorlevel 1 goto ERR_COPY
 echo [3.5/4] compiling native guard (.so)
 call build_native.bat
 if errorlevel 1 (
-  echo [WARN] native guard 编译失败，exe 仍会正常构建，但内置的 libjgguard.so 缺失；
-  echo        加固时 harden.py 会跳过 native 注入（仅失去 native 层防护）。请检查 NDK 路径。
+  echo [WARN] native guard build failed; exe still builds but libjgguard.so will be missing.
+  echo        harden.py will skip native injection (loses only the native guard layer). Check NDK path.
 ) else (
-  echo [OK] native guard 编译完成
+  echo [OK] native guard built
 )
 
 echo [4/4] packaging
 taskkill /f /im jiagu_gui.exe >nul 2>nul
 if exist "%~dp0_noop_sc" (set "PYTHONPATH=%~dp0_noop_sc")
-rem rename old exe away first; if it is locked by another process, rename still
-rem succeeds (unlike delete) so pyinstaller will not hit os.remove PermissionError
 if exist dist\jiagu_gui.exe move /y dist\jiagu_gui.exe dist\jiagu_gui.bak.exe >nul 2>nul
 "%VENV%\Scripts\pyinstaller.exe" jiagu_gui.spec
 if errorlevel 1 goto ERR_PYI
