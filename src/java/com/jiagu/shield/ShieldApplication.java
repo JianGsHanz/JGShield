@@ -185,26 +185,40 @@ public class ShieldApplication extends Application {
                 replaceAssetManager(base, am);
                 Log.i(TAG, "restoreAssets: merged AssetManager OK");
             } else {
-                Log.w(TAG, "restoreAssets: merge returned null (assets 可能不可用)");
+                Log.e(TAG, "restoreAssets: merge returned null —— assets 缺失！"
+                        + "本 ROM/版本可能因隐藏 API 限制导致还原失败，"
+                        + "请去掉 --assets-encrypt 重新加固", null);
             }
         } catch (Throwable t) {
-            Log.w(TAG, "restoreAssets: skipped (assets may be unavailable)", t);
+            Log.e(TAG, "restoreAssets: FAILED (assets 可能缺失)，"
+                    + "去掉 --assets-encrypt 重新加固即可恢复", t);
         }
     }
 
     private static android.content.res.AssetManager mergeAssetManager(Context base, String extraPath) {
         try {
             bypassHiddenApi();
+            Class<?> amClass = Class.forName("android.content.res.AssetManager");
+            String src = base.getApplicationInfo().sourceDir;
+            // 优先：隐藏构造器 AssetManager(String[]) 一次性注入全部路径（调用更短、部分 ROM 更稳）
+            try {
+                Constructor<?> ctor = amClass.getDeclaredConstructor(String[].class);
+                ctor.setAccessible(true);
+                return (android.content.res.AssetManager) ctor.newInstance(
+                        (Object) new String[]{src, extraPath});
+            } catch (Throwable t1) {
+                Log.w(TAG, "mergeAssetManager: AssetManager(String[]) 不可用，回退 addAssetPath", t1);
+            }
+            // 回退：无参构造 + addAssetPath
             android.content.res.AssetManager am =
-                (android.content.res.AssetManager) Class.forName("android.content.res.AssetManager")
-                    .getDeclaredConstructor().newInstance();
+                (android.content.res.AssetManager) amClass.getDeclaredConstructor().newInstance();
             Method add = am.getClass().getDeclaredMethod("addAssetPath", String.class);
             add.setAccessible(true);
-            add.invoke(am, base.getApplicationInfo().sourceDir);  // 原 APK（assets 已剥离）
-            add.invoke(am, extraPath);                            // 解密后的 assets zip
+            add.invoke(am, src);       // 原 APK（assets 已剥离）
+            add.invoke(am, extraPath); // 解密后的 assets zip
             return am;
         } catch (Throwable t) {
-            Log.w(TAG, "mergeAssetManager failed", t);
+            Log.e(TAG, "mergeAssetManager failed (hidden API 可能被本 ROM 限制)", t);
             return null;
         }
     }
@@ -514,7 +528,7 @@ class AssetRestorer {
             }
             return outZip.getAbsolutePath();
         } catch (Throwable t) {
-            Log.w("JG", "AssetRestorer.restore failed", t);
+            Log.e("JG", "AssetRestorer.restore failed", t);
             return null;
         }
     }

@@ -418,7 +418,7 @@ def self_verify(out_apk, orig_dexes):
 # --------------------------------------------------------------------------
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
-           no_assets=False):
+           assets_encrypt=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -448,9 +448,9 @@ def harden(input_apk, output_apk=None, keep=False,
     orig_dexes = read_dexes(input_apk, dex_names)
     _lap(sw, "收集DEX")
 
-    # 1.5) 原始 assets（可选加密剥离）
+    # 1.5) 原始 assets（可选加密剥离；默认关闭，避免运行时还原失败导致 App 缺资源）
     assets = []
-    if not no_assets:
+    if assets_encrypt:
         assets = collect_assets(input_apk)
         print("[1.5] 待加密 assets 条目数:", len(assets))
 
@@ -515,14 +515,16 @@ def main():
     ap.add_argument("--ksAlias", help="密钥别名（默认 common）")
     ap.add_argument("--ksPass", help="密钥库密码（默认内置）")
     ap.add_argument("--ksKeyPass", help="密钥密码（默认同密钥库密码）")
-    ap.add_argument("--no-assets-encrypt", action="store_true",
-                    help="不加密/剥离 assets（默认会加密原始 assets/ 以关闭资源明文泄漏）")
+    ap.add_argument("--assets-encrypt", action="store_true",
+                    help="加密并剥离原始 assets/（实验性）：关闭资源明文泄漏，运行时由壳还原；"
+                         "部分 ROM/高版本可能因隐藏 API 限制导致还原失败（App 缺资源），"
+                         "遇此情况请去掉本参数重新加固")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
                ks=args.ks, ks_alias=args.ksAlias,
                ks_pass=args.ksPass, ks_keypass=args.ksKeyPass,
-               no_assets=args.no_assets_encrypt)
+               assets_encrypt=args.assets_encrypt)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

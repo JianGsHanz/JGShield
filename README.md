@@ -234,6 +234,10 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
    Android 9+ 系统在 `makeApplication()` 早于 `attachBaseContext` 加载 `android:appComponentFactory` 指定的类，
    此时 DEX 尚未注入，被系统 catch 后回退默认工厂，不影响运行。
 3. **原生库命名空间**：已通过方案 B（DEX 注入 `sysLoader`）解决，原 App 原生库解析与未加固一致。
+4. **assets/ 加密（实验性、默认关闭）**：
+   - 加固核心支持把原始 `assets/` 加密进 `jg` 载荷并从 APK 剥离（关闭资源明文泄漏），运行时由壳解密还原进 `AssetManager`。
+   - **默认不开启**（CLI 需显式 `--assets-encrypt`）：因为运行时还原依赖反射绕过隐藏 API 合并 `AssetManager`，在部分 OEM/高版本 ROM 上可能失败，失败后 App 会缺资源而崩。
+   - 若开启后某 App 报 assets 缺失/资源找不到，**去掉 `--assets-encrypt` 重新加固即可恢复**（assets 留在 APK 内，与未加固行为一致）。
 
 ---
 
