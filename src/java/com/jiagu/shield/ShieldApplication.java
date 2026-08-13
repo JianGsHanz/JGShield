@@ -128,6 +128,8 @@ public class ShieldApplication extends Application {
         }
         Log.i(TAG, "load: injectDexElements OK");
 
+        restoreAssets(base);  // 自包含 try-catch，失败仅记日志、不影响启动
+
         Loader.setClassLoader(base, sysLoader);
 
         Log.i(TAG, "load: origApp=" + origApp);
@@ -168,6 +170,94 @@ public class ShieldApplication extends Application {
             Log.w(TAG, "readMeta", e);
         }
         return null;
+    }
+
+    // ===== 资产运行时还原（关闭 APK 内 assets 明文）=====
+    // 自包含：任何异常都只记日志、绝不外抛，避免影响 App 启动。
+    // 解密后的 assets 写入应用私有目录的 zip（非公开可读），仅关闭 APK 内明文泄漏。
+    private void restoreAssets(Context base) {
+        try {
+            File zip = new File(getCacheDir(), "jg_assets.zip");
+            String zipPath = AssetRestorer.restore(base, zip);
+            if (zipPath == null) return;
+            android.content.res.AssetManager am = mergeAssetManager(base, zipPath);
+            if (am != null) {
+                replaceAssetManager(base, am);
+                Log.i(TAG, "restoreAssets: merged AssetManager OK");
+            } else {
+                Log.w(TAG, "restoreAssets: merge returned null (assets 可能不可用)");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "restoreAssets: skipped (assets may be unavailable)", t);
+        }
+    }
+
+    private static android.content.res.AssetManager mergeAssetManager(Context base, String extraPath) {
+        try {
+            bypassHiddenApi();
+            android.content.res.AssetManager am =
+                (android.content.res.AssetManager) Class.forName("android.content.res.AssetManager")
+                    .getDeclaredConstructor().newInstance();
+            Method add = am.getClass().getDeclaredMethod("addAssetPath", String.class);
+            add.setAccessible(true);
+            add.invoke(am, base.getApplicationInfo().sourceDir);  // 原 APK（assets 已剥离）
+            add.invoke(am, extraPath);                            // 解密后的 assets zip
+            return am;
+        } catch (Throwable t) {
+            Log.w(TAG, "mergeAssetManager failed", t);
+            return null;
+        }
+    }
+
+    private static void replaceAssetManager(Context base, android.content.res.AssetManager am) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object thread = at.getMethod("currentActivityThread").invoke(null);
+            Field fPkgs = at.getDeclaredField("mPackages");
+            fPkgs.setAccessible(true);
+            Object pkgs = fPkgs.get(thread);
+            for (Object ref : ((Map<?, WeakReference<?>>) pkgs).values()) {
+                Object loadedApk = ((WeakReference<?>) ref).get();
+                if (loadedApk != null) {
+                    try {
+                        Field f = loadedApk.getClass().getDeclaredField("mAssets");
+                        f.setAccessible(true);
+                        f.set(loadedApk, am);
+                    } catch (Throwable ignored) {}
+                    try {
+                        Field fRes = loadedApk.getClass().getDeclaredField("mResources");
+                        fRes.setAccessible(true);
+                        Object resMap = fRes.get(loadedApk);
+                        if (resMap instanceof Map) {
+                            for (Object wr : ((Map<?, ?>) resMap).values()) {
+                                Object res = (wr instanceof WeakReference) ? ((WeakReference<?>) wr).get() : wr;
+                                if (res != null) {
+                                    try {
+                                        Field fa = res.getClass().getDeclaredField("mAssets");
+                                        fa.setAccessible(true);
+                                        fa.set(res, am);
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "replaceAssetManager failed", t);
+        }
+    }
+
+    private static void bypassHiddenApi() {
+        try {
+            Method forName = Class.class.getDeclaredMethod("forName", String.class);
+            Method getDeclaredMethod = Class.class.getDeclaredMethod("getDeclaredMethod", String.class, Class[].class);
+            Class<?> vmRuntimeClass = (Class<?>) forName.invoke(null, "dalvik.system.VMRuntime");
+            Method getRuntime = (Method) getDeclaredMethod.invoke(vmRuntimeClass, "getRuntime", (Object) null);
+            Object vmRuntime = getRuntime.invoke(null);
+            Method setHiddenApiExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", String[].class);
+            setHiddenApiExemptions.invoke(vmRuntime, (Object) new String[]{"L"});
+        } catch (Throwable ignored) {}
     }
 
     @Override
@@ -305,7 +395,7 @@ class Decryptor {
         return out;
     }
 
-    private static byte[] readPayload(String apk) throws IOException {
+    static byte[] readPayload(String apk) throws IOException {
         ZipFile zf = new ZipFile(apk);
         try {
             ZipEntry ze = zf.getEntry(ShieldApplication.PAYLOAD_ENTRY);
@@ -339,7 +429,7 @@ class Decryptor {
         return bos.toByteArray();
     }
 
-    private static byte[] aesGcmDecrypt(byte[] key, byte[] blob) throws Exception {
+    static byte[] aesGcmDecrypt(byte[] key, byte[] blob) throws Exception {
         if (blob.length < 28) throw new IllegalStateException("blob too short");
         byte[] iv = Arrays.copyOfRange(blob, 0, 12);
         byte[] rest = Arrays.copyOfRange(blob, 12, blob.length);
@@ -371,6 +461,61 @@ class Decryptor {
             // rename 失败（极少数跨文件系统场景），回退直接写入
             writeFile(f, data);
             tmp.delete();
+        }
+    }
+}
+
+/** 运行时还原加密的 assets 区段：解密写入 zip，供 AssetManager.addAssetPath 合并 */
+class AssetRestorer {
+    static String restore(Context ctx, File outZip) {
+        try {
+            byte[] seed = DeriveKeys.seed(ctx);
+            String apk = ctx.getApplicationInfo().sourceDir;
+            byte[] payload = Decryptor.readPayload(apk);
+            if (payload == null || payload.length < 8) return null;
+            int p = 0;
+            for (int i = 0; i < 4; i++) {
+                if (payload[p] != (byte) "JGS1".charAt(i)) return null;
+                p++;
+            }
+            int dexCount = Decryptor.readInt(payload, p);
+            p += 4;
+            for (int i = 0; i < dexCount; i++) {
+                int len = Decryptor.readInt(payload, p);
+                p += 4;
+                p += len;
+            }
+            if (p + 4 > payload.length) return null;  // 无 asset 区段（旧格式/无 assets）
+            int assetCount = Decryptor.readInt(payload, p);
+            p += 4;
+            if (assetCount <= 0) return null;
+            java.util.zip.ZipOutputStream zos =
+                new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(outZip));
+            try {
+                for (int i = 0; i < assetCount; i++) {
+                    int nl = Decryptor.readInt(payload, p);
+                    p += 4;
+                    String name = new String(payload, p, nl, "UTF-8");
+                    p += nl;
+                    int len = Decryptor.readInt(payload, p);
+                    p += 4;
+                    byte[] blob = Arrays.copyOfRange(payload, p, p + len);
+                    p += len;
+                    byte[] key = DeriveKeys.keyFor(seed, "asset" + i);
+                    byte[] comp = Decryptor.aesGcmDecrypt(key, blob);
+                    byte[] data = Decryptor.inflate(comp);
+                    java.util.zip.ZipEntry ze = new java.util.zip.ZipEntry(name);
+                    zos.putNextEntry(ze);
+                    zos.write(data);
+                    zos.closeEntry();
+                }
+            } finally {
+                zos.close();
+            }
+            return outZip.getAbsolutePath();
+        } catch (Throwable t) {
+            Log.w("JG", "AssetRestorer.restore failed", t);
+            return null;
         }
     }
 }

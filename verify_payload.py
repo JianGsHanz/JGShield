@@ -69,9 +69,9 @@ def seed_from_apk(apk_path):
     cert = _cert_from_pkcs7(der)
     return SHA256.new(cert).digest()
 
-def derive_key(seed, idx):
+def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|dex" + str(idx).encode("utf-8"))
+    mac.update(b"JG|" + label + str(idx).encode("utf-8"))
     return mac.digest()
 
 def _read_int(b, off):
@@ -126,6 +126,70 @@ def check_payload(apk_path, orig_dexes, seed=None):
             if got != exp:
                 return False, "第 %d 个 dex 解密后与原始不一致 (len %d vs %d)" % (
                     i, len(got), len(exp))
+        return True, "ok"
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+# --------------------------------------------------------------------------
+# 资产区段解析与校验（与 harden.py 的 build_payload 资产区段格式对齐）
+# 资产区段位于 dex 区段之后：[asset_count][name_len,name,len,blob]...
+# --------------------------------------------------------------------------
+def parse_assets(apk_path, seed=None):
+    """返回 [(name, decrypted_bytes), ...] 或抛异常。无资产区段时返回空列表。"""
+    with zipfile.ZipFile(apk_path) as z:
+        names = z.namelist()
+        if "jg" not in names:
+            raise RuntimeError("APK 中无 jg 载荷条目")
+        tail = z.read("jg")
+    if len(tail) < 8:
+        raise RuntimeError("jg 载荷过短")
+    if tail[0:4] != config.MAGIC:
+        raise RuntimeError("魔数不匹配")
+    p = 4
+    dex_count = _read_int(tail, p)
+    p += 4
+    for _ in range(dex_count):
+        ln = _read_int(tail, p)
+        p += 4
+        p += ln
+    if p + 4 > len(tail):
+        return []  # 无 asset 区段
+    asset_count = _read_int(tail, p)
+    p += 4
+    if asset_count <= 0:
+        return []
+    if seed is None:
+        seed = seed_from_apk(apk_path)
+    assets = []
+    for i in range(asset_count):
+        nl = _read_int(tail, p)
+        p += 4
+        name = tail[p:p + nl].decode("utf-8")
+        p += nl
+        ln = _read_int(tail, p)
+        p += 4
+        blob = tail[p:p + ln]
+        p += ln
+        iv = blob[0:12]
+        rest = blob[12:]
+        key = derive_key(seed, i, b"asset")
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        comp = cipher.decrypt_and_verify(rest[:-16], rest[-16:])
+        data = zlib.decompress(comp)
+        assets.append((name, data))
+    return assets
+
+def check_assets(apk_path, orig_assets, seed=None):
+    """解密还原并与原始 assets 列表（顺序一致）比对。返回 (ok, detail)。"""
+    try:
+        if seed is None:
+            seed = seed_from_apk(apk_path)
+        got = parse_assets(apk_path, seed)
+        if len(got) != len(orig_assets):
+            return False, "asset 数量不符: 载荷=%d 原始=%d" % (len(got), len(orig_assets))
+        for (gn, gd), (on, od) in zip(got, orig_assets):
+            if gn != on or gd != od:
+                return False, "asset 不一致: %s (len %d vs %d)" % (gn, len(gd), len(od))
         return True, "ok"
     except Exception as e:
         return False, "%s: %s" % (type(e).__name__, e)

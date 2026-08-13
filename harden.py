@@ -22,6 +22,7 @@ import argparse
 import traceback
 
 import config
+import verify_payload
 from Crypto.Cipher import AES
 from Crypto.Hash import HMAC, SHA256
 from axml_editor import patch_manifest as _axml_patch
@@ -155,10 +156,19 @@ def load_seed(ks=None, ks_alias=None, ks_pass=None):
             cert = f.read()
     return SHA256.new(cert).digest()
 
-def derive_key(seed, idx):
+def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|dex" + str(idx).encode("utf-8"))
+    mac.update(b"JG|" + label + str(idx).encode("utf-8"))
     return mac.digest()  # 32 bytes -> AES-256
+
+def encrypt_asset(seed, idx, data):
+    """加密单个 assets 条目（与 encrypt_dex 同算法，label=asset 区分密钥）。"""
+    comp = zlib_compress(data)
+    key = derive_key(seed, idx, b"asset")
+    iv = os.urandom(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    ct, tag = cipher.encrypt_and_digest(comp)
+    return iv + ct + tag
 
 def encrypt_dex(seed, idx, dex_bytes):
     comp = zlib_compress(dex_bytes)          # zlib 格式，对应 Java Inflater() 无参
@@ -168,12 +178,24 @@ def encrypt_dex(seed, idx, dex_bytes):
     ct, tag = cipher.encrypt_and_digest(comp)
     return iv + ct + tag
 
-def build_payload(seed, dex_list):
+def build_payload(seed, dex_list, asset_list=None):
     out = bytearray()
     out += config.MAGIC
     out += struct.pack("<I", len(dex_list))
     for i, d in enumerate(dex_list):
         blob = encrypt_dex(seed, i, d)
+        out += struct.pack("<I", len(blob))
+        out += blob
+    # 资产区段：加密原始 assets/ 条目，运行时由壳解密还原进 AssetManager。
+    # 末尾追加 asset_count + 若干 (name_len,name,len,blob)；无资产时为 0。
+    # 该区段位于 dex 区段之后，旧壳/旧校验逻辑读 dex 后自然停在末尾、不受影响。
+    assets = asset_list or []
+    out += struct.pack("<I", len(assets))
+    for i, (name, data) in enumerate(assets):
+        nb = name.encode("utf-8")
+        out += struct.pack("<I", len(nb))
+        out += nb
+        blob = encrypt_asset(seed, i, data)
         out += struct.pack("<I", len(blob))
         out += blob
     return bytes(out)
@@ -201,6 +223,20 @@ def read_dexes(apk_path, names):
         for n in names:
             out.append(z.read(n))
     return out
+
+def collect_assets(apk_path):
+    """收集原始 APK 的 assets/ 文件条目，用于加密后从 APK 剥离（关闭资源明文泄漏）。
+
+    仅覆盖 assets/（不含 res/）：res/ 由资源表 resources.arsc 索引，剥离后即使运行时
+    合并 AssetManager 也常无法正确还原 res/raw 等资源解析，风险高，故 res/ 保持原样。
+    """
+    items = []
+    with zipfile.ZipFile(apk_path) as z:
+        for info in z.infolist():
+            fn = info.filename
+            if fn.startswith("assets/") and not fn.endswith("/"):
+                items.append((fn, z.read(fn)))
+    return items
 
 # --------------------------------------------------------------------------
 # Manifest 改写（【已弃用】）
@@ -303,7 +339,7 @@ def _stored(name):
 
 
 def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path,
-                     native_libs_dir=None):
+                     native_libs_dir=None, strip_assets=False):
     """直接用 zipfile 重建 APK（Manifest 首条 + STORED，保持原资源+lib 顺序 + stub.dex + jg）。
     剔除原 classes*.dex、原 META-INF、原 AndroidManifest.xml。
 
@@ -336,6 +372,8 @@ def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path
                 if fn.startswith('META-INF/'):
                     continue
                 if fn == "jg":
+                    continue
+                if strip_assets and fn.startswith("assets/"):
                     continue
                 zout.writestr(info, zin.read(fn))
             # 3) 壳 DEX + 载荷
@@ -379,7 +417,8 @@ def self_verify(out_apk, orig_dexes):
 # 主流程
 # --------------------------------------------------------------------------
 def harden(input_apk, output_apk=None, keep=False,
-           ks=None, ks_alias=None, ks_pass=None, ks_keypass=None):
+           ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
+           no_assets=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -409,6 +448,12 @@ def harden(input_apk, output_apk=None, keep=False,
     orig_dexes = read_dexes(input_apk, dex_names)
     _lap(sw, "收集DEX")
 
+    # 1.5) 原始 assets（可选加密剥离）
+    assets = []
+    if not no_assets:
+        assets = collect_assets(input_apk)
+        print("[1.5] 待加密 assets 条目数:", len(assets))
+
     # 2) 二进制编辑 Manifest（跳过 apktool 解码/重编资源，大包从 ~10 分钟降到秒级）
     with zipfile.ZipFile(input_apk, 'r') as z:
         manifest_data = z.read('AndroidManifest.xml')
@@ -427,7 +472,7 @@ def harden(input_apk, output_apk=None, keep=False,
               % (ks_alias or config.KEY_ALIAS), flush=True)
     else:
         print("[*] 种子按内置签名证书(common)派生：与最终签名一致，换签即解密失败", flush=True)
-    payload = build_payload(seed, orig_dexes)
+    payload = build_payload(seed, orig_dexes, assets if assets else None)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
     print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 jg 条目" % (len(stub), len(payload)))
@@ -436,7 +481,7 @@ def harden(input_apk, output_apk=None, keep=False,
     # 4) zip 直打包（原资源 + patched Manifest + stub.dex + jg，跳过 apktool b）
     unsigned = os.path.join(work, "unsigned.apk")
     repackage_direct(input_apk, patched_manifest, stub, payload, unsigned,
-                     native_libs_dir=config.LIBJGGUARD_DIR)
+                     native_libs_dir=config.LIBJGGUARD_DIR, strip_assets=bool(assets))
     _lap(sw, "zip打包")
 
     # 5) 签名
@@ -447,6 +492,12 @@ def harden(input_apk, output_apk=None, keep=False,
 
     # 6) 内嵌回测
     self_verify(output_apk, orig_dexes)
+    # 6.5) assets 自检：解密还原后与原 assets 逐一比对
+    if assets:
+        ok, detail = verify_payload.check_assets(output_apk, assets)
+        if not ok:
+            raise RuntimeError("内嵌 assets 回测失败: " + detail)
+        print("[self-verify] 资产解密还原与原始一致: OK")
     _lap(sw, "自检")
     print("[总耗时 %.2fs]" % (time.time() - _t0), flush=True)
 
@@ -464,11 +515,14 @@ def main():
     ap.add_argument("--ksAlias", help="密钥别名（默认 common）")
     ap.add_argument("--ksPass", help="密钥库密码（默认内置）")
     ap.add_argument("--ksKeyPass", help="密钥密码（默认同密钥库密码）")
+    ap.add_argument("--no-assets-encrypt", action="store_true",
+                    help="不加密/剥离 assets（默认会加密原始 assets/ 以关闭资源明文泄漏）")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
                ks=args.ks, ks_alias=args.ksAlias,
-               ks_pass=args.ksPass, ks_keypass=args.ksKeyPass)
+               ks_pass=args.ksPass, ks_keypass=args.ksKeyPass,
+               no_assets=args.no_assets_encrypt)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
