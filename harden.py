@@ -386,7 +386,11 @@ def harden(input_apk, output_apk=None, keep=False,
 
     # 3) 构造载荷（魔数 JGS1），classes.dex 保持为干净壳 DEX
     seed = load_seed(ks, ks_alias, ks_pass)
-    print("[*] 种子已按签名证书派生（证书绑定密钥，换签即解密失败）", flush=True)
+    if ks and os.path.isfile(ks):
+        print("[*] 种子按你的签名证书派生(alias=%s)：证书绑定密钥，加固/上架须用同一证书，换签即解密失败"
+              % (ks_alias or config.KEY_ALIAS), flush=True)
+    else:
+        print("[*] 种子按内置签名证书(common)派生：与最终签名一致，换签即解密失败", flush=True)
     payload = build_payload(seed, orig_dexes)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
