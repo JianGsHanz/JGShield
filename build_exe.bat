@@ -37,7 +37,7 @@ if errorlevel 1 goto ERR_PIP
 
 echo [3/4] compiling stub.dex
 if not exist build\classes mkdir build\classes
-javac --release 8 -encoding UTF-8 -cp tools\android.jar -d build\classes src\java\com\jiagu\shield\ShieldApplication.java
+javac --release 8 -encoding UTF-8 -cp tools\android.jar -d build\classes src\java\com\jiagu\shield\*.java
 if errorlevel 1 goto ERR_JAVAC2
 if exist build\classes.jar del /f /q build\classes.jar
 jar cf build\classes.jar -C build\classes .

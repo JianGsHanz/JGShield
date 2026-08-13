@@ -50,7 +50,7 @@ echo "[3/4] 编译壳 stub.dex"
 rm -rf build/classes build/dex_out
 mkdir -p build/classes build/dex_out
 javac --release 8 -encoding UTF-8 -cp tools/android.jar -d build/classes \
-  src/java/com/jiagu/shield/ShieldApplication.java
+  src/java/com/jiagu/shield/*.java
 jar cf build/classes.jar -C build/classes .
 java -cp tools/d8.jar com.android.tools.r8.D8 --output build/dex_out --lib tools/android.jar --min-api 21 build/classes.jar
 mkdir -p build/dex
