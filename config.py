@@ -8,6 +8,7 @@ JGShield 加固工具集 - 共享配置
 """
 import os
 import sys
+import locale
 
 
 # -------------------------------------------------------------------------- #
@@ -110,6 +111,25 @@ WORK_DIR = os.path.join(EXEC_DIR, "work")
 OUTPUT_DIR = os.path.join(EXEC_DIR, "output")
 SAMPLES_DIR = os.path.join(EXEC_DIR, "test_apks")
 GEN_DIR = os.path.join(EXEC_DIR, "gen_samples")
+
+
+def _decode_bytes(b):
+    """将外部工具（aapt/adb/java 等）输出字节解码为 str。
+
+    这些原生/JVM 工具在中文 Windows 上常按系统代码页(cp936/GBK)输出，
+    而本程序的管道统一用 UTF-8，若直接 utf-8 解码会乱码。这里依次尝试
+    utf-8 -> gbk/cp936 -> 系统首选编码 -> utf-8(替换)，确保中文正确还原、绝不乱码。
+    """
+    encodings = ["utf-8", "gbk", "cp936"]
+    sys_enc = locale.getpreferredencoding(False)
+    if sys_enc and sys_enc.lower() not in ("utf-8", "utf8"):
+        encodings.append(sys_enc)
+    for enc in encodings:
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", errors="replace")
 
 
 def rmtree_safe(path):

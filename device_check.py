@@ -16,22 +16,25 @@ import argparse
 import subprocess
 
 import config
+from config import _decode_bytes
 
 ADB = config.ADB
 
 def adb(target, *args, check=True):
     cmd = [ADB, "-s", target] + list(args)
-    # 指定 utf-8 + replace，避免中文 Windows(GBK) 下解码 aapt/logcat 输出崩溃
-    p = subprocess.run(cmd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    if check and p.returncode != 0:
-        raise RuntimeError("adb %s failed rc=%d" % (args[0], p.returncode))
-    return p
+    # 外部工具按系统代码页(GBK)输出，读字节后用 _decode_bytes 容错解码，避免中文乱码
+    r = subprocess.run(cmd, capture_output=True)
+    if check and r.returncode != 0:
+        raise RuntimeError("adb %s failed rc=%d" % (args[0], r.returncode))
+    r.stdout = _decode_bytes(r.stdout or b"")
+    r.stderr = _decode_bytes(r.stderr or b"")
+    return r
 
 def get_pkg_launch(apk):
-    p = subprocess.run([config.AAPT, "dump", "badging", apk],
-                       capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    r = subprocess.run([config.AAPT, "dump", "badging", apk],
+                       capture_output=True)
+    p = type("R", (), {})()
+    p.stdout = _decode_bytes(r.stdout or b"")
     pkg = launch = None
     for line in (p.stdout or "").splitlines():
         if line.startswith("package:"):

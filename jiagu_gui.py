@@ -69,6 +69,7 @@ def child_env():
 def cli_dispatch():
     """--cli <module> <args...>  以 CLI 模式运行某模块（供 GUI 子进程调用）。"""
     _ensure_stdio()
+    _force_utf8_stdio()
     if len(sys.argv) < 3:
         print("usage: --cli <module> <args...>")
         sys.exit(2)
@@ -108,6 +109,19 @@ def _ensure_stdio():
                 setattr(sys, attr, stream)
             except Exception:
                 setattr(sys, attr, open(os.devnull, "w"))
+
+
+def _force_utf8_stdio():
+    """双保险：无论 PYTHONUTF8 是否生效，强制子进程 stdout/stderr 以 UTF-8 编码，
+    保证写入 GUI 管道的是 UTF-8，避免中文日志在 GUI 侧被按其他代码页解码而乱码。"""
+    for attr in ("stdout", "stderr"):
+        s = getattr(sys, attr, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 # --------------------------------------------------------------------------- #

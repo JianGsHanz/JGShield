@@ -33,6 +33,9 @@ from axml_editor import get_orig_app_class as _axml_get_orig
 # 这些参数后面跟的“值”是密码，打印/回显时必须脱敏
 _PASSWORD_KEYS = ("--ksPass", "--ksKeyPass", "--storepass", "--keypass")
 
+# 外部工具(aapt/adb/java)输出按系统代码页(GBK)时，用本函数容错解码，避免日志乱码
+from config import _decode_bytes
+
 def _format_args(cmd):
     """把命令列表格式化为可读字符串，密码值显示为 ***。"""
     out = []
@@ -55,17 +58,25 @@ class _RunResult:
         self.stdout = stdout
         self.stderr = ""
 
+
 def run(cmd, cwd=None, env=None, check=True):
     """流式执行：子进程输出边产生边打印，保证 GUI 实时显示；
-    同时累积 stdout 供调用方检查，并打印该命令耗时。"""
+    同时累积 stdout 供调用方检查，并打印该命令耗时。
+
+    外部工具（aapt/adb/java）在中文 Windows 下按 GBK 输出，故读字节后用
+    _decode_bytes 容错解码，避免日志中文乱码。
+    """
     print(">>", _format_args(cmd) if isinstance(cmd, list) else cmd, flush=True)
     t0 = time.time()
     p = subprocess.Popen(cmd, cwd=cwd, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, encoding="utf-8", errors="replace", bufsize=1)
+                         bufsize=0)
     buf = []
-    for line in p.stdout:
-        line = line.rstrip("\r\n")
+    while True:
+        raw = p.stdout.readline()
+        if not raw:
+            break
+        line = _decode_bytes(raw).rstrip("\r\n")
         buf.append(line)
         print(line, flush=True)   # 实时刷新（配合 PYTHONUNBUFFERED 生效）
     rc = p.wait()
@@ -118,14 +129,14 @@ def extract_cert_der(ks, alias, storepass):
         if ks.lower().endswith((".p12", ".pfx")):
             base += ["-storetype", "PKCS12"]
         try:
-            subprocess.run(base, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", check=True,
-                           env=env_with_android())
+            r = subprocess.run(base, capture_output=True, check=True,
+                               env=env_with_android())
+            _ = _decode_bytes(r.stdout or b"")
         except subprocess.CalledProcessError:
             # 部分 keystore 需显式声明类型，重试
-            subprocess.run(base + ["-storetype", "PKCS12"], capture_output=True,
-                           text=True, encoding="utf-8", errors="replace", check=True,
-                           env=env_with_android())
+            r = subprocess.run(base + ["-storetype", "PKCS12"], capture_output=True,
+                               check=True, env=env_with_android())
+            _ = _decode_bytes(r.stdout or b"")
         with open(der, "rb") as f:
             return f.read()
     finally:
