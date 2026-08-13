@@ -10,7 +10,7 @@ echo.
 echo ================= build\build_exe.log =================
 type build\build_exe.log
 echo ======================================================
-echo Build finished (log: build\build_exe.log). Press any key to close.
+echo Build finished. Log: build\build_exe.log. Press any key to close.
 pause >nul
 goto :eof
 
@@ -49,11 +49,11 @@ if errorlevel 1 goto ERR_D8B
 copy /y build\dex_out\classes.dex build\dex\stub.dex
 if errorlevel 1 goto ERR_COPY
 
-echo [3.5/4] compiling native guard (.so)
+echo [3.5/4] compiling native guard .so
 call build_native.bat
 if errorlevel 1 (
   echo [WARN] native guard build failed; exe still builds but libjgguard.so will be missing.
-  echo        harden.py will skip native injection (loses only the native guard layer). Check NDK path.
+  echo        harden.py will skip native injection, loses only the native guard layer. Check NDK path.
 ) else (
   echo [OK] native guard built
 )
@@ -82,7 +82,7 @@ exit /b 1
 echo [ERR] missing tools\android.jar
 exit /b 1
 :ERR_PIP
-echo [ERR] pip install failed (no network or bad index)
+echo [ERR] pip install failed, no network or bad index
 exit /b 1
 :ERR_JAVAC2
 echo [ERR] javac failed

@@ -20,7 +20,7 @@ if defined JG_NDK (
 
 if not exist "%NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin" (
   echo [ERR] NDK toolchain not found: %NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin
-  echo Set env JG_NDK to your NDK root (it should contain toolchains\llvm\prebuilt\windows-x86_64\bin)
+  echo Set env JG_NDK to your NDK root, it should contain toolchains\llvm\prebuilt\windows-x86_64\bin
   exit /b 1
 )
 set "PRE=%NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin"
@@ -42,8 +42,8 @@ goto :eof
 set "ABI=%1"
 set "CLANG=%2"
 if not exist "tools\libjgguard\%ABI%" mkdir "tools\libjgguard\%ABI%"
-echo [build_native] %ABI%  (%PRE%\%CLANG%)
-"%PRE%\%CLANG%" --shared -fPIC -O2 -o "tools\libjgguard\%ABI%\libjgguard.so" "%SRC%" -llog
+echo [build_native] %ABI%  %PRE%\%CLANG%
+call "%PRE%\%CLANG%" --shared -fPIC -O2 -o "tools\libjgguard\%ABI%\libjgguard.so" "%SRC%" -llog
 if errorlevel 1 (
   echo [ERR] %ABI% build failed
   exit /b 1
