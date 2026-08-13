@@ -94,6 +94,15 @@ else:
     if not os.path.isfile(KEYTOOL):
         KEYTOOL = "keytool"
 
+# javac（gen_samples.py 编译测试样本用；与 JAVA 同目录，按平台加 .exe）
+if JAVA and (JAVA == "java" or os.path.basename(JAVA) == "java"):
+    JAVAC = "javac"
+else:
+    _java_dir = os.path.dirname(JAVA)
+    JAVAC = os.path.join(_java_dir, _exe("javac"))
+    if not os.path.isfile(JAVAC):
+        JAVAC = "javac"
+
 # adb（bundled 或从 SDK / PATH 查找）
 ADB = os.path.join(TOOLS, _exe("adb"))
 if not os.path.isfile(ADB):

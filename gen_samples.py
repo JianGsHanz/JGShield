@@ -130,7 +130,7 @@ def build_one(s, base_work, out_dir):
         open(os.path.join(src, "Helper.java"), "w", encoding="utf-8").write(java_helper(pkg))
 
     # ---- 编译 + dx ----
-    javac_bin = "C:/Program Files/Java/jdk-11.0.21/bin/javac.exe"
+    javac_bin = config.JAVAC
     if s["dexs"] == 1:
         javac = [javac_bin, "--release", "8", "-cp", config.ANDROID_JAR,
                  "-d", cls, os.path.join(src, "MainActivity.java")]
