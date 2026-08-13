@@ -81,14 +81,17 @@ JGShield/
 ├── test_repack.py         # 临时诊断脚本（硬编码路径，仅供排障，非交付物）
 ├── jiagu_gui.py           # tkinter 桌面 GUI（一键加固 / 静态回测 / 真机验证）
 ├── jiagu_gui.spec         # PyInstaller 打包配方（datas 含 tools/* 与 stub.dex）
-├── build_exe.bat          # 一键构建 exe（建 venv → 编 stub.dex → 杀旧进程 → pyinstaller）
-├── setup_tools.bat        # 从本地 Android SDK 补齐 tools/ 外部依赖（不进 git 的二进制）
-├── run_gui.bat            # 开发态启动 GUI
+├── build_exe.bat          # Windows 一键构建 exe（建 venv → 编 stub.dex → 杀旧进程 → pyinstaller）
+├── setup_tools.bat        # Windows：从本地 Android SDK 补齐 tools/ 外部依赖（不进 git 的二进制）
+├── run_gui.bat            # Windows 开发态启动 GUI
+├── build_exe.sh           # macOS/Linux 构建 .app（或可执行文件）
+├── setup_tools.sh         # macOS/Linux：从 Android SDK 补齐 tools/ 依赖
+├── run_gui.sh             # macOS/Linux 开发态启动 GUI
 └── .gitignore
 ```
 
 > `tools/`（约 57MB 二进制工具）与 `build/`、`dist/`、`output/`、`test_apks/` 等均被 `.gitignore` 排除，
-> 仓库保持精简。**clone 后先跑 `setup_tools.bat` 补齐依赖即可开箱即用。**
+> 仓库保持精简。**clone 后：Windows 跑 `setup_tools.bat`、macOS/Linux 跑 `./setup_tools.sh` 补齐依赖即可开箱即用。**
 
 ---
 
@@ -96,7 +99,7 @@ JGShield/
 
 | 依赖 | 用途 | 备注 |
 |------|------|------|
-| Python **3.8.10** | 运行 / 打包 GUI | 必须用 3.8.10，因为打包用的 venv 需要 tkinter；3.13 venv 无 tkinter |
+| Python **3.8.10**（Windows）/ 任意带 tkinter 的 python3（macOS·Linux） | 运行 / 打包 GUI | Windows 打包必须用 3.8.10（其 venv 含 tkinter，3.13 venv 无）；macOS 建议 `brew install python`（系统自带 python 无 tkinter） |
 | JDK 11+ | 运行 apktool / uber-apk-signer / apksigner / d8 | `config.py` 自动探测常见安装路径，否则回退到 `PATH` 的 `java` |
 | Android SDK build-tools | `aapt.exe` | `setup_tools.bat` 从本地 SDK 复制 |
 | `apktool.jar` / `uber-apk-signer.jar` / `android.jar` / `d8.jar` | 资源解码 / 签名 / 编译壳 DEX | 由 `setup_tools.bat` 下载或复制 |
@@ -118,6 +121,44 @@ build_exe.bat
 ```
 
 构建产物：`dist/jiagu_gui.exe`（双击即用）。也可直接以源码方式运行（见下）。
+
+---
+
+## 🍎 macOS / Linux 支持
+
+核心加固逻辑（壳 Java + Python）本身跨平台。原生工具二进制由 `config.py` 按 `sys.platform` 自动适配：
+
+- `aapt` / `adb` / `keytool` 文件名（Windows 加 `.exe`，macOS/Linux 无扩展名）与 JDK/SDK 路径自动选择。
+- `apktool.jar` / `uber-apk-signer.jar` / `apksigner.jar` / `d8.jar` / `android.jar` 均为 Java jar，**跨平台通用**。
+
+### 准备依赖
+
+```bash
+git clone https://github.com/JianGsHanz/JGShield.git
+cd JGShield
+
+# 1) 补齐外部依赖（从 Android SDK 复制 darwin 版 aapt/adb/apksigner/d8/android.jar + 下载 apktool/uber-apk-signer + 生成测试密钥）
+./setup_tools.sh
+
+# 2) 构建桌面 .app（可选；不构建也能直接 python 跑 GUI）
+./build_exe.sh
+```
+
+构建产物：macOS 为 `dist/jiagu_gui.app`（双击即用）；Linux 为 `dist/jiagu_gui`。
+
+### 直接以源码运行（无需打包）
+
+```bash
+python3 jiagu_gui.py          # 开发态 GUI
+# 或
+./run_gui.sh
+```
+
+> ⚠️ **aapt 提示**：新版 Android SDK（build-tools 30+）只提供 `aapt2`、不再含 `aapt`。
+> `setup_tools.sh` 会尽力复制 darwin 版 `aapt`；若复制不到会给出提示。
+> **aapt 仅用于真机验证(`device_check.py`)与静态回测(`verify.py`)提取包名**，加固核心路径（zip 直打包）不依赖它——
+> 因此缺 `aapt` 仅影响「真机/回测」功能，不影响 `harden.py` 加固本身。
+> 需要完整功能时，从旧版 build-tools 复制 darwin 版 `aapt` 到 `tools/aapt`，或 `brew install android-sdk`。
 
 ---
 
