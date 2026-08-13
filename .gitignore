@@ -14,6 +14,7 @@ output/
 temp/
 work/
 _batch_b2.txt
+test_repack.py
 
 # ---- Test samples (regenerable via gen_samples.py) ----
 test_apks/
