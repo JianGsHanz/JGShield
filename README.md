@@ -126,6 +126,8 @@ build_exe.bat
 
 ## 🍎 macOS / Linux 支持
 
+> ⚠️ **未经真机/真实环境实测**：本项目的 macOS / Linux 支持（含 `build_exe.sh` 打包 `.app`、跨平台工具链适配）**仅通过代码与脚本静态校验，从未在真实 Mac/Linux 主机上跑通构建**。按现有代码与文档估算，构建出 `.app` 的成功率约 **60–70%**，失败点大概率在 PyInstaller + macOS + tkinter 打包组合及 JDK/SDK 工具链，而非加固逻辑本身。如需在 Mac/Linux 上使用，请严格按下方步骤准备环境，并把构建报错反馈以便修正。
+
 核心加固逻辑（壳 Java + Python）本身跨平台。原生工具二进制由 `config.py` 按 `sys.platform` 自动适配：
 
 - `aapt` / `adb` / `keytool` 文件名（Windows 加 `.exe`，macOS/Linux 无扩展名）与 JDK/SDK 路径自动选择。

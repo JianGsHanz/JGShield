@@ -4,6 +4,7 @@
 # 用途：clone 仓库后运行，补齐 tools/ 下 harden.py 所需的外部工具
 # 前置：本机已安装 Android SDK（设 ANDROID_HOME 或 ANDROID_SDK_ROOT）
 #       脚本会复制 SDK 内工具，并下载 apktool / uber-apk-signer
+# ⚠️ 未经 Mac/Linux 真实环境实测；本脚本仅做静态逻辑校验，请按 README 说明准备环境后运行
 # ============================================================
 set -e
 cd "$(dirname "$0")"

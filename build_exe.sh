@@ -3,6 +3,7 @@
 # JGShield GUI 构建脚本 (macOS / Linux)
 # 产出：dist/jiagu_gui.app (macOS) 或 dist/jiagu_gui (Linux)
 # 前置：python3（建议 brew install python，自带 tkinter）、JDK、已完成 ./setup_tools.sh
+# ⚠️ 未经 Mac/Linux 真实环境实测；构建成功率约 60-70%，失败多在 PyInstaller+tkinter 打包，详见 README「macOS / Linux 支持」章节
 # ============================================================
 set -e
 cd "$(dirname "$0")"
