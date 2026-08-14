@@ -14,6 +14,7 @@ import os
 import time
 import re
 import sys
+import zlib
 import struct
 import shutil
 import zipfile
@@ -178,7 +179,7 @@ def encrypt_dex(seed, idx, dex_bytes):
     ct, tag = cipher.encrypt_and_digest(comp)
     return iv + ct + tag
 
-def build_payload(seed, dex_list, asset_list=None):
+def build_payload(seed, dex_list, asset_list=None, method_sections=None):
     out = bytearray()
     out += config.MAGIC
     out += struct.pack("<I", len(dex_list))
@@ -198,7 +199,98 @@ def build_payload(seed, dex_list, asset_list=None):
         blob = encrypt_asset(seed, i, data)
         out += struct.pack("<I", len(blob))
         out += blob
+    # P3.1 方法区段：每个被抽取 DEX 一条 (dex_idx, [(method_idx, code_off, insns_size, blob), ...])。
+    # 位于资产区段之后；旧壳/旧校验读完 dex+asset 后自然停在末尾，不受影响。
+    msecs = method_sections or []
+    out += struct.pack("<I", len(msecs))
+    for (dex_idx, entries) in msecs:
+        out += struct.pack("<I", dex_idx)
+        out += struct.pack("<I", len(entries))
+        for (method_idx, code_off, insns_size, blob) in entries:
+            out += struct.pack("<I", method_idx)
+            out += struct.pack("<I", code_off)
+            out += struct.pack("<I", insns_size)
+            out += struct.pack("<I", len(blob))
+            out += blob
     return bytes(out)
+
+# --------------------------------------------------------------------------
+# P3.1 DEX 方法级指令抽取（离线，防内存 dump 的核心）
+# --------------------------------------------------------------------------
+def _read_uleb128(b, off):
+    """从 DEX 字节流读 LEB128 无符号整数，返回 (value, 新偏移)。"""
+    result = 0
+    shift = 0
+    idx = off
+    while True:
+        x = b[idx]
+        idx += 1
+        result |= (x & 0x7f) << shift
+        if not (x & 0x80):
+            break
+        shift += 7
+    return result, idx
+
+def _u32(b, off):
+    return (b[off] & 0xff) | ((b[off+1] & 0xff) << 8) \
+        | ((b[off+2] & 0xff) << 16) | ((b[off+3] & 0xff) << 24)
+
+def derive_method_key(seed, dex_idx, method_idx):
+    """per-method 密钥：HMAC(seed, "JG|m"+dexIdx+"."+methodIdx)。
+    沿用整包种子体系，换签即失败；dexIdx.methodIdx 唯一定位方法。"""
+    mac = HMAC.new(seed, digestmod=SHA256)
+    mac.update(b"JG|m" + str(dex_idx).encode("utf-8") + b"."
+               + str(method_idx).encode("utf-8"))
+    return mac.digest()
+
+def extract_methods(seed, dex_idx, dex_bytes):
+    """抽取单个 DEX 每个方法的 CodeItem.insns 并加密，原位回填 NOP（保留 insns_size
+    使 ART 仍可解析验证），返回 (NOP 化后的 dex 字节, [(method_idx, code_off, insns_size, blob), ...])。
+    blob = iv(12) + AES-256-GCM(ct+tag)。运行时(P3.3)按 method_idx 查密文还原。
+
+    注：不在方法首字节嵌入 'JG' 标记——0x4A47 作为指令首字节会触发 ART 验证器拒绝
+    （0x4A 解码为 AGET_CHAR，需特定寄存器类型，验证失败）；P3.3 改用「method_idx 是否
+    在抽取表」判定待还原方法，绕过此限制，更稳。"""
+    dex = bytearray(dex_bytes)
+    methods = []
+    class_defs_off = _u32(dex, 0x64)
+    class_defs_size = _u32(dex, 0x60)
+    for ci in range(class_defs_size):
+        cd_off = class_defs_off + ci * 32
+        class_data_off = _u32(dex, cd_off + 0x18)
+        if class_data_off == 0:
+            continue
+        p = class_data_off
+        static_fields_size, p = _read_uleb128(dex, p)
+        instance_fields_size, p = _read_uleb128(dex, p)
+        direct_methods_size, p = _read_uleb128(dex, p)
+        virtual_methods_size, p = _read_uleb128(dex, p)
+        # 跳过字段
+        for _ in range(static_fields_size + instance_fields_size):
+            _, p = _read_uleb128(dex, p)
+            _, p = _read_uleb128(dex, p)
+        running = 0
+        for _ in range(direct_methods_size + virtual_methods_size):
+            diff, p = _read_uleb128(dex, p)
+            running += diff
+            _, p = _read_uleb128(dex, p)          # access_flags
+            code_off, p = _read_uleb128(dex, p)
+            if code_off == 0:
+                continue
+            insns_size = _u32(dex, code_off + 12)
+            if insns_size == 0:
+                continue
+            insns_off = code_off + 16
+            insns = bytes(dex[insns_off:insns_off + insns_size * 2])
+            key = derive_method_key(seed, dex_idx, running)
+            iv = os.urandom(12)
+            cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+            ct, tag = cipher.encrypt_and_digest(zlib.compress(insns))
+            blob = iv + ct + tag
+            methods.append((running, code_off, insns_size, blob))
+            for k in range(insns_size * 2):       # 原位回填 NOP
+                dex[insns_off + k] = 0
+    return bytes(dex), methods
 
 def zlib_compress(data):
     import zlib
@@ -418,7 +510,7 @@ def self_verify(out_apk, orig_dexes):
 # --------------------------------------------------------------------------
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
-           assets_encrypt=False):
+           assets_encrypt=False, method_extract=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -472,7 +564,23 @@ def harden(input_apk, output_apk=None, keep=False,
               % (ks_alias or config.KEY_ALIAS), flush=True)
     else:
         print("[*] 种子按内置签名证书(common)派生：与最终签名一致，换签即解密失败", flush=True)
-    payload = build_payload(seed, orig_dexes, assets if assets else None)
+    # P3.1 方法级指令抽取（默认关闭）：把每个方法的 insns 抽走加密、DEX 内原位回填 NOP。
+    # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，待 P3.3 运行时还原。
+    # 注意：开启后产物在 P3.3 之前不可独立运行（方法体为空），仅用于验证抽取链路。
+    extracted_dexes = orig_dexes
+    method_sections = None
+    if method_extract:
+        extracted_dexes = []
+        method_sections = []
+        total_methods = 0
+        for i, d in enumerate(orig_dexes):
+            ex, entries = extract_methods(seed, i, d)
+            extracted_dexes.append(ex)
+            method_sections.append((i, entries))
+            total_methods += len(entries)
+        print("[3.1] 抽取方法指令数: %d（需 P3.3 运行时还原，当前产物不可独立运行）" % total_methods,
+              flush=True)
+    payload = build_payload(seed, extracted_dexes, assets if assets else None, method_sections)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
     print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 jg 条目" % (len(stub), len(payload)))
@@ -519,12 +627,16 @@ def main():
                     help="加密并剥离原始 assets/（实验性）：关闭资源明文泄漏，运行时由壳还原；"
                          "部分 ROM/高版本可能因隐藏 API 限制导致还原失败（App 缺资源），"
                          "遇此情况请去掉本参数重新加固")
+    ap.add_argument("--method-extract", action="store_true",
+                    help="P3.1 方法级指令抽取（实验性）：抽取每个方法的指令并加密，DEX 内原位回填 NOP，"
+                         "运行时需 P3.3 native 还原才能执行；当前产物不可独立运行，仅用于验证抽取链路。默认关闭。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
                ks=args.ks, ks_alias=args.ksAlias,
                ks_pass=args.ksPass, ks_keypass=args.ksKeyPass,
-               assets_encrypt=args.assets_encrypt)
+               assets_encrypt=args.assets_encrypt,
+               method_extract=args.method_extract)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

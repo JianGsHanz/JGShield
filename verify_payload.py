@@ -74,6 +74,13 @@ def derive_key(seed, idx, label=b"dex"):
     mac.update(b"JG|" + label + str(idx).encode("utf-8"))
     return mac.digest()
 
+def derive_method_key(seed, dex_idx, method_idx):
+    """与 harden.py 的 extract_methods 完全一致：HMAC(seed, "JG|m"+dexIdx+"."+methodIdx)。"""
+    mac = HMAC.new(seed, digestmod=SHA256)
+    mac.update(b"JG|m" + str(dex_idx).encode("utf-8") + b"."
+               + str(method_idx).encode("utf-8"))
+    return mac.digest()
+
 def _read_int(b, off):
     return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8) \
         | ((b[off + 2] & 0xff) << 16) | ((b[off + 3] & 0xff) << 24)
@@ -115,16 +122,32 @@ def parse_payload(apk_path, seed=None):
 
 def check_payload(apk_path, orig_dexes, seed=None):
     """解密还原并与原始 DEX 列表比对。返回 (ok, detail)。
-    种子默认从加固产物自身的签名证书派生（与设备端一致）。"""
+    种子默认从加固产物自身的签名证书派生（与设备端一致）。
+    P3.1：若载荷含方法区段，先用其密文把「NOP 化 dex」还原回原始，再比对。"""
     try:
         if seed is None:
             seed = seed_from_apk(apk_path)
         count, dexs = parse_payload(apk_path)
         if count != len(orig_dexes):
             return False, "dex 数量不符: 载荷=%d 原始=%d" % (count, len(orig_dexes))
+        # P3.1 还原：若有方法区段，用其密文把 NOP 化 dex 还原回原始
+        methods_secs = parse_methods(apk_path, seed)
+        if methods_secs:
+            dexs = [bytearray(d) for d in dexs]
+            for (dex_idx, entries) in methods_secs:
+                for (method_idx, code_off, insns_size, blob) in entries:
+                    iv = blob[0:12]
+                    rest = blob[12:]
+                    key = derive_method_key(seed, dex_idx, method_idx)
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+                    comp = cipher.decrypt_and_verify(rest[:-16], rest[-16:])
+                    insns = zlib.decompress(comp)
+                    ins_off = code_off + 16
+                    dexs[dex_idx][ins_off:ins_off + len(insns)] = insns
+            dexs = [bytes(d) for d in dexs]
         for i, (got, exp) in enumerate(zip(dexs, orig_dexes)):
             if got != exp:
-                return False, "第 %d 个 dex 解密后与原始不一致 (len %d vs %d)" % (
+                return False, "第 %d 个 dex 解密/还原后与原始不一致 (len %d vs %d)" % (
                     i, len(got), len(exp))
         return True, "ok"
     except Exception as e:
@@ -193,3 +216,53 @@ def check_assets(apk_path, orig_assets, seed=None):
         return True, "ok"
     except Exception as e:
         return False, "%s: %s" % (type(e).__name__, e)
+
+# --------------------------------------------------------------------------
+# P3.1 方法区段解析（与 harden.py 的 build_payload 方法区段格式对齐）
+# 方法区段位于 dex 区段 + 资产区段之后：
+#   [method_dex_count]
+#   for each: [dex_idx][entry_count][ (method_idx, code_off, insns_size, blob) ]...
+# --------------------------------------------------------------------------
+def parse_methods(apk_path, seed=None):
+    """返回 [(dex_idx, [(method_idx, code_off, insns_size, blob), ...]), ...]。
+    无方法区段时返回空列表。"""
+    with zipfile.ZipFile(apk_path) as z:
+        names = z.namelist()
+        if "jg" not in names:
+            raise RuntimeError("APK 中无 jg 载荷条目")
+        tail = z.read("jg")
+    if len(tail) < 8:
+        raise RuntimeError("jg 载荷过短")
+    if tail[0:4] != config.MAGIC:
+        raise RuntimeError("魔数不匹配")
+    p = 4
+    dex_count = _read_int(tail, p); p += 4
+    for _ in range(dex_count):              # 跳过 dex 区段
+        ln = _read_int(tail, p); p += 4; p += ln
+    if p + 4 > len(tail):
+        return []
+    asset_count = _read_int(tail, p); p += 4
+    for _ in range(asset_count):            # 跳过资产区段
+        nl = _read_int(tail, p); p += 4; p += nl
+        ln = _read_int(tail, p); p += 4; p += ln
+    if p + 4 > len(tail):
+        return []
+    method_dex_count = _read_int(tail, p); p += 4
+    if method_dex_count <= 0:
+        return []
+    if seed is None:
+        seed = seed_from_apk(apk_path)
+    sections = []
+    for _ in range(method_dex_count):
+        dex_idx = _read_int(tail, p); p += 4
+        ec = _read_int(tail, p); p += 4
+        entries = []
+        for _ in range(ec):
+            method_idx = _read_int(tail, p); p += 4
+            code_off = _read_int(tail, p); p += 4
+            insns_size = _read_int(tail, p); p += 4
+            ln = _read_int(tail, p); p += 4
+            blob = tail[p:p + ln]; p += ln
+            entries.append((method_idx, code_off, insns_size, blob))
+        sections.append((dex_idx, entries))
+    return sections
