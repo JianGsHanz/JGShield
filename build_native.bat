@@ -8,7 +8,7 @@ REM NDK lookup order: env JG_NDK -> ANDROID_NDK -> default D:\Android\AndoridSDK
 REM ============================================================================
 setlocal
 
-set "SRC=src\native\jg_guard.c"
+set "BASESRC=src\native\jg_guard.c src\native\jg_method_restore.c src\native\jg_integrity.c src\native\jg_inline_hook.c src\native\jg_method_restore_hook.c"
 
 if defined JG_NDK (
   set "NDK=%JG_NDK%"
@@ -41,9 +41,13 @@ goto :eof
 :build
 set "ABI=%1"
 set "CLANG=%2"
+rem 解释桥寄存器桥 jg_hook_bridge.S 仅 aarch64 提供；其余 ABI 不支持 inline hook，
+rem 由 jg_inline_hook.c 返回 -99 触发调用方回退批量还原。
+set "SRC=%BASESRC%"
+if "%ABI%"=="arm64-v8a" set "SRC=%BASESRC% src\native\jg_hook_bridge.S"
 if not exist "tools\libjgguard\%ABI%" mkdir "tools\libjgguard\%ABI%"
 echo [build_native] %ABI%  %PRE%\%CLANG%
-call "%PRE%\%CLANG%" --shared -fPIC -O2 -o "tools\libjgguard\%ABI%\libjgguard.so" "%SRC%" -llog
+call "%PRE%\%CLANG%" --shared -fPIC -O2 -o "tools\libjgguard\%ABI%\libjgguard.so" %SRC% -llog -lz
 if errorlevel 1 (
   echo [ERR] %ABI% build failed
   exit /b 1

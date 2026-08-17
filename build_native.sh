@@ -10,7 +10,7 @@
 # ============================================================================
 set -e
 
-SRC="src/native/jg_guard.c"
+SRC="src/native/jg_guard.c src/native/jg_method_restore.c src/native/jg_integrity.c src/native/jg_inline_hook.c src/native/jg_method_restore_hook.c"
 
 if [ -n "$JG_NDK" ]; then
   NDK="$JG_NDK"
@@ -45,7 +45,7 @@ for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
   CLANG="${MAP[$ABI]}"
   mkdir -p "tools/libjgguard/$ABI"
   echo "[build_native] $ABI ($PRE/$CLANG)"
-  "$PRE/$CLANG" --shared -fPIC -O2 -o "tools/libjgguard/$ABI/libjgguard.so" "$SRC" -llog
+  "$PRE/$CLANG" --shared -fPIC -O2 -o "tools/libjgguard/$ABI/libjgguard.so" $SRC -llog -lz
   echo "[OK] tools/libjgguard/$ABI/libjgguard.so"
 done
 echo "[build_native] 全部 ABI 编译完成"

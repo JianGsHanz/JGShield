@@ -44,6 +44,7 @@ static const char *MAP_KEYWORDS[] = {
 static const int FRIDA_PORTS[] = {27042, 27043};
 static const int POLL_MS = 2000;          /* 周期轮询间隔 */
 static volatile int g_stop = 0;
+static int g_response_exit = 0;   /* 0 = log-only(fail-safe 默认); 1 = exit */
 
 /* 防御式读文件：成功返回读取字节数(>=0)，失败返回 -1；buf 末尾补 \0 */
 static int read_file(const char *path, char *buf, size_t buflen) {
@@ -160,8 +161,14 @@ static int detect(void) {
 }
 
 static void respond(void) {
+    /* 统一收口到 Java 侧 STRENGTHEN_RESPONSE：默认 log=仅记录、不阻断；
+       exit=静默退出进程（与 AntiDebug / AntiTamper 行为一致）。 */
+    if (!g_response_exit) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "tamper detected but response=log (STRENGTHEN_RESPONSE) -> continue");
+        return;
+    }
     __android_log_print(ANDROID_LOG_WARN, TAG, "tamper confirmed -> exit");
-    /* 与 Java AntiTamper 默认行为一致：静默退出进程 */
     exit(1);
 }
 
@@ -186,6 +193,21 @@ Java_com_jiagu_shield_JgGuard_nativeStart(JNIEnv *env, jclass clazz) {
         return;
     }
     pthread_detach(tid);
+}
+
+JNIEXPORT void JNICALL
+Java_com_jiagu_shield_JgGuard_nativeSetResponse(JNIEnv *env, jclass clazz, jstring mode) {
+    (void)clazz;
+    g_response_exit = 0;
+    if (mode) {
+        const char *s = (*env)->GetStringUTFChars(env, mode, NULL);
+        if (s) {
+            if (strcmp(s, "exit") == 0) g_response_exit = 1;
+            (*env)->ReleaseStringUTFChars(env, mode, s);
+        }
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "response mode=%s",
+                        g_response_exit ? "exit" : "log");
 }
 
 JNIEXPORT jint JNICALL

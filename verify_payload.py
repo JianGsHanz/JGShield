@@ -15,11 +15,13 @@ from Crypto.Hash import HMAC, SHA256
 
 import config
 
-def load_seed():
-    """回退用：从内置证书派生种子（仅当未提供用户 keystore 时）。"""
+def load_cert_hash():
+    """回退用：内置证书的 cert_hash = SHA256(证书DER)（仅当未提供用户 keystore 时）。"""
     with open(config.CERT_DER, "rb") as f:
         cert = f.read()
     return SHA256.new(cert).digest()
+
+load_seed = load_cert_hash  # 兼容旧调用名
 
 # --------------------------------------------------------------------------
 # 从已签名 APK 自身的 META-INF 签名块提取证书，派生种子。
@@ -58,7 +60,24 @@ def _cert_from_pkcs7(data):
     # 否则会少算 4 字节导致与 keytool 导出的证书 SHA256 不一致。
     return data[v4:cn]
 
+def extract_salt(apk_path):
+    """从 jg 载荷末尾取 32B build_salt（HKDF-Extract 加盐派生的盐）。
+    所有区段解析器读完 dex+asset+method 后自然停住、从不触及这 32B，
+    故盐安全地位于载荷最末。"""
+    with zipfile.ZipFile(apk_path) as z:
+        if "jg" not in z.namelist():
+            raise RuntimeError("APK 中无 jg 载荷条目")
+        tail = z.read("jg")
+    if len(tail) < 32:
+        raise RuntimeError("jg 载荷过短，无法提取 salt trailer")
+    return tail[-32:]
+
 def seed_from_apk(apk_path):
+    """与设备端 DeriveKeys.seed(ctx,salt) 一致：
+      cert_hash = SHA256(签名证书DER)      # 从加固产物自身 META-INF 证书取
+      salt      = jg 载荷末 32B
+      seed      = HMAC-SHA256(key=salt, msg=cert_hash)   # HKDF-Extract
+    无需用户提供 keystore（证书从产物自身读取，与真机运行时相同）。"""
     with zipfile.ZipFile(apk_path) as z:
         names = [n for n in z.namelist()
                  if n.startswith("META-INF/")
@@ -67,7 +86,11 @@ def seed_from_apk(apk_path):
             raise RuntimeError("APK 中未找到签名证书 (META-INF/*.RSA)")
         der = z.read(names[0])
     cert = _cert_from_pkcs7(der)
-    return SHA256.new(cert).digest()
+    cert_hash = SHA256.new(cert).digest()
+    salt = extract_salt(apk_path)
+    mac = HMAC.new(salt, digestmod=SHA256)
+    mac.update(cert_hash)
+    return mac.digest()
 
 def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)

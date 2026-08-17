@@ -21,6 +21,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -62,10 +63,16 @@ public class ShieldApplication extends Application {
     // ===== 反篡改（保命版）开关 =====
     // 改为 false 并重新编译 stub.dex 即可完全关闭反篡改；响应方式 / 轮询间隔同理。
     static final boolean ANTI_TAMPER_ENABLED = true;
-    // 发现篡改时的响应："exit"=静默退出进程（默认，仅在被篡改环境触发）；"none"=仅打印日志便于调试
+    // [已废弃] 原 AntiTamper 响应开关；现统一收口到 STRENGTHEN_RESPONSE（含 frida 检测）。
+    // 保留仅供兼容，不再被读取。
     static final String ANTI_TAMPER_RESPONSE = "exit";
     // 后台轮询间隔（毫秒）
     static final long ANTI_TAMPER_INTERVAL_MS = 2000;
+    // 统一响应开关（覆盖全部检测层）：root/模拟器检测、运行时自校验（自 hook/篡改）、
+    // 反调试/反注入（frida/substrate/xposed 等）、native jg_guard 端口/maps 扫描。
+    // "log"=仅打印日志便于调试（默认，fail-safe，避免误杀正常设备）；
+    // "exit"=确认命中即静默退出进程（生产加固可用）。所有层共用此开关，行为一致。
+    static final String STRENGTHEN_RESPONSE = "log";
 
     private Application realApp;
     private boolean realOnCreateCalled = false;
@@ -75,6 +82,12 @@ public class ShieldApplication extends Application {
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
         shellDir = getDir("jgshell", Context.MODE_PRIVATE);
+        // 必须在调用任何依赖 libjgguard.so 的 native 方法前加载该库
+        // （P3 的 nativeRestoreInit / nativeRestoreMethods 与本壳反篡改都依赖它）。
+        // 否则 decryptBuffers 内的 native 还原调用会抛 UnsatisfiedLinkError 被 catch 吞掉，
+        // 导致 DEX 始终停在 NOP 化状态、ART 因校验和失效拒载。
+        JgGuard.ensureLoaded();
+        JgGuard.configureResponse();   // 把统一响应开关传给 native（在 native 守护线程启动前）
         try {
             AntiDebug.check();
             load(base);
@@ -100,6 +113,19 @@ public class ShieldApplication extends Application {
             JgGuard.start();
         } catch (Throwable t) {
             Log.w(TAG, "native guard start skipped", t);
+        }
+
+        // 补强：环境检测（root/模拟器）+ 运行时自校验（自 hook/篡改）。fail-safe，
+        // 任何异常仅记日志、不影响启动；默认响应为「记录」而非退出，避免误杀正常设备。
+        try {
+            JgGuard.envCheck();
+        } catch (Throwable t) {
+            Log.w(TAG, "envCheck skipped", t);
+        }
+        try {
+            JgGuard.integrityScan();
+        } catch (Throwable t) {
+            Log.w(TAG, "integrityScan skipped", t);
         }
     }
 
@@ -316,6 +342,42 @@ public class ShieldApplication extends Application {
 
 /** 解密 + 解压原始 DEX 区段 */
 class Decryptor {
+    /** 方法级指令还原总开关（P3）。
+     *  默认关闭。开启需先重编 libjgguard.so（含 jg_method_restore*.c / jg_inline_hook*），
+     *  且仅在真机验证通过后使用。 */
+    static final boolean METHOD_RESTORE_ENABLED = true;
+
+    /** 还原模式：
+     *  false = 整包批量还原（P3.2，nativeRestoreMethods）。写回发生在 DEX 交给
+     *         InMemoryDexClassLoader 之前，无论 ART 是否拷贝 ByteBuffer 都保证运行期
+     *         指令正确 —— 安全默认。代价：内存中存在完整明文 DEX（抗 dump 较弱）。
+     *  true  = 解释桥惰性还原（P3.3，nativeRestoreInit + inline hook）。方法仅在首次被
+     *         解释执行前于运行期还原，内存抗 dump 最强。
+     *         前置条件：ART 必须原地使用 direct ByteBuffer（不拷贝）才生效；若设备 ART 在
+     *         构造 InMemoryDexClassLoader 时拷贝了 Buffer，惰性还原不会触发、App 会在首个
+     *         抽取方法处崩溃 —— 故须先在真机 logcat 确认有 JG-MethodRestoreHook [restore]
+     *         日志后再开启。hook 安装失败会自动回退批量还原。
+     *  ⚠ Android 9 及其它急切校验 ROM 的根本限制（2026-08-17 小米 MIX2 Android9 实测）：
+     *         ART 在 DefineClass 阶段就急切校验类的全部方法（发生在任何解释执行之前）。
+     *         NOP 化方法体末尾无 return/throw 终结指令 → VerifyError "Execution can walk
+     *         off end of code area" → 类校验失败、App 启动即崩。此时 inline hook 虽已成功
+     *         安装(realMode=1)，但校验早于解释执行，hook 永不触发（[dbg] handler 为空）。
+     *         结论：真惰性还原与急切校验架构不兼容，需 hook ART 校验器(VerifyClass/改
+     *         mirror::Class 状态)才能绕过——ROM 极脆弱，暂不采用。故生产默认用 false(批量)。
+     *         lazy=true 仅适用于校验被延迟/hook 落在执行路径上的机型(部分 Android 10+)。 */
+    static final boolean METHOD_RESTORE_LAZY = false;
+
+    /** P3.2 JNI 入口：把 NOP 版 DEX 直接缓冲区整体解密写回（批量，安全默认路径）。 */
+    public static native int nativeRestoreMethods(java.nio.ByteBuffer dexBuf, byte[] payload, byte[] seed, int dexIdx);
+
+    /** P3.3 JNI 入口：注册 DEX 内存区间 + 尝试安装解释桥 inline hook（惰性还原）。
+     *  返回 1=惰性还原模式生效; 0=hook 不可用已回退批量还原。 */
+    public static native int nativeRestoreInit(int dexIdx, java.nio.ByteBuffer dexBuf, byte[] payload, byte[] seed);
+
+    /** P-INTEGRITY JNI 入口：还原后自校验——逐方法解密载荷并与内存 live dex 比对，
+     *  返回不匹配方法数（0 表示还原正确 / 未被篡改）。maxPerDex>0 抽样（启动期用），-1 全量。
+     *  fail-safe：错误返回负值。 */
+    public static native int nativeVerifyDex(java.nio.ByteBuffer dexBuf, byte[] payload, byte[] seed, int dexIdx, int maxPerDex);
     static List<File> decrypt(Context ctx, File dexDir) throws Exception {
         // 多进程竞态防护：主进程与 :pushcore 等子进程共用同一 dexDir。
         // 先完成的进程写出 DEX 文件，后续进程直接复用，避免并发写导致
@@ -332,12 +394,13 @@ class Decryptor {
         if (tmps != null) for (File t : tmps) t.delete();
 
         List<File> out = new ArrayList<>();
-        byte[] seed = DeriveKeys.seed(ctx);
         String apk = ctx.getApplicationInfo().sourceDir;
         byte[] payload = readPayload(apk);
         if (payload == null || payload.length < 8) {
             throw new IllegalStateException("payload missing");
         }
+        // 先读载荷取 per-build salt，再 HKDF-Extract 派生 seed（证书绑定 + 抗跨构建 diff）
+        byte[] seed = DeriveKeys.seed(ctx, DeriveKeys.extractSalt(payload));
         int p = 0;
         for (int i = 0; i < 4; i++) {
             if (payload[p] != (byte) "JGS1".charAt(i)) {
@@ -374,12 +437,13 @@ class Decryptor {
      * “磁盘明文文件 + 启动期整段明文大块”两个泄漏点。
      */
     static List<ByteBuffer> decryptBuffers(Context ctx) throws Exception {
-        byte[] seed = DeriveKeys.seed(ctx);
         String apk = ctx.getApplicationInfo().sourceDir;
         byte[] payload = readPayload(apk);
         if (payload == null || payload.length < 8) {
             throw new IllegalStateException("payload missing");
         }
+        // 先读载荷取 per-build salt，再 HKDF-Extract 派生 seed
+        byte[] seed = DeriveKeys.seed(ctx, DeriveKeys.extractSalt(payload));
         int p = 0;
         for (int i = 0; i < 4; i++) {
             if (payload[p] != (byte) "JGS1".charAt(i)) {
@@ -406,8 +470,81 @@ class Decryptor {
             Arrays.fill(dex, (byte) 0);
             out.add(buf);
         }
+        // P3 方法还原接入点（受 METHOD_RESTORE_ENABLED 总开关控制，fail-safe）。
+        // 默认 lazy=false -> 整包批量还原（P3.2，安全）；lazy=true -> 解释桥惰性还原（P3.3）。
+        if (METHOD_RESTORE_ENABLED) {
+            try {
+                int realMode = 0;   /* native 返回：1=惰性 hook 生效(P3.3); 0=回退批量(P3.2) */
+                for (int i = 0; i < out.size(); i++) {
+                    ByteBuffer buf = out.get(i);
+                    buf.position(0);
+                    if (METHOD_RESTORE_LAZY) {
+                        realMode = nativeRestoreInit(i, buf, payload, seed);
+                    } else {
+                        nativeRestoreMethods(buf, payload, seed, i);
+                    }
+                    buf.position(0);
+                }
+                String mode = !METHOD_RESTORE_LAZY ? "batch(P3.2)"
+                        : (realMode == 1 ? "lazy-hook ACTIVE(P3.3)" : "lazy unavailable -> batch FALLBACK(P3.2)");
+                Log.i("JG", "method restore effective mode=" + mode + " on " + out.size() + " dex buffer(s)");
+            } catch (Throwable t) {
+                Log.w("JG", "method restore skipped", t);
+            }
+            // P3 抽取后 DEX 指令被 NOP 化，但加固期未重算 DEX 头校验和，ART 加载会因
+            // Bad checksum 拒载。此处按当前缓冲区内容重算 checksum(偏移8, adler32[12:])
+            // 与 signature(偏移12, sha1[32:])，使 NOP 化 DEX 可通过加载期校验。
+            // P3.2 整包还原写回原指令后同样需重算以匹配还原后的内容。
+            for (int i = 0; i < out.size(); i++) {
+                fixDexChecksum(out.get(i));
+            }
+            // P-INTEGRITY：DEX 还原后自校验——抽样解密载荷并与内存 live dex 比对，
+            // 不匹配数 >0 表示还原失败或已被篡改。采样上限控制主线程耗时，避免启动期 ANR。
+            // fail-safe：异常仅记日志不阻断启动。
+            for (int i = 0; i < out.size(); i++) {
+                try {
+                    int mism = nativeVerifyDex(out.get(i), payload, seed, i, 64);
+                    Log.i("JG", "integrity dex_idx=" + i + " mismatches=" + mism);
+                } catch (Throwable t) {
+                    Log.w("JG", "integrity check skipped dex " + i, t);
+                }
+            }
+        }
         return out;
     }
+
+    /** 重算 DEX 头校验和：checksum(偏移8)=adler32(data[12:])，signature(偏移12)=sha1(data[32:])。
+     *  失败静默跳过（不抛异常），交还给上层 fail-safe。 */
+    private static void fixDexChecksum(ByteBuffer buf) {
+        if (buf == null) return;
+        int len = buf.capacity();
+        if (len < 32) return;
+        ByteOrder bo = buf.order();
+        buf.order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            /* ART 以 DEX 头 file_size(偏移32) 为校验和/签名覆盖边界，必须与之完全一致，
+             * 否则即使内容正确，ART 计算的 adler32 范围也不同 -> Bad checksum。 */
+            int fileSize = buf.getInt(32);
+            if (fileSize <= 12 || fileSize > len) fileSize = len;
+            /* 顺序必须：先写签名，再算校验和（与 ART 校验器一致）。
+             * ART 校验时 adler32 覆盖 [12, fs)（含 [12,32) 的签名区），SHA-1 覆盖 [32, fs)。
+             * 故先算 SHA-1([32,fs)) 写入 [12,32)，再算 adler32([12,fs))（此时已含新签名）写 [8,12)。 */
+            byte[] sigSrc = new byte[fileSize - 32];
+            buf.position(32); buf.get(sigSrc);
+            byte[] sig = java.security.MessageDigest.getInstance("SHA-1").digest(sigSrc);
+            buf.position(12); buf.put(sig);
+            byte[] tail = new byte[fileSize - 12];
+            buf.position(12); buf.get(tail);
+            java.util.zip.Adler32 adler = new java.util.zip.Adler32();
+            adler.update(tail);
+            buf.putInt(8, (int) (adler.getValue() & 0xffffffffL));
+    } catch (Throwable t) {
+        Log.w("JG", "fixDexChecksum skipped", t);
+    } finally {
+        buf.order(bo);
+        buf.position(0);
+    }
+}
 
     static byte[] readPayload(String apk) throws IOException {
         ZipFile zf = new ZipFile(apk);
@@ -483,10 +620,11 @@ class Decryptor {
 class AssetRestorer {
     static String restore(Context ctx, File outZip) {
         try {
-            byte[] seed = DeriveKeys.seed(ctx);
             String apk = ctx.getApplicationInfo().sourceDir;
             byte[] payload = Decryptor.readPayload(apk);
             if (payload == null || payload.length < 8) return null;
+            // 先读载荷取 per-build salt，再 HKDF-Extract 派生 seed
+            byte[] seed = DeriveKeys.seed(ctx, DeriveKeys.extractSalt(payload));
             int p = 0;
             for (int i = 0; i < 4; i++) {
                 if (payload[p] != (byte) "JGS1".charAt(i)) return null;
@@ -534,12 +672,31 @@ class AssetRestorer {
     }
 }
 
-/** 密钥派生：seed = SHA256(签名证书)，per-dex key = HMAC-SHA256(seed, info) */
+/**
+ * 密钥派生（抗跨构建 diff + 证书绑定，对齐 mocika 的 HKDF 思路）：
+ *   cert_hash = SHA256(签名证书DER)            // 证书绑定材料：换签即失败
+ *   seed = HMAC-SHA256(build_salt, cert_hash)  // RFC5869 HKDF-Extract：PRK = HMAC(salt, IKM)
+ *   per-dex/asset/method key = HMAC-SHA256(seed, "JG|"+info)
+ * build_salt 每次构建随机 (os.urandom(32))，藏于 jg 载荷末尾 32 字节；
+ * 故同一证书多次加固密文不同（抗跨构建差分），且仍硬绑定证书（换签 PRK 变 → GCM 标签失败）。
+ */
 class DeriveKeys {
-    static byte[] seed(Context ctx) throws Exception {
+    /** HKDF-Extract：PRK = HMAC(build_salt, SHA256(certDER))。 */
+    static byte[] seed(Context ctx, byte[] salt) throws Exception {
         byte[] cert = certDer(ctx);
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        return md.digest(cert);
+        byte[] certHash = md.digest(cert);
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(salt, "HmacSHA256"));
+        return mac.doFinal(certHash);
+    }
+
+    /** 从 jg 载荷尾部取 32 字节 per-build salt（HKDF-Extract 的 salt 输入）。 */
+    static byte[] extractSalt(byte[] payload) {
+        if (payload == null || payload.length < 32) {
+            throw new IllegalStateException("payload too short to hold salt");
+        }
+        return Arrays.copyOfRange(payload, payload.length - 32, payload.length);
     }
 
     static byte[] keyFor(byte[] seed, String info) throws Exception {
@@ -576,31 +733,48 @@ class DeriveKeys {
     }
 }
 
-/** 轻量反调试 / 反注入特征扫描 */
+/**
+ * 轻量反调试 / 反注入特征扫描（DEX 解密前硬网关）。
+ * 统一收口到 STRENGTHEN_RESPONSE：默认 "log"=仅记录、不阻断（fail-safe，避免误杀正常设备）；
+ * "exit"=命中即抛 SecurityException 阻断启动。与 native jg_guard / AntiTamper 守护线程行为一致。
+ */
 class AntiDebug {
+    private static final String TAG = "JG";
+    /** 检测 + 按统一开关响应。命中且 STRENGTHEN_RESPONSE=exit 才阻断；否则仅记录并继续。 */
     static void check() {
         try {
-            if (Debug.isDebuggerConnected()) {
-                throw new SecurityException("debugger");
+            String hit = detect();
+            if (hit != null) {
+                boolean block = "exit".equals(ShieldApplication.STRENGTHEN_RESPONSE);
+                Log.w(TAG, "anti-debug hit: " + hit + " -> "
+                        + (block ? "block" : "log-only (STRENGTHEN_RESPONSE)"));
+                if (block) {
+                    throw new SecurityException("hook/debug framework: " + hit);
+                }
+                // log 模式：继续启动（fail-safe）
             }
-            scanMaps();
         } catch (SecurityException se) {
             throw se;
         } catch (Throwable t) { /* 容忍扫描失败 */ }
     }
 
-    private static void scanMaps() throws IOException {
+    /** 返回命中的特征描述；未命中返回 null。 */
+    private static String detect() throws IOException {
+        if (Debug.isDebuggerConnected()) return "debugger connected";
         BufferedReader br = new BufferedReader(new FileReader("/proc/self/maps"));
-        String line;
-        while ((line = br.readLine()) != null) {
-            String l = line.toLowerCase();
-            if (l.contains("frida") || l.contains("substrate") || l.contains("xposed")
-                    || l.contains("libsandhook") || l.contains("libmsaoaidsec")) {
-                br.close();
-                throw new SecurityException("hook framework: " + line.trim());
+        try {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String l = line.toLowerCase();
+                if (l.contains("frida") || l.contains("substrate") || l.contains("xposed")
+                        || l.contains("libsandhook") || l.contains("libmsaoaidsec")) {
+                    return "hook framework: " + line.trim();
+                }
             }
+        } finally {
+            br.close();
         }
-        br.close();
+        return null;
     }
 }
 
@@ -745,11 +919,13 @@ class AntiTamper {
     }
 
     private static void respond() {
-        if ("none".equals(ShieldApplication.ANTI_TAMPER_RESPONSE)) {
-            Log.w(TAG, "tamper detected but response=none (debug mode)");
+        // 统一收口到 STRENGTHEN_RESPONSE（与 AntiDebug / native jg_guard 一致）。
+        // 默认 "log"=仅记录、不阻断（fail-safe，避免误杀正常设备）；"exit"=静默退出进程。
+        if (!"exit".equals(ShieldApplication.STRENGTHEN_RESPONSE)) {
+            Log.w(TAG, "tamper detected but STRENGTHEN_RESPONSE="
+                    + ShieldApplication.STRENGTHEN_RESPONSE + " (log-only)");
             return;
         }
-        // 默认静默退出进程（仅被篡改环境触发；干净设备永远走不到这里）
         Log.w(TAG, "tamper confirmed -> System.exit");
         try { System.exit(1); } catch (Throwable ignored) {}
     }

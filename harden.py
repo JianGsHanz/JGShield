@@ -5,10 +5,20 @@ JGShield 加固核心：对单个 APK 做差异化加壳。
 流程（方向B，二进制 Manifest 编辑 + zip 直打包，不经过 apktool）：
   1. 抽取原始 classes*.dex
   2. 二进制编辑 AndroidManifest.xml（直接改 AXML，不解码/重编资源）
-  3. 构建加密载荷：DEFLATE + AES-256-GCM（seed=SHA256(签名证书DER)）
+  3. 构建加密载荷：DEFLATE + AES-256-GCM
   4. zip 直打包：原资源 + patched Manifest + stub.dex(classses.dex) + jg 载荷
   5. 签名对齐
   6. 内嵌回测
+
+密钥派生（HKDF-Extract 加盐，抗跨构建密钥比对）：
+  cert_hash = SHA256(签名证书DER)         # 证书绑定材料（换签即变→GCM 认证失败）
+  build_salt = os.urandom(32)             # 每次构建随机（存 jg 载荷末 32B trailer）
+  seed = HMAC-SHA256(key=build_salt, msg=cert_hash)   # RFC5869 HKDF-Extract
+  per-dex/asset key = HMAC-SHA256(seed, "JG|"+label+idx)
+  per-method key     = HMAC-SHA256(seed, "JG|m"+dexIdx+"."+methodIdx)
+兼具「证书绑定」（cert_hash 作 IKM）与「每次构建密文不同」（随机 salt），
+使逆向者无法通过对比两次构建的密文/密钥定位加密结构。下游 HMAC 链与 native
+（只消费最终 seed）均不受影响；壳/回测须先从载荷末 32B 取 salt 再派生 seed。
 """
 import os
 import time
@@ -147,8 +157,10 @@ def extract_cert_der(ks, alias, storepass):
         except OSError:
             pass
 
-def load_seed(ks=None, ks_alias=None, ks_pass=None):
-    """派生种子：优先用用户指定的 keystore 证书，否则回退内置 common.cer。"""
+def load_cert_hash(ks=None, ks_alias=None, ks_pass=None):
+    """证书绑定材料 cert_hash = SHA256(证书DER)。
+    优先用用户指定的 keystore 证书，否则回退内置 common.cer。
+    这是 HKDF-Extract 的 IKM（信息密钥材料）：换签→证书变→cert_hash 变→seed 变。"""
     if ks and os.path.isfile(ks):
         cert = extract_cert_der(ks, ks_alias or config.KEY_ALIAS,
                                 ks_pass or config.KEY_PASS)
@@ -156,6 +168,18 @@ def load_seed(ks=None, ks_alias=None, ks_pass=None):
         with open(config.CERT_DER, "rb") as f:
             cert = f.read()
     return SHA256.new(cert).digest()
+
+# 兼容旧调用名（如有外部引用），语义即 cert_hash
+load_seed = load_cert_hash
+
+def derive_seed(cert_hash, salt):
+    """RFC5869 HKDF-Extract：seed = HMAC-SHA256(key=salt, msg=cert_hash)。
+    salt=每次构建随机 32B（存载荷末尾）；cert_hash=证书绑定材料。
+    → 每次构建 seed 不同（抗跨构建密钥/密文比对），同时保留证书绑定
+    （salt 相同而证书变→cert_hash 变→seed 仍变；证书相同而 salt 变→seed 变）。"""
+    mac = HMAC.new(salt, digestmod=SHA256)
+    mac.update(cert_hash)
+    return mac.digest()
 
 def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)
@@ -179,7 +203,7 @@ def encrypt_dex(seed, idx, dex_bytes):
     ct, tag = cipher.encrypt_and_digest(comp)
     return iv + ct + tag
 
-def build_payload(seed, dex_list, asset_list=None, method_sections=None):
+def build_payload(seed, dex_list, asset_list=None, method_sections=None, salt=None):
     out = bytearray()
     out += config.MAGIC
     out += struct.pack("<I", len(dex_list))
@@ -212,6 +236,13 @@ def build_payload(seed, dex_list, asset_list=None, method_sections=None):
             out += struct.pack("<I", insns_size)
             out += struct.pack("<I", len(blob))
             out += blob
+    # 盐 trailer：每次构建随机 32B，追加在所有区段之后（载荷最末）。
+    # 所有解析器（native / verify / 壳）读完 dex+asset+method 区段后自然停住，
+    # 从不读到这 32B；仅需「读末 32B 取 salt」即可还原派生种子。向后兼容旧解析逻辑。
+    if salt is not None:
+        if len(salt) != 32:
+            raise ValueError("build_payload: salt must be 32 bytes, got %d" % len(salt))
+        out += salt
     return bytes(out)
 
 # --------------------------------------------------------------------------
@@ -558,12 +589,17 @@ def harden(input_apk, output_apk=None, keep=False,
     _lap(sw, "改Manifest(二进制)")
 
     # 3) 构造载荷（魔数 JGS1），classes.dex 保持为干净壳 DEX
-    seed = load_seed(ks, ks_alias, ks_pass)
+    # HKDF-Extract 加盐派生：cert_hash 绑证书，build_salt 每次构建随机 → 抗跨构建密钥比对。
+    cert_hash = load_cert_hash(ks, ks_alias, ks_pass)
+    build_salt = os.urandom(32)
+    seed = derive_seed(cert_hash, build_salt)
     if ks and os.path.isfile(ks):
-        print("[*] 种子按你的签名证书派生(alias=%s)：证书绑定密钥，加固/上架须用同一证书，换签即解密失败"
+        print("[*] 种子=HKDF-Extract(salt=随机32B, ikm=SHA256(你的签名证书 alias=%s))："
+              "证书绑定+每次构建随机，加固/上架须用同一证书，换签即解密失败"
               % (ks_alias or config.KEY_ALIAS), flush=True)
     else:
-        print("[*] 种子按内置签名证书(common)派生：与最终签名一致，换签即解密失败", flush=True)
+        print("[*] 种子=HKDF-Extract(salt=随机32B, ikm=SHA256(内置证书 common))："
+              "证书绑定+每次构建随机，换签即解密失败", flush=True)
     # P3.1 方法级指令抽取（默认关闭）：把每个方法的 insns 抽走加密、DEX 内原位回填 NOP。
     # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，待 P3.3 运行时还原。
     # 注意：开启后产物在 P3.3 之前不可独立运行（方法体为空），仅用于验证抽取链路。
@@ -580,7 +616,8 @@ def harden(input_apk, output_apk=None, keep=False,
             total_methods += len(entries)
         print("[3.1] 抽取方法指令数: %d（需 P3.3 运行时还原，当前产物不可独立运行）" % total_methods,
               flush=True)
-    payload = build_payload(seed, extracted_dexes, assets if assets else None, method_sections)
+    payload = build_payload(seed, extracted_dexes, assets if assets else None,
+                            method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
     print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 jg 条目" % (len(stub), len(payload)))
