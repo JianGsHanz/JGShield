@@ -37,40 +37,48 @@ def gcm_blob_parts(blob):
     return iv, ct, tag
 
 
+def stream_plain(blob, seed, dex_idx):
+    """解密 per-dex 方法流 blob，返回 GCM 明文（= zlib(concat_insns)）。"""
+    iv = blob[0:12]
+    rest = blob[12:]
+    key = verify_payload.derive_method_key(seed, dex_idx)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    return cipher.decrypt_and_verify(rest[:-16], rest[-16:])
+
+
 def main():
     seed = harden.load_seed()
 
     # ---- sample1：完整写回向量（FULL_PAYLOAD + NOP_DEX + ORIG_DEX）----
     with zipfile.ZipFile(SAMPLE1) as z:
         orig1 = z.read("classes.dex")
-    nop1, entries1 = harden.extract_methods(seed, 0, orig1)
-    payload1 = harden.build_payload(seed, [nop1], None, [(0, entries1)])
-    # 取 entry0 的 GCM 向量（label 用其 method_idx）
+    nop1, blob1, entries1 = harden.extract_methods(seed, 0, orig1)
+    payload1 = harden.build_payload(seed, [nop1], None, [(0, blob1, entries1)])
+    # 取 dex0 整条流 blob 的 GCM 向量（per-dex 密钥 "JG|m0"）
     m0 = entries1[0]
     midx0 = m0[0]
-    iv, ct, tag = gcm_blob_parts(m0[3])
+    iv, ct, tag = gcm_blob_parts(blob1)
     insns0 = orig1[(m0[1] + 16):(m0[1] + 16 + m0[2] * 2)]
-    plain0 = zlib.compress(insns0)  # AES-GCM 明文 = zlib(insns)
-    key0 = verify_payload.derive_method_key(seed, 0, midx0)
+    plain0 = stream_plain(blob1, seed, 0)  # AES-GCM 明文 = zlib(concat_insns)
+    key0 = verify_payload.derive_method_key(seed, 0)
 
-    # ---- sample4：第二个 GCM 向量（不同 method_idx）----
+    # ---- sample4：第二个 GCM 向量（同 dex0 per-dex 密钥，不同密文）----
     with zipfile.ZipFile(SAMPLE4) as z:
         orig4 = z.read("classes.dex")
-    nop4, entries4 = harden.extract_methods(seed, 0, orig4)
+    nop4, blob4, entries4 = harden.extract_methods(seed, 0, orig4)
     m4 = entries4[0]
     midx4 = m4[0]
-    iv4, ct4, tag4 = gcm_blob_parts(m4[3])
+    iv4, ct4, tag4 = gcm_blob_parts(blob4)
     insns4 = orig4[(m4[1] + 16):(m4[1] + 16 + m4[2] * 2)]
-    plain4 = zlib.compress(insns4)
-    key4 = verify_payload.derive_method_key(seed, 0, midx4)
+    plain4 = stream_plain(blob4, seed, 0)
+    key4 = verify_payload.derive_method_key(seed, 0)
 
-    # HMAC 向量：label "JG|m0.0"
-    import hashlib
+    # HMAC 向量：label "JG|m0"（per-dex 密钥）
     hmac_key = HMAC.new(seed, digestmod=SHA256)
-    hmac_key.update(b"JG|m0.0")
+    hmac_key.update(b"JG|m0")
     hmac_vec = hmac_key.digest()
 
-    label0 = ("JG|m0.%u" % midx0).encode("utf-8")
+    label0 = b"JG|m0"
 
     parts = []
     parts.append("/* 自动生成：method_restore_vectors.h — 来自真实加固数据，不可手改 */")
@@ -80,7 +88,7 @@ def main():
     parts.append("/* 种子：SHA256(内置签名证书)。所有向量据此派生。 */")
     parts.append(hex_arr("V_SEED", seed))
     parts.append("")
-    parts.append("/* HMAC-SHA256(V_SEED, \"JG|m0.0\") 期望输出 */")
+    parts.append("/* HMAC-SHA256(V_SEED, \"JG|m0\") 期望输出 */")
     parts.append(hex_arr("V_HMAC_KEY", hmac_vec))
     parts.append("")
     parts.append("/* AES-256-GCM 向量 1：dex0 method_idx=%d */" % midx0)
@@ -102,7 +110,7 @@ def main():
     parts.append(hex_arr("V_NOP_DEX", nop1))
     parts.append(hex_arr("V_ORIG_DEX", orig1))
     parts.append(hex_arr("V_FULL_PAYLOAD", payload1))
-    parts.append("#define V_LABEL0 \"JG|m0.%u\"" % midx0)
+    parts.append("#define V_LABEL0 \"JG|m0\"")
     parts.append("")
     parts.append("#endif /* JG_METHOD_RESTORE_VECTORS_H */")
 

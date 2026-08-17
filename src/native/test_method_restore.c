@@ -40,7 +40,7 @@ static void check_bytes(const char *name, const unsigned char *got, const unsign
 int main(void) {
     /* 1) HMAC 密钥派生 */
     unsigned char hmac_out[32];
-    jg_hmac_sha256(V_SEED, 32, (const unsigned char *)"JG|m0.0", 7, hmac_out);
+    jg_hmac_sha256(V_SEED, 32, (const unsigned char *)"JG|m0", 5, hmac_out);
     check_bytes("HMAC derive JG|m0.0", hmac_out, V_HMAC_KEY, 32);
 
     /* 2) AES-256-GCM 解密向量 1 */
