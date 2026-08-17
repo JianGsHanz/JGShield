@@ -234,12 +234,16 @@ def build_payload(seed, dex_list, asset_list=None, method_sections=None, salt=No
         out += struct.pack("<I", len(entries))
         out += struct.pack("<I", len(blob))
         out += blob
-        for (method_idx, code_off, insns_size, offset, length) in entries:
-            out += struct.pack("<I", method_idx)
-            out += struct.pack("<I", code_off)
-            out += struct.pack("<I", insns_size)
-            out += struct.pack("<I", offset)
-            out += struct.pack("<I", length)
+        # P6：方法元数据表整体 zlib 压缩，避免 21 万方法 × 20B 裸 u32 占 ~4MB。
+        # 仅存 (method_idx, code_off, insns_size) 三项；offset_in_stream / len_in_stream
+        # 可由 insns_size 在还原端按序累加推得，无需存储。整体压缩后 212993×12B → ~1MB。
+        if entries:
+            meta = b"".join(struct.pack("<III", m[0], m[1], m[2]) for m in entries)
+        else:
+            meta = b""
+        meta_blob = zlib_compress(meta)
+        out += struct.pack("<I", len(meta_blob))
+        out += meta_blob
     # 盐 trailer：每次构建随机 32B，追加在所有区段之后（载荷最末）。
     # 所有解析器（native / verify / 壳）读完 dex+asset+method 区段后自然停住，
     # 从不读到这 32B；仅需「读末 32B 取 salt」即可还原派生种子。向后兼容旧解析逻辑。

@@ -82,14 +82,22 @@ def simulate_native_writeback(seed, payload, orig_dexes):
         ec = u32(payload, p); p += 4
         sln = u32(payload, p); p += 4
         stream_blob = payload[p:p + sln]; p += sln
+        mlen = u32(payload, p); p += 4
+        meta_blob = payload[p:p + mlen]; p += mlen
         entries = []
-        for _ in range(ec):
-            method_idx = u32(payload, p); p += 4
-            code_off = u32(payload, p); p += 4
-            insns_size = u32(payload, p); p += 4
-            offset = u32(payload, p); p += 4
-            length = u32(payload, p); p += 4
-            entries.append((method_idx, code_off, insns_size, offset, length))
+        if mlen > 0 and ec > 0:
+            raw = zlib.decompress(meta_blob)
+            # 每行 (method_idx, code_off, insns_size) 共 12B；offset/len 由累计推得（P6）
+            run = 0
+            for k in range(ec):
+                base = k * 12
+                method_idx = struct.unpack_from("<I", raw, base)[0]
+                code_off = struct.unpack_from("<I", raw, base + 4)[0]
+                insns_size = struct.unpack_from("<I", raw, base + 8)[0]
+                offset = run
+                length = insns_size * 2
+                run += length
+                entries.append((method_idx, code_off, insns_size, offset, length))
         sections.append((dex_idx, stream_blob, entries))
 
     # ---- 解密 dex 段，得到 NOP 化 DEX ----

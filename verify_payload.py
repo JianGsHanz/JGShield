@@ -250,9 +250,10 @@ def parse_methods(apk_path, seed=None):
     """返回 [(dex_idx, stream_blob, [(method_idx, code_off, insns_size,
     offset_in_stream, len_in_stream), ...]), ...]。无方法区段时返回空列表。
 
-    与 harden.py build_payload / jg_method_restore.c 新格式对齐：
+    与 harden.py build_payload / jg_method_restore.c 新格式对齐（P6）：
     每 dex 一条 stream_blob(iv12+AES-GCM(zlib(concat_insns))+tag16)，
-    entries 记录每个方法在拼流内的 offset/len。"""
+    元数据表 meta_blob = zlib( (method_idx,code_off,insns_size)[u32]×count )，
+    还原端 inflate 后按序推得 offset/len，故此处重建为 5-tuple 供 check_payload 复用。"""
     with zipfile.ZipFile(apk_path) as z:
         names = z.namelist()
         if "jg" not in names:
@@ -277,21 +278,27 @@ def parse_methods(apk_path, seed=None):
     method_dex_count = _read_int(tail, p); p += 4
     if method_dex_count <= 0:
         return []
-    if seed is None:
-        seed = seed_from_apk(apk_path)
     sections = []
     for _ in range(method_dex_count):
         dex_idx = _read_int(tail, p); p += 4
         ec = _read_int(tail, p); p += 4
         sln = _read_int(tail, p); p += 4
         stream_blob = tail[p:p + sln]; p += sln
+        mlen = _read_int(tail, p); p += 4
+        meta_blob = tail[p:p + mlen]; p += mlen
         entries = []
-        for _ in range(ec):
-            method_idx = _read_int(tail, p); p += 4
-            code_off = _read_int(tail, p); p += 4
-            insns_size = _read_int(tail, p); p += 4
-            offset = _read_int(tail, p); p += 4
-            length = _read_int(tail, p); p += 4
-            entries.append((method_idx, code_off, insns_size, offset, length))
+        if mlen > 0 and ec > 0:
+            raw = zlib.decompress(meta_blob)
+            # 每行 (method_idx, code_off, insns_size) 共 12B；offset/len 由累计推得
+            run = 0
+            for k in range(ec):
+                base = k * 12
+                method_idx = struct.unpack_from("<I", raw, base)[0]
+                code_off = struct.unpack_from("<I", raw, base + 4)[0]
+                insns_size = struct.unpack_from("<I", raw, base + 8)[0]
+                offset = run
+                length = insns_size * 2
+                run += length
+                entries.append((method_idx, code_off, insns_size, offset, length))
         sections.append((dex_idx, stream_blob, entries))
     return sections
