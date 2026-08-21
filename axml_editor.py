@@ -5,7 +5,7 @@
 对外接口：
     get_orig_app_class(manifest_data: bytes) -> str | None
     patch_manifest(manifest_data: bytes, orig_app_class: str,
-                   shell_app_class: str = "com.jiagu.shield.ShieldApplication") -> bytes
+                   shell_app_class: str = "com.gx.runtime.GxApp") -> bytes
 """
 
 import struct
@@ -464,7 +464,8 @@ def get_orig_app_class(manifest_data):
     return None
 
 
-def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shield.ShieldApplication"):
+def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.gx.runtime.GxApp",
+                   ssl_pins=None, strengthen=None):
     """
     修改二进制 AndroidManifest.xml：
 
@@ -512,7 +513,7 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
 
     # 3. 确定需要新增的字符串
     new_strings_needed = []
-    for s in [shell_app_class, orig_app_class, 'com.jiagu.orig_app']:
+    for s in [shell_app_class, orig_app_class, 'gx.orig_app']:
         if _find_string_index(strings, s) == -1:
             new_strings_needed.append(s)
     if _find_string_index(strings, 'name') == -1:
@@ -521,6 +522,16 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
         new_strings_needed.append('value')
     if _find_string_index(strings, 'meta-data') == -1:
         new_strings_needed.append('meta-data')
+    # SSL pinning meta（P-CAPTURE）：加固期注入 gx.ssl_pins，壳运行期读取
+    if ssl_pins:
+        for s in ['gx.ssl_pins', ssl_pins]:
+            if _find_string_index(strings, s) == -1:
+                new_strings_needed.append(s)
+    # 统一响应姿态 meta（P-CAPTURE）：加固期注入 gx.strengthen，壳运行期读取覆盖默认 "log"
+    if strengthen:
+        for s in ['gx.strengthen', strengthen]:
+            if _find_string_index(strings, s) == -1:
+                new_strings_needed.append(s)
     # 注：删除 appComponentFactory 属性时无需把 appComponentFactory / 空串 加入字符串池
 
     # 4. 向字符串池追加新字符串（在 XML 修改前完成，避免偏移追踪困扰）
@@ -541,7 +552,11 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
     meta_data_idx   = _find_string_index(strings, 'meta-data')
     shell_class_idx = _find_string_index(strings, shell_app_class)
     orig_class_idx  = _find_string_index(strings, orig_app_class)
-    jg_orig_idx     = _find_string_index(strings, 'com.jiagu.orig_app')
+    jg_orig_idx     = _find_string_index(strings, 'gx.orig_app')
+    ssl_pins_idx     = _find_string_index(strings, 'gx.ssl_pins') if ssl_pins else -1
+    ssl_pins_val_idx = _find_string_index(strings, ssl_pins) if ssl_pins else -1
+    strengthen_idx     = _find_string_index(strings, 'gx.strengthen') if strengthen else -1
+    strengthen_val_idx = _find_string_index(strings, strengthen) if strengthen else -1
 
     # 重新定位 application（字符串池修改后位置可能后移）
     xml_start = _find_xml_start(data, 8)
@@ -639,6 +654,52 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.jiagu.shi
     )
 
     insertion = meta_start_chunk + meta_end_chunk
+    # SSL pinning meta-data 子元素（P-CAPTURE）
+    if ssl_pins and ssl_pins_idx >= 0 and ssl_pins_val_idx >= 0:
+        ssl_meta_attrs = [
+            {
+                'ns':        android_uri_idx,
+                'name':      name_attr_idx,
+                'raw_value': ssl_pins_idx,
+                'data_type': TYPE_STRING,
+                'data':      ssl_pins_idx,
+            },
+            {
+                'ns':        android_uri_idx,
+                'name':      value_attr_idx,
+                'raw_value': ssl_pins_val_idx,
+                'data_type': TYPE_STRING,
+                'data':      ssl_pins_val_idx,
+            },
+        ]
+        ssl_meta_start = _pack_start_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, attributes=ssl_meta_attrs, line=app_elem['line'])
+        ssl_meta_end = _pack_end_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, line=app_elem['line'])
+        insertion = insertion + ssl_meta_start + ssl_meta_end
+    # 统一响应姿态 meta-data 子元素（P-CAPTURE）
+    if strengthen and strengthen_idx >= 0 and strengthen_val_idx >= 0:
+        str_meta_attrs = [
+            {
+                'ns':        android_uri_idx,
+                'name':      name_attr_idx,
+                'raw_value': strengthen_idx,
+                'data_type': TYPE_STRING,
+                'data':      strengthen_idx,
+            },
+            {
+                'ns':        android_uri_idx,
+                'name':      value_attr_idx,
+                'raw_value': strengthen_val_idx,
+                'data_type': TYPE_STRING,
+                'data':      strengthen_val_idx,
+            },
+        ]
+        str_meta_start = _pack_start_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, attributes=str_meta_attrs, line=app_elem['line'])
+        str_meta_end = _pack_end_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, line=app_elem['line'])
+        insertion = insertion + str_meta_start + str_meta_end
     insertion_size = len(insertion)
     # 注意：meta-data 是独立的子 chunk，不计入 application StartElement 的 chunkSize
     # app_size_growth 仅记录 application 元素自身的变化（如新增属性），不包含子元素

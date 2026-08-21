@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-载荷校验：读取加固 APK 中自定义顶层 ZIP 条目 "jg"（JGS1 魔数），
+载荷校验：读取加固 APK 中自定义顶层 ZIP 条目 "z9"（JGS1 魔数），
 用相同种子解密并还原原始 DEX，与输入逐一比对。
 被 harden.py（内嵌回测）与 verify.py（静态回测）复用。
 """
@@ -65,9 +65,9 @@ def extract_salt(apk_path):
     所有区段解析器读完 dex+asset+method 后自然停住、从不触及这 32B，
     故盐安全地位于载荷最末。"""
     with zipfile.ZipFile(apk_path) as z:
-        if "jg" not in z.namelist():
+        if "z9" not in z.namelist():
             raise RuntimeError("APK 中无 jg 载荷条目")
-        tail = z.read("jg")
+        tail = z.read("z9")
     if len(tail) < 32:
         raise RuntimeError("jg 载荷过短，无法提取 salt trailer")
     return tail[-32:]
@@ -115,9 +115,9 @@ def parse_payload(apk_path, seed=None):
         names = z.namelist()
         if "classes.dex" not in names:
             raise RuntimeError("APK 中无 classes.dex")
-        if "jg" not in names:
+        if "z9" not in names:
             raise RuntimeError("APK 中无 jg 载荷条目")
-        tail = z.read("jg")
+        tail = z.read("z9")
     if len(tail) < 8:
         raise RuntimeError("jg 载荷过短")
     if tail[0:4] != config.MAGIC:
@@ -184,9 +184,9 @@ def parse_assets(apk_path, seed=None):
     """返回 [(name, decrypted_bytes), ...] 或抛异常。无资产区段时返回空列表。"""
     with zipfile.ZipFile(apk_path) as z:
         names = z.namelist()
-        if "jg" not in names:
+        if "z9" not in names:
             raise RuntimeError("APK 中无 jg 载荷条目")
-        tail = z.read("jg")
+        tail = z.read("z9")
     if len(tail) < 8:
         raise RuntimeError("jg 载荷过短")
     if tail[0:4] != config.MAGIC:
@@ -256,9 +256,9 @@ def parse_methods(apk_path, seed=None):
     还原端 inflate 后按序推得 offset/len，故此处重建为 5-tuple 供 check_payload 复用。"""
     with zipfile.ZipFile(apk_path) as z:
         names = z.namelist()
-        if "jg" not in names:
+        if "z9" not in names:
             raise RuntimeError("APK 中无 jg 载荷条目")
-        tail = z.read("jg")
+        tail = z.read("z9")
     if len(tail) < 8:
         raise RuntimeError("jg 载荷过短")
     if tail[0:4] != config.MAGIC:

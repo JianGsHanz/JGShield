@@ -36,3 +36,23 @@ Thumbs.db
 Desktop.ini
 ehthumbs.db
 .DS_Store
+
+# ===== 验证 / 调试临时产物（本轮新增，不入库） =====
+# frida 验证目录：保留驱动脚本（driver_*.py），忽略 53MB 二进制与运行日志
+_frida/frida-server
+_frida/*.xz
+_frida/*_712.txt
+_frida/*.txt
+# <26 边界验证产物目录（可由 verify_lt26.py 重建）
+_lt26_verify/
+# Windows 设备名误生成文件（无法常规删除，忽略即可）
+nul
+# 杂项日志
+stub_build.log
+verify_run.log
+verify_stderr.txt
+verify_stdout.txt
+
+# ===== 构建中间产物（可重建，不入库） =====
+_stubout/
+_stub_classes.jar

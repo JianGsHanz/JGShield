@@ -185,7 +185,7 @@ static void *guard_thread(void *arg) {
 
 /* JNI 入口：由 Java 侧 JgGuard.nativeStart() 调用，启动守护线程 */
 JNIEXPORT void JNICALL
-Java_com_jiagu_shield_JgGuard_nativeStart(JNIEnv *env, jclass clazz) {
+Java_com_gx_runtime_GxGuard_nativeStart(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     pthread_t tid;
     if (pthread_create(&tid, NULL, guard_thread, NULL) != 0) {
@@ -196,7 +196,7 @@ Java_com_jiagu_shield_JgGuard_nativeStart(JNIEnv *env, jclass clazz) {
 }
 
 JNIEXPORT void JNICALL
-Java_com_jiagu_shield_JgGuard_nativeSetResponse(JNIEnv *env, jclass clazz, jstring mode) {
+Java_com_gx_runtime_GxGuard_nativeSetResponse(JNIEnv *env, jclass clazz, jstring mode) {
     (void)clazz;
     g_response_exit = 0;
     if (mode) {

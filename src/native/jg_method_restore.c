@@ -1,7 +1,7 @@
 /*
  * jg_method_restore.c - JGShield P3.2 native 方法指令还原（解密 + 写回内存 DEX）
  * --------------------------------------------------------------------------
- * 与 harden.py(P3.1) / ShieldApplication.java 完全对齐：
+ * 与 harden.py(P3.1) / GxApp.java 完全对齐：
  *   - 载荷 jg 条目布局：MAGIC(4) + dex_count(4) + [dex blob]... + asset_count(4)
  *     + [asset]... + method_dex_count(4) + 每 dex {dex_idx(4)+entry_count(4)
  *     + stream_blob_len(4)+stream_blob + meta_blob_len(4)+meta_blob}。
@@ -16,7 +16,7 @@
  *   - jg_restore_methods()：平台无关核心（不碰 mprotect），便于单测。
  *   - jg_restore_methods_protected()：对 DEX 所在内存页 mprotect(RW) 后写回，
  *     再恢复 PROT_READ|PROT_EXEC。对应 P3.2 “确保 DEX 映射可写” 的验证点。
- *   - Java_com_jiagu_shield_Decryptor_nativeRestoreMethods：JNI 入口，
+ *   - Java_com_gx_runtime_GxDecryptor_nativeRestoreMethods：JNI 入口，
  *     Decryptor 传入 direct ByteBuffer(dex) + direct ByteBuffer(payload) + byte[](seed)。
  *
  * 失败语义：返回 0 成功；<0 各类错误（魔数/参数/解密失败/长度不符/写越界）。
@@ -280,7 +280,7 @@ int jg_verify_methods(const uint8_t *dex, size_t dex_len,
  * dexBuf 必须为 direct ByteBuffer（allocateDirect），native 直接取其内存地址做 mprotect+写回。
  * payload 为 jg 载荷原始字节（byte[]），seed 为 32 字节，dexIdx 指定仅还原该 dex 的条目。 */
 JNIEXPORT jint JNICALL
-Java_com_jiagu_shield_Decryptor_nativeRestoreMethods(JNIEnv *env, jclass clazz,
+Java_com_gx_runtime_GxDecryptor_nativeRestoreMethods(JNIEnv *env, jclass clazz,
         jobject dexBuf, jbyteArray payloadArr, jbyteArray seedArr, jint dexIdx) {
     (void)clazz;
     uint8_t *dex = (uint8_t *)(*env)->GetDirectBufferAddress(env, dexBuf);
@@ -310,7 +310,7 @@ Java_com_jiagu_shield_Decryptor_nativeRestoreMethods(JNIEnv *env, jclass clazz,
  * 返回不匹配方法数（0 表示还原正确）。maxPerDex>0 抽样（启动期用），-1 全量（后台深度体检）。
  * fail-safe：任何错误返回负值，调用方仅记日志。 */
 JNIEXPORT jint JNICALL
-Java_com_jiagu_shield_Decryptor_nativeVerifyDex(JNIEnv *env, jclass clazz,
+Java_com_gx_runtime_GxDecryptor_nativeVerifyDex(JNIEnv *env, jclass clazz,
         jobject dexBuf, jbyteArray payloadArr, jbyteArray seedArr, jint dexIdx, jint maxPerDex) {
     (void)clazz;
     uint8_t *dex = (uint8_t *)(*env)->GetDirectBufferAddress(env, dexBuf);

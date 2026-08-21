@@ -1,22 +1,22 @@
-package com.jiagu.shield;
+package com.gx.runtime;
 
 import android.util.Log;
 
 /**
- * JgGuard - native 反篡改/反调试桥接层。
+ * GxGuard - native 反篡改/反调试桥接层。
  *
- * 把检测逻辑下沉到 native (.so)，相比纯 Java 的 AntiTamper 更难被 frida 一行 hook 废掉。
+ * 把检测逻辑下沉到 native (.so)，相比纯 Java 的 GxTamper 更难被 frida 一行 hook 废掉。
  * 设计要点（与「别让补强导致 App 崩溃」的硬约束一致）：
  *   - 加载/调用全程 try-catch；libjgguard.so 缺失或任何异常都「优雅降级」，
  *     仅跳过 native 防护，绝不影响解密与 App 正常启动。
  *   - 实际的检测与响应在 native 守护线程里完成（命中即静默 exit）。
- *   - 与现有 Java AntiTamper 互为备份：native 为主，Java 为辅，任一可用即提供防护。
+ *   - 与现有 Java GxTamper 互为备份：native 为主，Java 为辅，任一可用即提供防护。
  */
-public final class JgGuard {
-    private static final String TAG = "JG-Native";
+public final class GxGuard {
+    private static final String TAG = "GX-Native";
     private static boolean loaded = false;
 
-    private JgGuard() {}
+    private GxGuard() {}
 
     /** 加载 libjgguard.so（幂等，失败静默降级）。
      *  必须在任何依赖该 .so 的 native 方法被调用前执行（P3 的 nativeRestoreInit /
@@ -24,7 +24,7 @@ public final class JgGuard {
     static void ensureLoaded() {
         if (loaded) return;
         try {
-            System.loadLibrary("jgguard");
+            System.loadLibrary(Obf.d(new byte[]{0x79, 0x30, 0x4D, 0x19, 0x2F, 0x69, 0x52}));
             loaded = true;
             Log.i(TAG, "native guard loaded");
         } catch (Throwable t) {
@@ -49,13 +49,13 @@ public final class JgGuard {
     private static native void nativeSetResponse(String mode);
 
     /** 把 Java 侧统一的响应开关传给 native（native 据此决定命中后是退出还是仅记录）。
-     *  必须在 JgGuard.start() 之前调用，确保 native 守护线程启动即读到正确模式。 */
+     *  必须在 GxGuard.start() 之前调用，确保 native 守护线程启动即读到正确模式。 */
     static void configureResponse() {
         ensureLoaded();
         if (!loaded) return;
         try {
-            nativeSetResponse(ShieldApplication.STRENGTHEN_RESPONSE);
-            Log.i(TAG, "response mode -> native: " + ShieldApplication.STRENGTHEN_RESPONSE);
+            nativeSetResponse(GxApp.STRENGTHEN_RESPONSE);
+            Log.i(TAG, "response mode -> native: " + GxApp.STRENGTHEN_RESPONSE);
         } catch (Throwable t) {
             Log.w(TAG, "set response skipped", t);
         }
@@ -96,7 +96,7 @@ public final class JgGuard {
     /** 命中且生产开关为 exit 时静默退出；默认 log 模式仅记录。fail-safe，异常不抛出。 */
     private static void respondIfNeeded(String what, boolean hit) {
         if (!hit) return;
-        if (!"exit".equals(ShieldApplication.STRENGTHEN_RESPONSE)) return;
+        if (!"exit".equals(GxApp.STRENGTHEN_RESPONSE)) return;
         try {
             Log.w(TAG, what + " -> System.exit (STRENGTHEN_RESPONSE=exit)");
             System.exit(1);

@@ -72,7 +72,7 @@ if not JAVA:
     JAVA = "java"  # 回退到 PATH
 
 # -------------------------------------------------------------------------- #
-# 外壳 DEX（由 ShieldApplication.java 编译而来，含 5 个壳类）
+# 外壳 DEX（由 GxApp.java 编译而来，含 5 个壳类）
 # -------------------------------------------------------------------------- #
 STUB_DEX = os.path.join(_BUNDLE, "build", "dex", "stub.dex")
 
@@ -166,11 +166,15 @@ KEY_PASS = "123123"
 CERT_DER = os.path.join(TOOLS, "common.cer")
 
 # -------------------------------------------------------------------------- #
-# 加固壳相关常量（必须与 ShieldApplication.java 保持一致）
+# 加固壳相关常量（必须与 GxApp.java 保持一致）
 # -------------------------------------------------------------------------- #
 MAGIC = b"JGS1"
-META_ORIG = "com.jiagu.orig_app"
-SHELL_APP = "com.jiagu.shield.ShieldApplication"
+META_ORIG = "gx.orig_app"
+META_SSL_PINS = "gx.ssl_pins"
+# P-CAPTURE 统一响应姿态：加固期注入，壳运行期读取覆盖默认 "log"
+# 取值 "log"（默认，fail-safe，仅记日志）或 "exit"（命中即退出进程）。
+META_STRENGTHEN = "gx.strengthen"
+SHELL_APP = "com.gx.runtime.GxApp"
 
 # -------------------------------------------------------------------------- #
 # 工作/输出目录（放在 exe 同级，便于用户找到产物）

@@ -126,7 +126,7 @@ def _short_work(base):
     return os.path.join(root, token)
 
 # --------------------------------------------------------------------------
-# 密钥派生 & 加密（与 ShieldApplication.java 完全对应）
+# 密钥派生 & 加密（与 GxApp.java 完全对应）
 # --------------------------------------------------------------------------
 def extract_cert_der(ks, alias, storepass):
     """从用户 keystore 提取签名证书 DER（keytool -exportcert）。
@@ -438,11 +438,11 @@ def repackage(unsigned_apk, stub_dex_bytes, payload, out_apk):
                     continue
                 if fn.startswith("META-INF/"):
                     continue
-                if fn == "jg":   # 剔除可能残留的旧载荷，避免重复条目
+                if fn == "z9":   # 剔除可能残留的旧载荷，避免重复条目
                     continue
                 zout.writestr(info, zin.read(fn))
             zout.writestr("classes.dex", stub_dex_bytes)
-            zout.writestr("jg", payload)
+            zout.writestr("z9", payload)
 
 # --------------------------------------------------------------------------
 # 签名（uber-apk-signer：v1+v2+v3）
@@ -518,14 +518,14 @@ def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path
                     continue
                 if fn.startswith('META-INF/'):
                     continue
-                if fn == "jg":
+                if fn == "z9":
                     continue
                 if strip_assets and fn.startswith("assets/"):
                     continue
                 zout.writestr(info, zin.read(fn))
             # 3) 壳 DEX + 载荷
             zout.writestr(zipfile.ZipInfo('classes.dex'), stub_dex)
-            zout.writestr(zipfile.ZipInfo("jg"), payload)
+            zout.writestr(zipfile.ZipInfo("z9"), payload)
             # 4) 注入 native 反篡改库（与原 App .so 并列；STORED 不压缩）
             if have_native:
                 injected = 0
@@ -565,7 +565,8 @@ def self_verify(out_apk, orig_dexes):
 # --------------------------------------------------------------------------
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
-           assets_encrypt=False, method_extract=False):
+           assets_encrypt=False, method_extract=False,
+           ssl_pins=None, strengthen=None):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -608,7 +609,15 @@ def harden(input_apk, output_apk=None, keep=False,
     if not orig_app:
         raise RuntimeError("无法从二进制 Manifest 提取原始 Application 类名（"
                            "android:name 是资源引用而非字符串），请用 apktool 文本流")
-    patched_manifest = _axml_patch(manifest_data, orig_app)
+    patched_manifest = _axml_patch(manifest_data, orig_app,
+                                   ssl_pins=ssl_pins, strengthen=strengthen)
+    if ssl_pins:
+        print("[2*] 注入 SSL pinning meta: gx.ssl_pins (%d host(s))"
+              % (ssl_pins.count(';') + 1))
+    if strengthen:
+        print("[2*] 注入统一响应姿态 meta: gx.strengthen = %s" % strengthen)
+        if strengthen == "exit":
+            print("[!] 警告: exit 模式会误杀正常 VPN/海外用户，不推荐用于面向海外用户的 app。")
     print("[2] 原 Application:", orig_app)
     _lap(sw, "改Manifest(二进制)")
 
@@ -691,13 +700,24 @@ def main():
     ap.add_argument("--method-extract", action="store_true",
                     help="P3.1 方法级指令抽取（实验性）：抽取每个方法的指令并加密，DEX 内原位回填 NOP，"
                          "运行时需 P3.3 native 还原才能执行；当前产物不可独立运行，仅用于验证抽取链路。默认关闭。")
+    ap.add_argument("--pins", help="SSL 证书固定：host=sha256/Base64;host2=sha256/Base64（与 OkHttp "
+                                    "CertificatePinner 同构）。例：api.example.com=sha256/ABCD... 。"
+                                    "配置后壳在运行期做按主机证书固定，挡 root+系统证书 MITM。不指定则不启用。")
+    ap.add_argument("--strengthen", choices=["log", "exit"], default=None,
+                    help="统一响应姿态（覆盖壳默认 'log'）：log=仅记日志（fail-safe，默认，不误伤任何用户）；"
+                         "exit=检测命中（root/模拟器/frida/代理/VPN/自校验失败）即退出进程。"
+                         "⚠ 不推荐 exit：会误杀正常 VPN/海外用户（VPN 使用≠抓包，系统层面无法区分），"
+                         "仅限明确接受该代价的场景。不指定则默认 log，永不阻断。"
+                         "经 manifest meta gx.strengthen 注入，运行期生效，无需重编 stub.dex。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
                ks=args.ks, ks_alias=args.ksAlias,
                ks_pass=args.ksPass, ks_keypass=args.ksKeyPass,
                assets_encrypt=args.assets_encrypt,
-               method_extract=args.method_extract)
+               method_extract=args.method_extract,
+               ssl_pins=args.pins,
+               strengthen=args.strengthen)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

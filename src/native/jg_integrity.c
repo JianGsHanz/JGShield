@@ -206,7 +206,7 @@ static int count_rwx(void) {
 }
 
 JNIEXPORT jint JNICALL
-Java_com_jiagu_shield_JgGuard_nativeEnvCheck(JNIEnv *env, jclass clazz) {
+Java_com_gx_runtime_GxGuard_nativeEnvCheck(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     int mask = 0;
     if (check_root()) mask |= 1;
@@ -217,7 +217,7 @@ Java_com_jiagu_shield_JgGuard_nativeEnvCheck(JNIEnv *env, jclass clazz) {
 }
 
 JNIEXPORT jint JNICALL
-Java_com_jiagu_shield_JgGuard_nativeIntegrityScan(JNIEnv *env, jclass clazz) {
+Java_com_gx_runtime_GxGuard_nativeIntegrityScan(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     int t = scan_threads();
     int selfW = check_self_writable();

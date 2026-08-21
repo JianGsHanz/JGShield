@@ -1,7 +1,7 @@
 /*
  * jg_crypto.h - JGShield native 加解密原语（自包含、header-only、无外部依赖）
  * --------------------------------------------------------------------------
- * 与 harden.py / ShieldApplication.java 的密钥/加密体系严格对齐：
+ * 与 harden.py / GxApp.java 的密钥/加密体系严格对齐：
  *   - HMAC-SHA256(seed, "JG|m"+dexIdx+"."+methodIdx)  -> per-method AES-256 密钥
  *   - AES-256-GCM 解密：iv(12) + 密文 + tag(16)  （与 Java AES/GCM/NoPadding 一致）
  *   - 密文 = zlib(RFC1950) 压缩后的方法指令（由调用方 zlib 解压，见 jg_method_restore.c）

@@ -475,7 +475,7 @@ static void try_install_hook(void) {
 
 /* ---------------- JNI 入口 ---------------- */
 JNIEXPORT jint JNICALL
-Java_com_jiagu_shield_Decryptor_nativeRestoreInit(JNIEnv *env, jclass clazz,
+Java_com_gx_runtime_GxDecryptor_nativeRestoreInit(JNIEnv *env, jclass clazz,
         jint dexIdx, jobject dexBuf, jbyteArray payloadArr, jbyteArray seedArr) {
     (void)clazz;
 
