@@ -15,12 +15,13 @@ JGShield 是一个参考开源项目 *mocika-shield* 的设计目标、但实现
 | 维度 | mocika-shield | JGShield |
 |------|---------------|----------|
 | 对称加密 | ChaCha20-Poly1305 + Zstd | **AES-256-GCM (AEAD) + DEFLATE** |
-| 载荷藏匿 | `assets/app.bin` | **自定义顶层 ZIP 条目 `jg`，魔数 `JGS1`**；`classes.dex` 保持标准干净壳 DEX，任何反编译/安装工具都不会因尾部垃圾数据报错 |
+| 载荷藏匿 | `assets/app.bin` | **自定义顶层 ZIP 条目 `z9`，魔数 `JGS1`**；`classes.dex` 保持标准干净壳 DEX，任何反编译/安装工具都不会因尾部垃圾数据报错 |
 | 密钥派生 | HKDF + 随机 IKM | **`seed = SHA256(签名证书DER)`**，再 `HMAC-SHA256(seed, "JG\|dex"+i)` 派生每 DEX 独立密钥；**换签 / 重签即解密失败（抗篡改）** |
 | 加载 | Rust native 注入 | **纯 Java `PathClassLoader` 注入 + 替换 `LoadedApk`/`ActivityThread` 的 Application 与 ClassLoader** |
 | 反调试 | — | 启动期对 `/proc/self/maps` 做 Frida/Substrate/Xposed 特征扫描 + `Debug.isDebuggerConnected` |
+| 壳指纹 | 包名/类名/字符串明文（易被 strings/grep 定位） | **壳自身混淆（P1）**：包名 `com.jiagu.shield`→`com.gx.runtime`、类名/内部类全部改名、敏感字符串走 `Obf` XOR 加密、native JNI 符号改名、运行期 TAG `JG-*`→`GX-*` |
 
-> 完整的差异化要点也写在 `src/java/com/jiagu/shield/ShieldApplication.java` 的类注释里。
+> 完整的差异化要点也写在 `src/java/com/gx/runtime/GxApp.java` 的类注释里。
 
 ---
 
@@ -31,7 +32,7 @@ flowchart LR
     A[输入 APK] --> B[抽取原始 classes*.dex]
     B --> C[二进制编辑 AndroidManifest.xml<br/>改 application 为壳 + 注入 orig_app meta]
     C --> D[构建载荷: DEFLATE + AES-256-GCM<br/>seed=SHA256 签名证书]
-    D --> E[zip 直打包:<br/>patched Manifest + 原资源 + stub.dex + jg]
+    D --> E[zip 直打包:<br/>patched Manifest + 原资源 + stub.dex + z9]
     E --> F[签名对齐 v1/v2/v3]
     F --> G[内嵌回测: 解密还原与原始 DEX 比对]
     G --> H[加固 APK]
@@ -40,7 +41,7 @@ flowchart LR
 关键实现选择：
 
 - **不解码 / 重编资源**。直接操作 AXML 二进制（见 `axml_editor.py`），大包加固从 ~5–10 分钟降到秒级。
-- **载荷不在 assets、不在 dex 尾部**，而是作为自定义顶层 ZIP 条目 `jg`；`classes.dex` 始终是一份干净的壳 DEX，规避各类工具对"异常结构"的报错。
+- **载荷不在 assets、不在 dex 尾部**，而是作为自定义顶层 ZIP 条目 `z9`；`classes.dex` 始终是一份干净的壳 DEX，规避各类工具对"异常结构"的报错。
 - **密钥与签名绑定**：壳在运行期通过 `PackageManager` 读取同一签名证书派生密钥，开发者换签名证书后旧包无法解密（天然防重打包）。
 - **原生库命名空间（方案 B）**：解密后的 DEX 注入框架 `sysLoader` 的 `dexElements`（而非新建 `PathClassLoader`），使原 App 留在主 `classloader-namespace`，原生库 `.so` 解析与未加固完全一致（修复了 `UnsatisfiedLinkError: ... not accessible for namespace "clns-N"`）。
 
@@ -50,16 +51,19 @@ flowchart LR
 
 - **加密链路**：AES-256-GCM（认证加密，防篡改）+ DEFLATE。
 - **密钥派生**：`seed = SHA256(签名证书DER)`；`per-dex key = HMAC-SHA256(seed, "JG|dex"+i)`。换签即解密失败。
-- **载荷藏匿**：自定义顶层 ZIP 条目 `jg` + 魔数 `JGS1`；`classes.dex` 保持干净壳 DEX。
+- **载荷藏匿**：自定义顶层 ZIP 条目 `z9` + 魔数 `JGS1`；`classes.dex` 保持干净壳 DEX。
 - **反调试**：`/proc/self/maps` 特征扫描（frida / substrate / xposed / libsandhook / libmsaoaidsec）+ `Debug.isDebuggerConnected`。
 - **反篡改守护（AntiTamper，保命版）**：独立后台守护线程，与加载器物理隔离、整段 try-catch、绝不导致 App 闪退。周期轮询：
   - `/proc/self/maps` 扩展特征扫描（frida / gadget / libfrida / frida-agent / substrate / xposed / libsandhook / libmsaoaidsec / libnativehook / cydia / magisk / re.frida / frida-server）
   - frida 默认端口 `27042 / 27043` 探测
   - `/data/local/tmp/re.frida.server` 文件存在性
   - `/proc/self/status` 的 `TracerPid`（ptrace 检测）
-  - 命中即按 `ANTI_TAMPER_RESPONSE` 响应（默认 `exit`，仅在被篡改环境触发；干净设备零影响）
-  - 开关：`ShieldApplication.ANTI_TAMPER_ENABLED`（改 `false` + 重编 stub.dex 即全关）
+  - 命中即按 `STRENGTHEN_RESPONSE` 统一响应（默认 `log`=仅记录不阻断，fail-safe 避免误杀正常设备；加固期注入 `gx.strengthen=exit` 可改为阻断）
+  - 开关：`GxApp.ANTI_TAMPER_ENABLED`（改 `false` + 重编 stub.dex 即全关）
 - **多进程竞态防护**：解密 DEX 先检查已有文件直接复用；`writeFileAtomic` 用 `.tmp + sync + rename` 原子写入，防止并发写导致 DEX 验证器 SIGBUS。
+- **壳自身混淆（P1）**：壳包名 `com.jiagu.shield` → `com.gx.runtime`、类名/内部类（`ShieldApplication`→`GxApp`、`JgGuard`→`GxGuard`、`Decryptor`→`GxDecryptor`、`AntiTamper`→`GxTamper` 等）全部改名；敏感字符串（魔数 `JGS1`、运行期 TAG `JG-*`、frida 关键词库、路径、`loadLibrary` 名）走 `Obf` XOR 加密；native `libjgguard.so` 的 JNI 导出符号改名（`Java_com_gx_runtime_*`）；载荷 ZIP 条目 `jg`→`z9`、meta 键 `com.jiagu.*`→`gx.*`。DEX 二进制静态扫描已无 `com/jiagu`、`JGS1`、`frida` 等可定位指纹，可挫败"熟悉开源方案者照抄破解步骤"这一类攻击，也规避按特征打 mocika 标签的自动识别。**边界**：`Obf` 为混淆非加密，密钥算法在壳内，防静态扫描/防指纹，不防 jadx 人工分析。
+- **反内存 dump 检测（P-ANTIDUMP）**：`GxAntiDump` 守护线程启动即查 + 周期轮询，检测 FART/Youpk/BlackDex 等脱壳工具的默认 dump 产物路径（app 数据目录下的 `dump`/`app_dump`/`dexdump`/`dump_dex` 目录、`/data/local/tmp` 下的 `blackdex`/`youpk`/`fart` 标记文件），命中收口 `STRENGTHEN_RESPONSE`。**边界**：仅挡默认配置脱壳工具，改路径的定制工具挡不住；根治需 VMP 指令虚拟化，未做。
+- **防抓包（P-CAPTURE，代码待命、默认未启用）**：`GxPinning` 支持按 `gx.ssl_pins` 配置 SPKI 指纹固定，`GxProxy` 检测系统代理/VPN，二者统一收口 `STRENGTHEN_RESPONSE`（默认 `log` 仅记录）。因证书轮换顾虑未配 pin；X5 WebView 与自定义 TrustManager 的 OkHttp 为机制盲区，故当前防抓包处于"检测可见、不阻断"的半开状态。
 
 > ⚠️ **已补强 P1/P2，但仍有的边界**：反 Frida（P1 native 层 + Java 周期轮询）与 DEX fileless 内存加载（P2，磁盘不落明文、不生成 odex）已完成；但**运行期内存 dump 仍未 100% 防护**——DEX 被 ART 加载后优化代码必在进程内存，frida-dexdump 仍可扫到。要做到"运行期明文不驻留内存"需 P3 指令抽取（native hook ART，高风险，未做）。加密链路本身扎实。
 
@@ -69,7 +73,7 @@ flowchart LR
 
 ```
 JGShield/
-├── src/java/com/jiagu/shield/ShieldApplication.java   # 加固壳（编译为 stub.dex）
+├── src/java/com/gx/runtime/GxApp.java                # 加固壳主类（编译为 stub.dex；已做自身混淆：类名/字符串/native 符号改名）
 ├── harden.py              # 加固核心：DEX 收集→Manifest 改写→加密载荷→zip 直打包→签名→回测
 ├── axml_editor.py         # 二进制 AXML 编辑器（改 application / 注入 meta-data，不经 apktool）
 ├── config.py              # 共享配置（路径解析、工具/密钥位置、壳常量，必须与 Java 壳保持一致）
@@ -228,14 +232,14 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
    - ✅ **反 Frida 已补强（保命版）**：启动期一次性扫描 → 升级为 `AntiTamper` 后台守护线程周期轮询（maps 扩展特征 / frida 端口 27042·27043 / `/data/local/tmp/re.frida.server` / `TracerPid`），可捕获改名注入与延迟注入；命中即退出，干净设备零影响。
    - ✅ **原生层反篡改（P1）**：`libjgguard.so`（NDK 编译，JNI 守护线程）下沉到 native，比 Java `AntiTamper` 更难被 frida hook，二者互为备份；加载失败仅降级，不影响启动。
    - ✅ **DEX fileless 内存加载（P2）**：API≥26 时解密进 `ByteBuffer`，经公开 API `InMemoryDexClassLoader` 在内存中加载并注入框架 `sysLoader`（保留原生库命名空间），**磁盘不落明文 DEX 文件、不生成 odex**（关掉了"读明文文件/备份"这一类最易利用的泄漏）；解密后源 `byte[]` 立即清零。API<26 自动回退原文件方案（不回归）。
-   - ❌ **运行期内存 dump 仍未 100% 防护**：DEX 一旦被 ART 加载运行，优化后的代码必存在于进程内存，frida-dexdump 等仍可扫到。当前 P2 已关闭**磁盘明文**与**启动期整段明文大块**两个泄漏点，但要做到"运行期明文 DEX 不驻留内存"，必须做 **DEX 指令抽取（native 层 hook ART 方法，按需解密/还原方法字节码）**——该方案版本相关、极易崩，属独立的**高风险 P3**，暂未做，需独立真机压测。
+   - ⚠️ **运行期内存 dump 仍未 100% 防护**：DEX 一旦被 ART 加载运行，优化后的代码必存在于进程内存，frida-dexdump 等仍可扫到。当前 P2 已关闭**磁盘明文**与**启动期整段明文大块**两个泄漏点，并已加 **`GxAntiDump` 检测层**（拦默认配置脱壳工具）；但要做到"运行期明文 DEX 不驻留内存"，必须做 **DEX 指令抽取（native 层 hook ART 方法，按需解密/还原方法字节码）**——该方案版本相关、极易崩，属独立的**高风险 P3**。方法级抽取（P3.2 批量还原）已落地但覆盖率有限。
    - 待规划：P3 指令抽取（需独立真机验证）、关键逻辑 native 化深化。
 2. **`logcat` 中的 `ClassNotFoundException: androidx.core.app.CoreComponentFactory`**：无害。
    Android 9+ 系统在 `makeApplication()` 早于 `attachBaseContext` 加载 `android:appComponentFactory` 指定的类，
    此时 DEX 尚未注入，被系统 catch 后回退默认工厂，不影响运行。
 3. **原生库命名空间**：已通过方案 B（DEX 注入 `sysLoader`）解决，原 App 原生库解析与未加固一致。
 4. **assets/ 加密（实验性、默认关闭）**：
-   - 加固核心支持把原始 `assets/` 加密进 `jg` 载荷并从 APK 剥离（关闭资源明文泄漏），运行时由壳解密还原进 `AssetManager`。
+   - 加固核心支持把原始 `assets/` 加密进 `z9` 载荷并从 APK 剥离（关闭资源明文泄漏），运行时由壳解密还原进 `AssetManager`。
    - **默认不开启**（CLI 需显式 `--assets-encrypt`）：因为运行时还原依赖反射绕过隐藏 API 合并 `AssetManager`，在部分 OEM/高版本 ROM 上可能失败，失败后 App 会缺资源而崩。
    - 若开启后某 App 报 assets 缺失/资源找不到，**去掉 `--assets-encrypt` 重新加固即可恢复**（assets 留在 APK 内，与未加固行为一致）。
 
