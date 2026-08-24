@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <android/log.h>
+#include "jg_crypto.h"
 
 #define TAG "JG-Native"
 
@@ -208,6 +209,47 @@ Java_com_gx_runtime_GxGuard_nativeSetResponse(JNIEnv *env, jclass clazz, jstring
     }
     __android_log_print(ANDROID_LOG_INFO, TAG, "response mode=%s",
                         g_response_exit ? "exit" : "log");
+}
+
+/* ===== 密钥派生下沉（GxKeys）===== */
+/* seed = HMAC(key=salt, msg=SHA256(certDer))；与 Java 原 seed() 语义一致。 */
+JNIEXPORT jbyteArray JNICALL
+Java_com_gx_runtime_GxKeys_nativeDeriveSeed(JNIEnv *env, jclass clazz,
+        jbyteArray certDer, jbyteArray salt) {
+    (void)clazz;
+    jbyte *cert = (*env)->GetByteArrayElements(env, certDer, NULL);
+    jsize clen = (*env)->GetArrayLength(env, certDer);
+    jbyte *slt = (*env)->GetByteArrayElements(env, salt, NULL);
+    jsize slen = (*env)->GetArrayLength(env, salt);
+    uint8_t certHash[32];
+    jg_sha256_ctx sc; jg_sha256_init(&sc);
+    jg_sha256_update(&sc, (const uint8_t*)cert, (size_t)clen);
+    jg_sha256_final(certHash, &sc);
+    uint8_t seed[32];
+    jg_hmac_sha256((const uint8_t*)slt, (size_t)slen, certHash, 32, seed);
+    (*env)->ReleaseByteArrayElements(env, certDer, cert, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, salt, slt, JNI_ABORT);
+    jbyteArray out = (*env)->NewByteArray(env, 32);
+    (*env)->SetByteArrayRegion(env, out, 0, 32, (jbyte*)seed);
+    return out;
+}
+
+/* key = HMAC(key=seed, msg="JG|"+info)；与 Java 原 keyFor() 语义一致。 */
+JNIEXPORT jbyteArray JNICALL
+Java_com_gx_runtime_GxKeys_nativeKeyFor(JNIEnv *env, jclass clazz,
+        jbyteArray seedArr, jbyteArray info) {
+    (void)clazz;
+    jbyte *sd = (*env)->GetByteArrayElements(env, seedArr, NULL);
+    jsize sdlen = (*env)->GetArrayLength(env, seedArr);
+    jbyte *inf = (*env)->GetByteArrayElements(env, info, NULL);
+    jsize inflen = (*env)->GetArrayLength(env, info);
+    uint8_t out[32];
+    jg_hmac_sha256((const uint8_t*)sd, (size_t)sdlen, (const uint8_t*)inf, (size_t)inflen, out);
+    (*env)->ReleaseByteArrayElements(env, seedArr, sd, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, info, inf, JNI_ABORT);
+    jbyteArray res = (*env)->NewByteArray(env, 32);
+    (*env)->SetByteArrayRegion(env, res, 0, 32, (jbyte*)out);
+    return res;
 }
 
 JNIEXPORT jint JNICALL

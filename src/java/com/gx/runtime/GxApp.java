@@ -773,14 +773,15 @@ class GxAssets {
  * 故同一证书多次加固密文不同（抗跨构建差分），且仍硬绑定证书（换签 PRK 变 → GCM 标签失败）。
  */
 class GxKeys {
+    /** 核心密钥派生下沉 native（libjgguard.so 的 jg_hmac_sha256），避免 HMAC 逻辑留在 DEX 被 jadx 直接分析。
+     *  Java 侧仅取证书 DER（需反射隐藏 API），其余 HMAC 派生在 .so 内完成。 */
+    private static native byte[] nativeDeriveSeed(byte[] certDer, byte[] salt);
+    private static native byte[] nativeKeyFor(byte[] seed, byte[] info);
+
     /** HKDF-Extract：PRK = HMAC(build_salt, SHA256(certDER))。 */
     static byte[] seed(Context ctx, byte[] salt) throws Exception {
         byte[] cert = certDer(ctx);
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] certHash = md.digest(cert);
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(salt, "HmacSHA256"));
-        return mac.doFinal(certHash);
+        return nativeDeriveSeed(cert, salt);
     }
 
     /** 从 jg 载荷尾部取 32 字节 per-build salt（HKDF-Extract 的 salt 输入）。 */
@@ -792,10 +793,7 @@ class GxKeys {
     }
 
     static byte[] keyFor(byte[] seed, String info) throws Exception {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(seed, "HmacSHA256"));
-        mac.update(("JG|" + info).getBytes("UTF-8"));
-        return mac.doFinal();
+        return nativeKeyFor(seed, ("JG|" + info).getBytes("UTF-8"));
     }
 
     private static byte[] certDer(Context ctx) throws Exception {
@@ -1588,10 +1586,28 @@ class GxProxy {
 
 /** P1 字符串混淆助手（XOR）。密钥/算法与密文同源，属混淆非加密：防静态 grep，不防动态分析。 */
 class Obf {
-    private static final byte[] K = {0x13, 0x57, 0x2A, 0x6C, 0x4E, 0x1B, 0x36, 0x79, 0x0D, 0x51, 0x68, 0x74, 0x2B, 0x3F, 0x44, 0x52};
+    // 密钥不再以现成明文字节数组出现：由几个整数常量在运行期拼装，
+    // 逆向者需分析 deriveKey() 才能还原 XOR 密钥（比现成字节数组门槛高；
+    // 本质仍是混淆非加密——DEX 内逻辑必可分析，仅提高静态扫描/jadx 成本）。
+    private static final int[] K_SEED = {0x13572A6C, 0x4E1B3679, 0x0D516874, 0x2B3F4452};
+    private static byte[] K;
+    private static byte[] deriveKey() {
+        if (K != null) return K;
+        byte[] k = new byte[16];
+        for (int i = 0; i < 4; i++) {
+            int v = K_SEED[i];
+            k[i*4]   = (byte)(v >>> 24);
+            k[i*4+1] = (byte)(v >>> 16);
+            k[i*4+2] = (byte)(v >>> 8);
+            k[i*4+3] = (byte)v;
+        }
+        K = k;
+        return k;
+    }
     static String d(byte[] c) {
+        byte[] key = deriveKey();
         char[] r = new char[c.length];
-        for (int i = 0; i < c.length; i++) r[i] = (char) (c[i] ^ K[i % K.length]);
+        for (int i = 0; i < c.length; i++) r[i] = (char) (c[i] ^ key[i % key.length]);
         return new String(r);
     }
 }
