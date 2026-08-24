@@ -203,6 +203,19 @@ def encrypt_dex(seed, idx, dex_bytes):
     ct, tag = cipher.encrypt_and_digest(comp)
     return iv + ct + tag
 
+def encrypt_shell_dex(seed, dex_bytes):
+    """P8：加密壳自身 DEX（GxApp 等 12 类），密钥派生与原载荷同源同 salt，
+    但 label 用 "JG|shell" 区分，使壳 DEX 与原 App DEX 使用不同密钥。
+    Bootstrap 端 deriveShellKey 必须用完全相同派生（见 GxBootstrap.java）。
+    注意：此处对原始 DEX 字节直接加密（不 zlib 压缩），使解密结果就是合法 DEX
+    文件，InMemoryDexClassLoader 可直接加载；否则 Bootstrap 端需额外 inflate，
+    违背"壳 DEX 即 DEX 文件"的语义且增加失败面。"""
+    key = derive_key(seed, 0, label=b"shell")
+    iv = os.urandom(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    ct, tag = cipher.encrypt_and_digest(dex_bytes)
+    return iv + ct + tag
+
 def build_payload(seed, dex_list, asset_list=None, method_sections=None, salt=None):
     out = bytearray()
     out += config.MAGIC
@@ -486,11 +499,16 @@ def _stored(name):
 
 
 def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path,
-                     native_libs_dir=None, strip_assets=False):
-    """直接用 zipfile 重建 APK（Manifest 首条 + STORED，保持原资源+lib 顺序 + stub.dex + jg）。
+                     native_libs_dir=None, strip_assets=False,
+                     shell_dex_enc=None, shell_dex_entry=None):
+    """直接用 zipfile 重建 APK（Manifest 首条 + STORED，保持原资源+lib 顺序 + 入口壳 DEX + 加密壳 DEX + jg）。
     剔除原 classes*.dex、原 META-INF、原 AndroidManifest.xml。
 
-    native_libs_dir：若提供，则把其中的 libjgguard.so 注入到输出 APK 的 lib/<abi>/，
+    P8：stub_dex 参数此处接收的是 bootstrap.dex（明文入口 Application）；
+    加密的壳 DEX（GxApp 等）通过 shell_dex_enc / shell_dex_entry 注入随机条目，
+    由 Bootstrap 运行期解密并加载。
+
+    native_libs_dir：若提供，则把其中的 lib<LIB_NAME>.so 注入到输出 APK 的 lib/<abi>/，
     与原 App 自身的 .so 并列（ZIP_STORED 不压缩，Android 要求）。
     """
     # 确定要注入的 ABI 集合：优先取原包已有的 lib/<abi>/，没有则补 arm64-v8a/armeabi-v7a
@@ -523,8 +541,12 @@ def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path
                 if strip_assets and fn.startswith("assets/"):
                     continue
                 zout.writestr(info, zin.read(fn))
-            # 3) 壳 DEX + 载荷
+            # 3) 壳 DEX（入口 bootstrap，明文）+ 加密壳 DEX + 载荷
             zout.writestr(zipfile.ZipInfo('classes.dex'), stub_dex)
+            if shell_dex_enc is not None and shell_dex_entry is not None:
+                zi = zipfile.ZipInfo(shell_dex_entry)
+                zi.compress_type = zipfile.ZIP_STORED
+                zout.writestr(zi, shell_dex_enc)
             zout.writestr(zipfile.ZipInfo(config.PAYLOAD_ENTRY), payload)
             # 4) 注入 native 反篡改库（与原 App .so 并列；STORED 不压缩）
             #    注意：APK 内文件名随机化（lib<LIB_NAME>.so），但 .so 内部 JNI 符号与
@@ -622,7 +644,7 @@ def harden(input_apk, output_apk=None, keep=False,
         raise RuntimeError("无法从二进制 Manifest 提取原始 Application 类名（"
                            "android:name 是资源引用而非字符串），请用 apktool 文本流")
     patched_manifest = _axml_patch(manifest_data, orig_app,
-                                   shell_app_class=config.SHELL_APP,
+                                   shell_app_class=config.BOOTSTRAP_APP,
                                    ssl_pins=ssl_pins, strengthen=strengthen,
                                    meta_orig=config.META_ORIG,
                                    meta_ssl=config.META_SSL_PINS,
@@ -669,13 +691,22 @@ def harden(input_apk, output_apk=None, keep=False,
                             method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
-    print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 %s 条目" % (len(stub), len(payload), config.PAYLOAD_ENTRY))
+    # P8：加密壳自身 DEX（GxApp 等 12 类），与原载荷同 salt 同 seed，
+    # 但 label "JG|shell" 区分密钥；Bootstrap 端用同派生解密。
+    shell_dex_enc = encrypt_shell_dex(seed, stub)
+    print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 %s 条目；壳 DEX 加密(%d) -> %s 条目"
+          % (len(stub), len(payload), config.PAYLOAD_ENTRY,
+             len(shell_dex_enc), config.SHELL_DEX_ENTRY))
     _lap(sw, "加密载荷")
 
-    # 4) zip 直打包（原资源 + patched Manifest + stub.dex + jg，跳过 apktool b）
+    # 4) zip 直打包（原资源 + patched Manifest + bootstrap.dex(明文入口) +
+    #    加密壳 DEX + 载荷，跳过 apktool b）
+    with open(config.BOOTSTRAP_DEX, "rb") as f:
+        bootstrap = f.read()
     unsigned = os.path.join(work, "unsigned.apk")
-    repackage_direct(input_apk, patched_manifest, stub, payload, unsigned,
-                     native_libs_dir=config.LIBJGGUARD_DIR, strip_assets=bool(assets))
+    repackage_direct(input_apk, patched_manifest, bootstrap, payload, unsigned,
+                     native_libs_dir=config.LIBJGGUARD_DIR, strip_assets=bool(assets),
+                     shell_dex_enc=shell_dex_enc, shell_dex_entry=config.SHELL_DEX_ENTRY)
     _lap(sw, "zip打包")
 
     # 5) 签名

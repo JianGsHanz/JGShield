@@ -68,7 +68,12 @@ import java.net.NetworkInterface;
  *      ClassLoader，使原 Application 与四大组件均可被系统正常实例化（而非 Rust native 注入）。
  *   5. 反调试：启动期对 /proc/self/maps 做 Frida/Substrate/Xposed 特征扫描 + debugger 检测。
  */
-public class GxApp extends Application {
+/**
+ * P8 变更：GxApp 不再 extends Application（Manifest 入口改为 GxBootstrap）。
+ * 改为被引导壳加载的普通类，所有初始化逻辑收口到 static Application boot(Context, Application)。
+ * 系统不会再把 GxApp 当 Application 实例化，生命周期转发由 GxBootstrap 负责。
+ */
+public class GxApp {
     private static final String TAG = "GX";
     static final String MAGIC = Obf.d(new byte[]{0x59, 0x10, 0x79, 0x5D});
     private static final String META_ORIG = "gx.orig_app";
@@ -90,14 +95,18 @@ public class GxApp extends Application {
     // 以便同一份 stub.dex 同时支持两种姿态，无需维护两份 dex。
     static String STRENGTHEN_RESPONSE = "log";
 
-    private Application realApp;
-    private boolean realOnCreateCalled = false;
-    private File shellDir;
-
-    @Override
-    protected void attachBaseContext(Context base) {
-        super.attachBaseContext(base);
-        shellDir = getDir("gxshell", Context.MODE_PRIVATE);
+    /**
+     * P8 引导入口（替换原 attachBaseContext）。
+     * 由 GxBootstrap.attachBaseContext 反射调用：完成壳自身的全部初始化
+     * （loadLibrary / 反调试 / 解密原 App DEX / 注入 / 启动 realApp / swap）。
+     *
+     * @param base   应用 Context（来自 Bootstrap.attachBaseContext 的 base）
+     * @param proxy  Bootstrap 实例（系统真正的 Application），用于 swap 替换
+     * @return realApp（可能为 null，表示原 App 用默认 Application）
+     */
+    public static Application boot(Context base, Application proxy) {
+        Application realApp = null;
+        File shellDir = proxy.getDir("gxshell", Context.MODE_PRIVATE);
 
         // P-CAPTURE 统一响应姿态：优先从加固期注入的 manifest meta 读取（默认 log，fail-safe）。
         // 必须在 GxGuard.configureResponse() 之前设置，确保 native 守护线程拿到正确姿态。
@@ -134,7 +143,7 @@ public class GxApp extends Application {
         // 代理/VPN 检测仅记录日志（fail-safe），不做阻断。
         try {
             GxAntiDebug.check();
-            load(base);
+            realApp = load(base, proxy, shellDir);
         } catch (Throwable t) {
             Log.e(TAG, "init failed", t);
             if (realApp == null) {
@@ -179,14 +188,17 @@ public class GxApp extends Application {
         } catch (Throwable t) {
             Log.w(TAG, "integrityScan skipped", t);
         }
+
+        // 返回 realApp 给 Bootstrap 做生命周期转发（可能为 null）
+        return realApp;
     }
 
-    private void load(Context base) throws Exception {
+    private static Application load(Context base, Application proxy, File shellDir) throws Exception {
         String origApp = readMeta(base, META_ORIG);
         File dexDir = new File(shellDir, "dex");
         if (!dexDir.exists()) dexDir.mkdirs();
 
-        ClassLoader sysLoader = getClass().getClassLoader();
+        ClassLoader sysLoader = GxApp.class.getClassLoader();
 
         // P2：fileless 内存加载（API>=26）。解密进 ByteBuffer 直接注入 sysLoader，
         // 磁盘不落明文文件；解密后源 byte[] 立即清零。失败（含 OEM 限制）自动回退文件方案。
@@ -211,6 +223,7 @@ public class GxApp extends Application {
         GxLoader.setClassLoader(base, sysLoader);
 
         Log.i(TAG, "load: origApp=" + origApp);
+        Application realApp = null;
         if (origApp != null && !origApp.isEmpty()
                 && !origApp.equals(Application.class.getName())
                 && !origApp.equals(GxApp.class.getName())) {
@@ -218,7 +231,7 @@ public class GxApp extends Application {
             realApp = (Application) cls.newInstance();
             Log.i(TAG, "load: realApp=" + realApp.getClass().getName());
 
-            GxLoader.swap(this, realApp);
+            GxLoader.swap(proxy, realApp);
             Log.i(TAG, "load: swap OK");
 
             Method attach = Application.class.getDeclaredMethod("attach", Context.class);
@@ -228,13 +241,13 @@ public class GxApp extends Application {
 
             // 同步调用 realApp.onCreate()——不依赖系统 callApplicationOnCreate（EMUI 可能跳过）
             try {
-                realOnCreateCalled = true;
                 realApp.onCreate();
                 Log.i(TAG, "load: realApp.onCreate() OK");
             } catch (Throwable t) {
                 Log.e(TAG, "load: realApp.onCreate() FAILED", t);
             }
         }
+        return realApp;
     }
 
     private static String readMeta(Context ctx, String key) {
@@ -253,9 +266,9 @@ public class GxApp extends Application {
     // ===== 资产运行时还原（关闭 APK 内 assets 明文）=====
     // 自包含：任何异常都只记日志、绝不外抛，避免影响 App 启动。
     // 解密后的 assets 写入应用私有目录的 zip（非公开可读），仅关闭 APK 内明文泄漏。
-    private void restoreAssets(Context base) {
+    private static void restoreAssets(Context base) {
         try {
-            File zip = new File(getCacheDir(), "gx_assets.zip");
+            File zip = new File(base.getCacheDir(), "gx_assets.zip");
             String zipPath = GxAssets.restore(base, zip);
             if (zipPath == null) return;
             android.content.res.AssetManager am = mergeAssetManager(base, zipPath);
@@ -352,44 +365,7 @@ public class GxApp extends Application {
         } catch (Throwable ignored) {}
     }
 
-    @Override
-    public void onCreate() {
-        super.onCreate();
-        Log.i(TAG, "onCreate: called, realApp=" + (realApp != null ? realApp.getClass().getName() : "null") + " realOnCreateCalled=" + realOnCreateCalled);
-        if (realApp != null && !realOnCreateCalled) {
-            realOnCreateCalled = true;
-            try {
-                realApp.onCreate();
-                Log.i(TAG, "onCreate: realApp.onCreate() OK");
-            } catch (Throwable t) {
-                Log.e(TAG, "onCreate: realApp.onCreate() FAILED", t);
-            }
-        }
-    }
-
-    @Override
-    public void onConfigurationChanged(Configuration c) {
-        super.onConfigurationChanged(c);
-        if (realApp != null) realApp.onConfigurationChanged(c);
-    }
-
-    @Override
-    public void onLowMemory() {
-        super.onLowMemory();
-        if (realApp != null) realApp.onLowMemory();
-    }
-
-    @Override
-    public void onTrimMemory(int l) {
-        super.onTrimMemory(l);
-        if (realApp != null) realApp.onTrimMemory(l);
-    }
-
-    @Override
-    public void onTerminate() {
-        super.onTerminate();
-        if (realApp != null) realApp.onTerminate();
-    }
+    // ===== 生命周期转发：由 GxBootstrap 持有 realApp 并转发，GxApp 不再 override =====
 }
 
 /** 解密 + 解压原始 DEX 区段 */

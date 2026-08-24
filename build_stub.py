@@ -135,9 +135,18 @@ def _transform_java(txt, st):
         return "Obf.d(new byte[]{%s})" % ", ".join("(byte)0x%02X" % v for v in out)
 
     txt = re.sub(r'Obf\.d\(new byte\[\]\{([^}]*)\}\)', _reenc, txt)
-    # 8) 类名最后改（覆盖所有引用，含刚生成的模板与调用）
+    # 8) P8 Bootstrap 反射调用 GxApp.boot 的类名字符串随机化 —— 必须在「类名替换」(step 9)
+    # 之前执行，否则 step 9 已把 GxApp→随机名，导致 "com.gx.runtime.GxApp" 模式消失而失效。
+    txt = txt.replace('"com.gx.runtime.GxApp"',
+                      '"%s.%s"' % (st["pkg"], st["classes"]["GxApp"]))
+    # 9) 类名最后改（覆盖所有引用，含刚生成的模板与调用）。注意：本步骤的 old 是
+    # 原始类名（如 GxApp），不会误伤 step 8 已生成的 "pkg.随机名" 字符串。
     for old, new in classes.items():
         txt = re.sub(r'\b' + re.escape(old) + r'\b', new, txt)
+    # 10) P8 引导壳占位替换（仅 GxBootstrap.java 含这些占位，GxApp 不受影响）
+    txt = txt.replace("__LIB_NAME__", st["lib_name"])
+    txt = txt.replace("__SHELL_DEX_ENTRY__", st["shell_dex_entry"])
+    txt = txt.replace("__PAYLOAD_ENTRY__", st["payload_entry"])
     return txt
 
 
@@ -147,44 +156,53 @@ def _build_java(st):
     dest_pkg = st["pkg"].replace(".", "/")
     dest_dir = os.path.join(TMP_JAVA, dest_pkg)
     os.makedirs(dest_dir)
-    java_files = []
-    for fn in ("GxApp.java", "GxGuard.java"):
-        with open(os.path.join(SRC_RUNTIME, fn), encoding="utf-8") as f:
-            txt = f.read()
-        txt = _transform_java(txt, st)
-        new_cls = st["classes"]["GxApp"] if fn == "GxApp.java" \
-            else st["classes"]["GxGuard"]
-        new_path = os.path.join(dest_dir, new_cls + ".java")
-        with open(new_path, "w", encoding="utf-8") as f:
-            f.write(txt)
-        java_files.append(new_path)
-    os.makedirs(TMP_CLASSES)
-    subprocess.check_call([
-        config.JAVAC, "--release", "8", "-encoding", "UTF-8",
-        "-cp", ANDROID_JAR, "-d", TMP_CLASSES,
-    ] + java_files)
-    # d8 不支持「目录」作为输入，且输出不能是单文件 .dex；
-    # 故枚举 .class 文件，输出到目录，再取 classes.dex（壳很小，单 dex）。
-    class_files = []
-    for _root, _dirs, _files in os.walk(TMP_CLASSES):
-        for _f in _files:
-            if _f.endswith(".class"):
-                class_files.append(os.path.join(_root, _f))
-    dex_out = os.path.join(HERE, "build", "dex_out")
-    shutil.rmtree(dex_out, ignore_errors=True)
-    os.makedirs(dex_out)
-    subprocess.check_call([
-        config.JAVA, "-cp", D8, "com.android.tools.r8.D8",
-        "--lib", ANDROID_JAR, "--min-api", "21",
-        "--output", dex_out,
-    ] + class_files)
-    produced = glob.glob(os.path.join(dex_out, "classes*.dex"))
-    if not produced:
-        raise RuntimeError("d8 未产出任何 dex")
-    if len(produced) > 1:
-        raise RuntimeError("壳超出单 dex 限制，需 multidex 处理: %s" % produced)
-    shutil.copy(sorted(produced)[0], config.STUB_DEX)
+
+    def _compile_to_dex(java_files, out_dex):
+        cf = []
+        for fn in java_files:
+            with open(os.path.join(SRC_RUNTIME, fn), encoding="utf-8") as f:
+                txt = f.read()
+            txt = _transform_java(txt, st)
+            cls_key = fn[:-5]  # "GxApp"/"GxGuard"/"GxBootstrap"
+            new_cls = st["classes"][cls_key]
+            new_path = os.path.join(dest_dir, new_cls + ".java")
+            with open(new_path, "w", encoding="utf-8") as f:
+                f.write(txt)
+            cf.append(new_path)
+        classes_dir = os.path.join(TMP_CLASSES, cls_key)
+        shutil.rmtree(classes_dir, ignore_errors=True)
+        os.makedirs(classes_dir)
+        subprocess.check_call([
+            config.JAVAC, "--release", "8", "-encoding", "UTF-8",
+            "-cp", ANDROID_JAR, "-d", classes_dir,
+        ] + cf)
+        class_files = []
+        for _r, _d, _fs in os.walk(classes_dir):
+            for _f in _fs:
+                if _f.endswith(".class"):
+                    class_files.append(os.path.join(_r, _f))
+        dex_out = os.path.join(HERE, "build", "dex_out_" + cls_key)
+        shutil.rmtree(dex_out, ignore_errors=True)
+        os.makedirs(dex_out)
+        subprocess.check_call([
+            config.JAVA, "-cp", D8, "com.android.tools.r8.D8",
+            "--lib", ANDROID_JAR, "--min-api", "21",
+            "--output", dex_out,
+        ] + class_files)
+        produced = glob.glob(os.path.join(dex_out, "classes*.dex"))
+        if not produced:
+            raise RuntimeError("d8 未产出任何 dex for %s" % cls_key)
+        if len(produced) > 1:
+            raise RuntimeError("壳超出单 dex 限制: %s" % produced)
+        shutil.copy(sorted(produced)[0], out_dex)
+        return out_dex
+
+    # ① 壳主 DEX（GxApp + GxGuard → stub.dex，加密前明文，harden 会加密它）
+    _compile_to_dex(("GxApp.java", "GxGuard.java"), config.STUB_DEX)
     print("[*] stub.dex 构建完成（随机包名 %s）: %s" % (st["pkg"], config.STUB_DEX))
+    # ② P8 引导壳（GxBootstrap → bootstrap.dex，明文，作 APK 入口 classes.dex）
+    _compile_to_dex(("GxBootstrap.java",), config.BOOTSTRAP_DEX)
+    print("[*] bootstrap.dex 构建完成: %s" % config.BOOTSTRAP_DEX)
 
 
 # ── native 源码变换 ────────────────────────────────────────────────────────────

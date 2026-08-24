@@ -73,9 +73,14 @@ if not JAVA:
     JAVA = "java"  # 回退到 PATH
 
 # -------------------------------------------------------------------------- #
-# 外壳 DEX（由 GxApp.java 编译而来，含 5 个壳类）
+# 外壳 DEX（由 GxApp.java 编译而来，含 12 个壳类）；P8 起被加密为载荷段
 # -------------------------------------------------------------------------- #
 STUB_DEX = os.path.join(_BUNDLE, "build", "dex", "stub.dex")
+# P8 引导壳 DEX（GxBootstrap.java 编译，极简，作 APK 的 classes.dex 明文入口）
+BOOTSTRAP_DEX = os.path.join(_BUNDLE, "build", "dex", "bootstrap.dex")
+# P8 随机化默认值（apply_stamp_from_file 覆盖）
+SHELL_DEX_ENTRY = "gxsh"     # 加密壳 DEX 的随机 zip 条目名
+BOOTSTRAP_APP = "com.gx.runtime.GxBootstrap"
 
 # -------------------------------------------------------------------------- #
 # native 反篡改库（由各 ABI 的 libjgguard.so 组成，加固时注入 APK 的 lib/<abi>/）
@@ -191,6 +196,7 @@ _STAMP_PATH = os.path.join(EXEC_DIR, "build", "stamp.json")
 
 def apply_stamp(st):
     global MAGIC, META_ORIG, META_SSL_PINS, META_STRENGTHEN, SHELL_APP, PAYLOAD_ENTRY, LIB_NAME
+    global SHELL_DEX_ENTRY, BOOTSTRAP_APP
     MAGIC = st["magic"].encode("utf-8") if isinstance(st["magic"], str) else st["magic"]
     META_ORIG = st["meta_orig"]
     META_SSL_PINS = st["meta_ssl"]
@@ -198,6 +204,8 @@ def apply_stamp(st):
     SHELL_APP = st["pkg"] + "." + st["classes"]["GxApp"]
     PAYLOAD_ENTRY = st["payload_entry"]
     LIB_NAME = st["lib_name"]
+    SHELL_DEX_ENTRY = st["shell_dex_entry"]
+    BOOTSTRAP_APP = st["pkg"] + "." + st["classes"]["GxBootstrap"]
 
 
 def apply_stamp_from_file(path=_STAMP_PATH):

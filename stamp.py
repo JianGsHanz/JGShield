@@ -24,9 +24,11 @@ _ALNUM = string.ascii_letters + string.digits
 _MAGIC_CHARS = "!#$&()*+,-.0123456789:<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 # 需要随机化改名的全部壳类（含 4 个带 JNI 方法的类：GxGuard/GxKeys/GxDecryptor/Obf）
+# P8：新增 GxBootstrap（引导壳，也纳入随机化以抹特征）
 _SHELL_CLASSES = [
     "GxApp", "GxGuard", "GxKeys", "GxDecryptor", "GxAssets", "GxAntiDebug",
     "GxTamper", "GxAntiDump", "GxLoader", "GxPinning", "GxProxy", "Obf",
+    "GxBootstrap",
 ]
 
 
@@ -75,6 +77,12 @@ def generate():
         lambda: "".join(random.choice(string.ascii_lowercase + string.digits)
                          for _ in range(random.randint(2, 4))))
 
+    # P8 加密壳 DEX 的随机 zip 条目名（Bootstrap 从此条目读加密壳 DEX）
+    shell_dex_entry = _uniq(
+        used,
+        lambda: "".join(random.choice(string.ascii_lowercase + string.digits)
+                        for _ in range(random.randint(2, 4))))
+
     magic = "".join(random.choice(_MAGIC_CHARS) for _ in range(4))
 
     lib_name = _uniq(
@@ -98,6 +106,7 @@ def generate():
         "tag_mr_log": tags["mr_log"], "tag_ih_log": tags["ih_log"],
         "tag_mrh_log": tags["mrh_log"],
         "payload_entry": payload_entry,
+        "shell_dex_entry": shell_dex_entry,
         "magic": magic,
         "lib_name": lib_name,
         "obf_key": obf_key,
