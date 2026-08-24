@@ -23,6 +23,9 @@ gen_samples/
 
 # ---- External tool binaries (not source; place locally to run harden.py) ----
 tools/
+# libjgguard.so 是加固壳强依赖的 native 产物，必须与 jg_guard.c 同步，强制入库
+!tools/libjgguard/
+!tools/libjgguard/*.so
 
 # ---- Keystores (never commit keys) ----
 *.jks
