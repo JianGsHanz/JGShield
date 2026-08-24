@@ -10,6 +10,8 @@
 
 import struct
 
+import config
+
 
 # ─── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -464,8 +466,10 @@ def get_orig_app_class(manifest_data):
     return None
 
 
-def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.gx.runtime.GxApp",
-                   ssl_pins=None, strengthen=None):
+def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_APP,
+                   ssl_pins=None, strengthen=None,
+                   meta_orig=config.META_ORIG, meta_ssl=config.META_SSL_PINS,
+                   meta_strengthen=config.META_STRENGTHEN):
     """
     修改二进制 AndroidManifest.xml：
 
@@ -513,7 +517,7 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.gx.runtim
 
     # 3. 确定需要新增的字符串
     new_strings_needed = []
-    for s in [shell_app_class, orig_app_class, 'gx.orig_app']:
+    for s in [shell_app_class, orig_app_class, meta_orig]:
         if _find_string_index(strings, s) == -1:
             new_strings_needed.append(s)
     if _find_string_index(strings, 'name') == -1:
@@ -524,12 +528,12 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.gx.runtim
         new_strings_needed.append('meta-data')
     # SSL pinning meta（P-CAPTURE）：加固期注入 gx.ssl_pins，壳运行期读取
     if ssl_pins:
-        for s in ['gx.ssl_pins', ssl_pins]:
+        for s in [meta_ssl, ssl_pins]:
             if _find_string_index(strings, s) == -1:
                 new_strings_needed.append(s)
     # 统一响应姿态 meta（P-CAPTURE）：加固期注入 gx.strengthen，壳运行期读取覆盖默认 "log"
     if strengthen:
-        for s in ['gx.strengthen', strengthen]:
+        for s in [meta_strengthen, strengthen]:
             if _find_string_index(strings, s) == -1:
                 new_strings_needed.append(s)
     # 注：删除 appComponentFactory 属性时无需把 appComponentFactory / 空串 加入字符串池
@@ -552,10 +556,10 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class="com.gx.runtim
     meta_data_idx   = _find_string_index(strings, 'meta-data')
     shell_class_idx = _find_string_index(strings, shell_app_class)
     orig_class_idx  = _find_string_index(strings, orig_app_class)
-    jg_orig_idx     = _find_string_index(strings, 'gx.orig_app')
-    ssl_pins_idx     = _find_string_index(strings, 'gx.ssl_pins') if ssl_pins else -1
+    jg_orig_idx     = _find_string_index(strings, meta_orig)
+    ssl_pins_idx     = _find_string_index(strings, meta_ssl) if ssl_pins else -1
     ssl_pins_val_idx = _find_string_index(strings, ssl_pins) if ssl_pins else -1
-    strengthen_idx     = _find_string_index(strings, 'gx.strengthen') if strengthen else -1
+    strengthen_idx     = _find_string_index(strings, meta_strengthen) if strengthen else -1
     strengthen_val_idx = _find_string_index(strings, strengthen) if strengthen else -1
 
     # 重新定位 application（字符串池修改后位置可能后移）

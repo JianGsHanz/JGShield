@@ -18,6 +18,10 @@ import subprocess
 import config
 from config import _decode_bytes
 
+# 使检测端的 shell TAG 与本次加固产物一致（build/stamp.json）
+config.apply_stamp_from_file()
+import stamp as _stamp
+
 ADB = config.ADB
 
 def adb(target, *args, check=True):
@@ -95,10 +99,20 @@ def check(apk, target, keep=False):
     # 收集与本包相关日志
     pkg_logs = "\n".join([l for l in logs.splitlines() if pkg in l][:40])
 
+    # 收集壳自身日志（按本次随机化 TAG，确认加固链路跑通）
+    _st = _stamp.load()
+    _tag = (_st["tag_app"] if _st else "GX")
+    shell_logs = "\n".join([l for l in logs.splitlines()
+                             if _tag in l or "method restore" in l
+                             or "integrity" in l or "native guard" in l
+                             or "fileless" in l or "realApp" in l][:40])
+
     ok = resumed and not crash
     detail = "resumed=%s crash=%s" % (resumed, crash)
     if pkg_logs.strip():
         detail += "\n    [相关日志]\n    " + "\n    ".join(pkg_logs.splitlines()[:20])
+    if shell_logs.strip():
+        detail += "\n    [壳日志 TAG=%s]\n    " % _tag + "\n    ".join(shell_logs.splitlines()[:30])
     if not keep:
         try:
             adb(target, "uninstall", pkg)

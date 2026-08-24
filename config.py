@@ -10,6 +10,7 @@ JGShield 加固工具集 - 共享配置
 """
 import os
 import sys
+import json
 import locale
 
 # -------------------------------------------------------------------------- #
@@ -175,6 +176,34 @@ META_SSL_PINS = "gx.ssl_pins"
 # 取值 "log"（默认，fail-safe，仅记日志）或 "exit"（命中即退出进程）。
 META_STRENGTHEN = "gx.strengthen"
 SHELL_APP = "com.gx.runtime.GxApp"
+# 载荷 ZIP 条目名（默认 z9，随机化由 stamp 覆盖）
+PAYLOAD_ENTRY = "z9"
+# 注入到 APK 的 native 库文件名（不含 lib 前缀/ .so 后缀；默认 jgguard，随机化由 stamp 覆盖）
+LIB_NAME = "jgguard"
+
+# -------------------------------------------------------------------------- #
+# 按构建随机化（抹壳特征）：从 build/stamp.json 覆盖上述常量。
+# build_stub.py 每次加固先生成 stamp 并重建 stub.dex / .so，harden/verify/device_check
+# 在本进程内调用 apply_stamp_from_file() 使写端与壳读端完全一致。
+# -------------------------------------------------------------------------- #
+_STAMP_PATH = os.path.join(EXEC_DIR, "build", "stamp.json")
+
+
+def apply_stamp(st):
+    global MAGIC, META_ORIG, META_SSL_PINS, META_STRENGTHEN, SHELL_APP, PAYLOAD_ENTRY, LIB_NAME
+    MAGIC = st["magic"].encode("utf-8") if isinstance(st["magic"], str) else st["magic"]
+    META_ORIG = st["meta_orig"]
+    META_SSL_PINS = st["meta_ssl"]
+    META_STRENGTHEN = st["meta_strengthen"]
+    SHELL_APP = st["pkg"] + "." + st["classes"]["GxApp"]
+    PAYLOAD_ENTRY = st["payload_entry"]
+    LIB_NAME = st["lib_name"]
+
+
+def apply_stamp_from_file(path=_STAMP_PATH):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            apply_stamp(json.load(f))
 
 # -------------------------------------------------------------------------- #
 # 工作/输出目录（放在 exe 同级，便于用户找到产物）

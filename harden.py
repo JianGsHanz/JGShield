@@ -518,32 +518,35 @@ def repackage_direct(input_apk, patched_manifest, stub_dex, payload, output_path
                     continue
                 if fn.startswith('META-INF/'):
                     continue
-                if fn == "z9":
+                if fn == config.PAYLOAD_ENTRY:
                     continue
                 if strip_assets and fn.startswith("assets/"):
                     continue
                 zout.writestr(info, zin.read(fn))
             # 3) 壳 DEX + 载荷
             zout.writestr(zipfile.ZipInfo('classes.dex'), stub_dex)
-            zout.writestr(zipfile.ZipInfo("z9"), payload)
+            zout.writestr(zipfile.ZipInfo(config.PAYLOAD_ENTRY), payload)
             # 4) 注入 native 反篡改库（与原 App .so 并列；STORED 不压缩）
+            #    注意：APK 内文件名随机化（lib<LIB_NAME>.so），但 .so 内部 JNI 符号与
+            #    文件名无关，壳 System.loadLibrary("<LIB_NAME>") 按文件名加载、按类名解析。
             if have_native:
                 injected = 0
                 for abi in sorted(abis):
-                    src = os.path.join(native_libs_dir, abi, 'libjgguard.so')
+                    src = os.path.join(native_libs_dir, abi,
+                                       'lib%s.so' % config.LIB_NAME)
                     if not os.path.isfile(src):
                         continue
                     with open(src, 'rb') as f:
                         data = f.read()
-                    zi = zipfile.ZipInfo('lib/%s/libjgguard.so' % abi)
+                    zi = zipfile.ZipInfo('lib/%s/lib%s.so' % (abi, config.LIB_NAME))
                     zi.compress_type = zipfile.ZIP_STORED
                     zout.writestr(zi, data)
                     injected += 1
                 if injected:
-                    print("[*] 注入 native 反篡改库 libjgguard.so 到 %d 个 ABI: %s"
-                          % (injected, ', '.join(sorted(abis))), flush=True)
+                    print("[*] 注入 native 反篡改库 lib%s.so 到 %d 个 ABI: %s"
+                          % (config.LIB_NAME, injected, ', '.join(sorted(abis))), flush=True)
                 else:
-                    print("[!] 未找到任何 ABI 的 libjgguard.so，跳过 native 注入（需先 build_native）",
+                    print("[!] 未找到任何 ABI 的 libjgguard.so，跳过 native 注入（需先 build_stub）",
                           flush=True)
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError("zip 直打包失败")
@@ -566,7 +569,7 @@ def self_verify(out_apk, orig_dexes):
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
-           ssl_pins=None, strengthen=None):
+           ssl_pins=None, strengthen=None, rebuild_stub=True):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -581,6 +584,15 @@ def harden(input_apk, output_apk=None, keep=False,
     work = _short_work(base)
     config.rmtree_safe(work)
     os.makedirs(work, exist_ok=True)
+
+    # 0) 壳指纹随机化（抹壳特征）：按构建唯一化包名/类名/meta 键/TAG/payload 条目/
+    #     魔数/lib 名/Obf 密钥，重建 stub.dex 与 4 ABI native，并把随机参数应用到 config
+    #     （写端 manifest/payload 与壳读端 stub.dex/.so 完全一致）。
+    #     rebuild_stub=False 时跳过重建、直接复用已有 build/stamp.json + 产物（快速迭代用）。
+    if rebuild_stub:
+        import build_stub
+        build_stub.main()
+    config.apply_stamp_from_file()
 
     print("=" * 60)
     print("加固:", input_apk)
@@ -610,12 +622,16 @@ def harden(input_apk, output_apk=None, keep=False,
         raise RuntimeError("无法从二进制 Manifest 提取原始 Application 类名（"
                            "android:name 是资源引用而非字符串），请用 apktool 文本流")
     patched_manifest = _axml_patch(manifest_data, orig_app,
-                                   ssl_pins=ssl_pins, strengthen=strengthen)
+                                   shell_app_class=config.SHELL_APP,
+                                   ssl_pins=ssl_pins, strengthen=strengthen,
+                                   meta_orig=config.META_ORIG,
+                                   meta_ssl=config.META_SSL_PINS,
+                                   meta_strengthen=config.META_STRENGTHEN)
     if ssl_pins:
-        print("[2*] 注入 SSL pinning meta: gx.ssl_pins (%d host(s))"
-              % (ssl_pins.count(';') + 1))
+        print("[2*] 注入 SSL pinning meta: %s (%d host(s))"
+              % (config.META_SSL_PINS, ssl_pins.count(';') + 1))
     if strengthen:
-        print("[2*] 注入统一响应姿态 meta: gx.strengthen = %s" % strengthen)
+        print("[2*] 注入统一响应姿态 meta: %s = %s" % (config.META_STRENGTHEN, strengthen))
         if strengthen == "exit":
             print("[!] 警告: exit 模式会误杀正常 VPN/海外用户，不推荐用于面向海外用户的 app。")
     print("[2] 原 Application:", orig_app)
@@ -653,7 +669,7 @@ def harden(input_apk, output_apk=None, keep=False,
                             method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
-    print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 jg 条目" % (len(stub), len(payload)))
+    print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 %s 条目" % (len(stub), len(payload), config.PAYLOAD_ENTRY))
     _lap(sw, "加密载荷")
 
     # 4) zip 直打包（原资源 + patched Manifest + stub.dex + jg，跳过 apktool b）
