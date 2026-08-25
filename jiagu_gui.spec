@@ -31,7 +31,15 @@ _datas = [
     ('tools/common.jks',          'tools'),
     ('tools/common.cer',          'tools'),
     ('tools/apksigner.jar',       'tools'),
+    ('tools/d8.jar',              'tools'),
+    ('tools/android.jar',         'tools'),
     ('build/dex/stub.dex',        'build/dex'),
+]
+# 壳源码：加固时 build_stub 默认 rebuild_stub=True（按随机包名重编），
+# 故 java 源码与 native 源码必须在冻结后也能被找到（路径解析为 _MEIPASS/src/...）
+_datas += [
+    ('src/java',   'src/java'),
+    ('src/native', 'src/native'),
 ]
 # native 反篡改库（按 ABI 分目录），加固时注入 APK 的 lib/<abi>/；不存在时不影响打包
 if os.path.isdir(os.path.join(ROOT, 'tools', 'libjgguard')):
