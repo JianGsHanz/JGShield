@@ -33,7 +33,6 @@ _datas = [
     ('tools/apksigner.jar',       'tools'),
     ('tools/d8.jar',              'tools'),
     ('tools/android.jar',         'tools'),
-    ('build/dex/stub.dex',        'build/dex'),
 ]
 # 壳源码：加固时 build_stub 默认 rebuild_stub=True（按随机包名重编），
 # 故 java 源码与 native 源码必须在冻结后也能被找到（路径解析为 _MEIPASS/src/...）
@@ -41,12 +40,10 @@ _datas += [
     ('src/java',   'src/java'),
     ('src/native', 'src/native'),
 ]
-# native 反篡改库（按 ABI 分目录），加固时注入 APK 的 lib/<abi>/；不存在时不影响打包
-if os.path.isdir(os.path.join(ROOT, 'tools', 'libjgguard')):
-    for _abi in sorted(os.listdir(os.path.join(ROOT, 'tools', 'libjgguard'))):
-        _so = os.path.join('tools', 'libjgguard', _abi, 'libjgguard.so')
-        if os.path.isfile(os.path.join(ROOT, _so)):
-            _datas.append((_so, 'tools/libjgguard/%s' % _abi))
+# 注意：stub.dex / bootstrap.dex / libjgguard/*.so 不再打包进 exe。
+# 它们由 build_stub 在每次加固时按随机 stamp 重编到 BUILD_DIR（exe 同级 build/）。
+# 若打包「构建期」的固定名产物，其随机包名/类名/JNI 符号会与运行时 stamp 不一致，
+# 反而引发 Manifest 类与 dex 类不匹配（ClassNotFoundException）。故只打包源码，运行时重编。
 if IS_WINDOWS:
     _datas += [
         ('tools/aapt.exe',            'tools'),

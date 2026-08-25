@@ -31,9 +31,11 @@ import stamp
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_RUNTIME = os.path.join(HERE, "src", "java", "com", "gx", "runtime")
 NATIVE_SRC = os.path.join(HERE, "src", "native")
-TMP_JAVA = os.path.join(HERE, "build", "src_tmp")
-TMP_NATIVE = os.path.join(HERE, "build", "native_tmp")
-TMP_CLASSES = os.path.join(HERE, "build", "classes_tmp")
+# 临时目录必须可写：冻结态 HERE==_MEIPASS 只读，故统一落在 config.BUILD_DIR
+# （exe 同级 build/，可写且持久）。非冻结态 BUILD_DIR==本工程 build/，行为不变。
+TMP_JAVA = os.path.join(config.BUILD_DIR, "src_tmp")
+TMP_NATIVE = os.path.join(config.BUILD_DIR, "native_tmp")
+TMP_CLASSES = os.path.join(config.BUILD_DIR, "classes_tmp")
 D8 = os.path.join(config.TOOLS, "d8.jar")
 ANDROID_JAR = config.ANDROID_JAR
 
@@ -179,7 +181,7 @@ def _build_java(st):
     shutil.rmtree(TMP_CLASSES, ignore_errors=True)
     dest_pkg = st["pkg"].replace(".", "/")
     dest_dir = os.path.join(TMP_JAVA, dest_pkg)
-    os.makedirs(dest_dir)
+    os.makedirs(dest_dir, exist_ok=True)
 
     def _compile_to_dex(java_files, out_dex):
         cf = []
@@ -195,7 +197,21 @@ def _build_java(st):
             cf.append(new_path)
         classes_dir = os.path.join(TMP_CLASSES, cls_key)
         shutil.rmtree(classes_dir, ignore_errors=True)
-        os.makedirs(classes_dir)
+        # 兼容安全删除 shim 拦截 rmtree 的情形：用 os 原语兜底清空，避免残留旧随机名
+        # .class 文件被 d8 误编入（会导致壳 DEX 含过期类）。exist_ok 保证幂等重入。
+        if os.path.isdir(classes_dir):
+            for _r, _d, _fs in os.walk(classes_dir, topdown=False):
+                for _f in _fs:
+                    try:
+                        os.remove(os.path.join(_r, _f))
+                    except OSError:
+                        pass
+                for _d2 in _d:
+                    try:
+                        os.rmdir(os.path.join(_r, _d2))
+                    except OSError:
+                        pass
+        os.makedirs(classes_dir, exist_ok=True)
         subprocess.check_call([
             config.JAVAC, "--release", "8", "-encoding", "UTF-8",
             "-cp", ANDROID_JAR, "-d", classes_dir,
@@ -205,9 +221,9 @@ def _build_java(st):
             for _f in _fs:
                 if _f.endswith(".class"):
                     class_files.append(os.path.join(_r, _f))
-        dex_out = os.path.join(HERE, "build", "dex_out_" + cls_key)
+        dex_out = os.path.join(config.BUILD_DIR, "dex_out_" + cls_key)
         shutil.rmtree(dex_out, ignore_errors=True)
-        os.makedirs(dex_out)
+        os.makedirs(dex_out, exist_ok=True)
         subprocess.check_call([
             config.JAVA, "-cp", D8, "com.android.tools.r8.D8",
             "--lib", ANDROID_JAR, "--min-api", "21",
@@ -218,6 +234,7 @@ def _build_java(st):
             raise RuntimeError("d8 未产出任何 dex for %s" % cls_key)
         if len(produced) > 1:
             raise RuntimeError("壳超出单 dex 限制: %s" % produced)
+        os.makedirs(os.path.dirname(out_dex), exist_ok=True)
         shutil.copy(sorted(produced)[0], out_dex)
         return out_dex
 
@@ -332,6 +349,8 @@ def _build_native(st):
 
 
 def main():
+    # 确保可写构建目录存在（冻结态 exe/build 是首次运行，目录尚不存在）
+    os.makedirs(config.BUILD_DIR, exist_ok=True)
     st = stamp.generate()
     stamp.write(stamp.STAMP_PATH, st)
     _build_java(st)

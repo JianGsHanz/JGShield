@@ -16,8 +16,15 @@ import os
 import random
 import string
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-STAMP_PATH = os.path.join(HERE, "build", "stamp.json")
+import config
+
+# STAMP 是「写端 / 读端」的唯一事实来源。
+# 关键：冻结态（PyInstaller onefile）下 _MEIPASS 是只读临时解压目录，build_stub 写入的
+# stamp 若落在此处，config.apply_stamp_from_file() 从 EXEC_DIR/build 读取会读不到 →
+# apply_stamp 不生效 → Manifest 写入默认固定类 com.gx.runtime.GxBootstrap，但 dex 内类已
+# 随机化 → 真机 ClassNotFoundException 闪退。故必须直接复用 config.BUILD_DIR（exe 同级、
+# 可写且持久），与 config._STAMP_PATH 完全同一对象，杜绝路径分裂。
+STAMP_PATH = os.path.join(config.BUILD_DIR, "stamp.json")
 
 _ALNUM = string.ascii_letters + string.digits
 # 魔数可用字符（可打印 ASCII，避开引号/反斜杠，避免 C/Java 字符串转义问题）

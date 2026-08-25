@@ -120,7 +120,7 @@ def _short_work(base):
     NullPointerException 导致解码失败（与是否 --no-src 无关，是 apktool
     3.0.1 在长路径下的固有 bug）。用短 token 代替长 base 名即可规避。
     """
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_wk")
+    root = os.path.join(config.BUILD_DIR, "_wk")
     os.makedirs(root, exist_ok=True)
     token = "h%d_%d" % (os.getpid(), int(time.time() * 1000) % 1000000)
     return os.path.join(root, token)

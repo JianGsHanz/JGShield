@@ -44,6 +44,13 @@ else:
 ROOT = EXEC_DIR  # 向后兼容
 TOOLS = os.path.join(_BUNDLE, "tools")
 
+# 构建期「可写」目录： executable 同级 build/。
+# 冻结态下 _BUNDLE(sys._MEIPASS) 是只读临时解压目录，任何 build 产物（stamp.json /
+# stub.dex / bootstrap.dex / libjgguard .so / 临时源码）都必须落在这里，否则抛
+# PermissionError；且 stamp 读写端必须都指向它，否则 Manifest 类名与 dex 类名不一致
+# 导致 ClassNotFoundException 闪退。非冻结态 EXEC_DIR==_BUNDLE，行为不变。
+BUILD_DIR = os.path.join(EXEC_DIR, "build")
+
 # -------------------------------------------------------------------------- #
 # Java 运行时（apktool / uber-apk-signer / apksigner 均依赖 java）
 # -------------------------------------------------------------------------- #
@@ -75,9 +82,9 @@ if not JAVA:
 # -------------------------------------------------------------------------- #
 # 外壳 DEX（由 GxApp.java 编译而来，含 12 个壳类）；P8 起被加密为载荷段
 # -------------------------------------------------------------------------- #
-STUB_DEX = os.path.join(_BUNDLE, "build", "dex", "stub.dex")
+STUB_DEX = os.path.join(BUILD_DIR, "dex", "stub.dex")
 # P8 引导壳 DEX（GxBootstrap.java 编译，极简，作 APK 的 classes.dex 明文入口）
-BOOTSTRAP_DEX = os.path.join(_BUNDLE, "build", "dex", "bootstrap.dex")
+BOOTSTRAP_DEX = os.path.join(BUILD_DIR, "dex", "bootstrap.dex")
 # P8 随机化默认值（apply_stamp_from_file 覆盖）
 SHELL_DEX_ENTRY = "gxsh"     # 加密壳 DEX 的随机 zip 条目名
 BOOTSTRAP_APP = "com.gx.runtime.GxBootstrap"
@@ -86,7 +93,7 @@ BOOTSTRAP_APP = "com.gx.runtime.GxBootstrap"
 # native 反篡改库（由各 ABI 的 libjgguard.so 组成，加固时注入 APK 的 lib/<abi>/）
 # 源码 src/native/jg_guard.c，由 build_native.bat/.sh 用 NDK 编译到此目录
 # -------------------------------------------------------------------------- #
-LIBJGGUARD_DIR = os.path.join(TOOLS, "libjgguard")
+LIBJGGUARD_DIR = os.path.join(BUILD_DIR, "libjgguard")
 
 # -------------------------------------------------------------------------- #
 # 第三方工具（全部 bundled 在 tools/ 下，exe 自包含）
@@ -191,7 +198,7 @@ LIB_NAME = "jgguard"
 # build_stub.py 每次加固先生成 stamp 并重建 stub.dex / .so，harden/verify/device_check
 # 在本进程内调用 apply_stamp_from_file() 使写端与壳读端完全一致。
 # -------------------------------------------------------------------------- #
-_STAMP_PATH = os.path.join(EXEC_DIR, "build", "stamp.json")
+_STAMP_PATH = os.path.join(BUILD_DIR, "stamp.json")
 
 
 def apply_stamp(st):
