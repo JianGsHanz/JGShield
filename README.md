@@ -32,7 +32,7 @@ flowchart LR
     A[输入 APK] --> B[抽取原始 classes*.dex]
     B --> C[二进制编辑 AndroidManifest.xml<br/>改 application 为壳 + 注入 orig_app meta]
     C --> D[构建载荷: DEFLATE + AES-256-GCM<br/>seed=SHA256 签名证书]
-    D --> E[zip 直打包:<br/>patched Manifest + 原资源 + bootstrap.dex(明文引导壳, 即 classes.dex) + 加密壳 DEX(随机条目) + z9(随机名载荷)]
+    D --> E[zip 直打包:<br/>patched Manifest + 原资源 + bootstrap.dex（明文引导壳，即 classes.dex）+ 加密壳 DEX（随机条目）+ z9（随机名载荷）]
     E --> F[签名对齐 v1/v2/v3]
     F --> G[内嵌回测: 解密还原与原始 DEX 比对]
     G --> H[加固 APK]
