@@ -6,7 +6,7 @@ JGShield 是一个参考开源项目 *mocika-shield* 的设计目标、但实现
 核心诉求：**逆向者即使看过参考项目，也无法直接照搬到本项目上攻破**。
 
 设计上通过「算法差异 + 载荷藏匿方式差异 + 密钥派生差异 + 加载方式差异 + 反调试差异」组合，
-使任何"照抄参考项目破解步骤"的尝试失效。加固后 APK 在真机可正常运行（已通过华为 / vivo / 小米等机型验证）。
+使任何"照抄参考项目破解步骤"的尝试失效。加固后 APK 在真机可正常运行（已通过华为 / 小米真机验证）。
 
 ---
 
@@ -17,7 +17,7 @@ JGShield 是一个参考开源项目 *mocika-shield* 的设计目标、但实现
 | 对称加密 | ChaCha20-Poly1305 + Zstd | **AES-256-GCM (AEAD) + DEFLATE** |
 | 载荷藏匿 | `assets/app.bin` | **自定义顶层 ZIP 条目（由 `stamp.py` 随机命名，如 `z9`/`aa1`）**；`classes.dex` 现为**明文引导壳 `GxBootstrap`**，原壳 DEX 已 AES-GCM 加密进另一随机条目，任何反编译/安装工具都不会因尾部垃圾数据报错 |
 | 密钥派生 | HKDF + 随机 IKM | **`seed = SHA256(签名证书DER)`**，再 `HMAC-SHA256(seed, "JG\|dex"+i)` 派生每 DEX 独立密钥；**换签 / 重签即解密失败（抗篡改）** |
-| 加载 | Rust native 注入 | **纯 Java `PathClassLoader` 注入 + 替换 `LoadedApk`/`ActivityThread` 的 Application 与 ClassLoader** |
+| 加载 | Rust native 注入 | **纯 Java 注入（方案 B：`InMemoryDexClassLoader` 解密后的 DEX 注入框架 `sysLoader` 的 `dexElements`，保留原生库命名空间）+ 反射替换 `ActivityThread` 的 Application 与 ClassLoader** |
 | 反调试 | — | 启动期对 `/proc/self/maps` 做 Frida/Substrate/Xposed 特征扫描 + `Debug.isDebuggerConnected` |
 | 壳指纹 | 包名/类名/字符串明文（易被 strings/grep 定位） | **壳指纹随机化（P7）**：每次加固由 `stamp.py` 随机生成包名 / 13 个壳类名 / 敏感字符串 / 魔数 / 运行期 TAG / native 日志 tag / 载荷 ZIP 条目名，原始固定特征（`com.gx.runtime`、`gx.*`、`JGS1`、`JG-`）已彻底消除；`Obf` 字符串走 native 解码（密钥仅存 `.so`） |
 
@@ -64,7 +64,7 @@ flowchart LR
 - **壳指纹随机化（P1 混淆 + P7 全量随机）**：每次加固由 `stamp.py` 随机生成包名 / 全部壳类名 / 魔数 / 运行期 TAG / native 符号 / 载荷 ZIP 条目名 / meta 键，原始固定特征（`com.gx.runtime`、`gx.*`、`JGS1`、`JG-`）已彻底消除；敏感字符串走 `Obf` native 解码（密钥仅存 `.so`）。DEX 二进制静态扫描无可定位指纹，可挫败照抄破解步骤与按特征自动识别。**边界**：`Obf` 为混淆非加密，不防 jadx 人工分析。
 - **反内存 dump 检测（P-ANTIDUMP）**：`GxAntiDump` 守护线程启动即查 + 周期轮询，检测 FART/Youpk/BlackDex 等脱壳工具的默认 dump 产物路径（app 数据目录下的 `dump`/`app_dump`/`dexdump`/`dump_dex` 目录、`/data/local/tmp` 下的 `blackdex`/`youpk`/`fart` 标记文件），命中收口 `STRENGTHEN_RESPONSE`。**边界**：仅挡默认配置脱壳工具，改路径的定制工具挡不住；根治需 VMP 指令虚拟化，未做；此外壳自身 DEX 已 AES-GCM 加密（P8 双壳），静态提取仅得密文。
 
-- **双壳自加密（P8）**：Manifest 入口为极简明文引导壳 `GxBootstrap`（`classes.dex`），它解密并注入经 AES-256-GCM 加密的原壳 DEX（随机 ZIP 条目），再反射随机名 `GxApp.boot()` 驱动原壳逻辑，并持有原 App 转发 5 个生命周期。壳自身不再明文裸露，进一步对抗「熟悉开源方案者直接提取壳 DEX 分析」；密钥派生同源（`seed=SHA256(证书DER)`，`per-dex` 用 `JG|dex`、壳 DEX 用 `JG|shell`，均带 idx），换签即解密失败。
+- **双壳自加密（P8）**：Manifest 入口为极简明文引导壳 `GxBootstrap`（`classes.dex`），它解密并注入经 AES-256-GCM 加密的原壳 DEX（随机 ZIP 条目），再反射随机名 `GxApp.boot(base, proxy)` 驱动原壳逻辑，并持有原 App 转发 5 个生命周期。壳自身不再明文裸露，进一步对抗「熟悉开源方案者直接提取壳 DEX 分析」；密钥派生同源（`seed=SHA256(证书DER)`，`per-dex` 用 `JG|dex`、壳 DEX 用 `JG|shell`，均带 idx），换签即解密失败。
 
 - **防抓包（P-CAPTURE，代码待命、默认未启用）**：`GxPinning` 支持按 `gx.ssl_pins` 配置 SPKI 指纹固定，`GxProxy` 检测系统代理/VPN，二者统一收口 `STRENGTHEN_RESPONSE`（默认 `log` 仅记录）。因证书轮换顾虑未配 pin；X5 WebView 与自定义 TrustManager 的 OkHttp 为机制盲区，故当前防抓包处于"检测可见、不阻断"的半开状态。
 
@@ -234,7 +234,7 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
 
 1. **运行时防护（已补强 P1 + P2 + P7 + P8）**：
    - ✅ **反 Frida 已补强（保命版）**：启动期一次性扫描 → 升级为 `AntiTamper` 后台守护线程周期轮询（maps 扩展特征 / frida 端口 27042·27043 / `/data/local/tmp/re.frida.server` / `TracerPid`），可捕获改名注入与延迟注入；命中即退出，干净设备零影响。
-   - ✅ **原生层反篡改（P1）**：`libjgguard.so`（NDK 编译，JNI 守护线程）下沉到 native，比 Java `AntiTamper` 更难被 frida hook，二者互为备份；加载失败仅降级，不影响启动。
+   - ✅ **原生层反篡改（P1）**：随机名 native 库（NDK 编译，JNI 守护线程；原固定名 `libjgguard.so` 已被 P7 随机名替代以抹特征）下沉到 native，比 Java `AntiTamper` 更难被 frida hook，二者互为备份；加载失败仅降级，不影响启动。
    - ✅ **DEX fileless 内存加载（P2）**：API≥26 时解密进 `ByteBuffer`，经公开 API `InMemoryDexClassLoader` 在内存中加载并注入框架 `sysLoader`（保留原生库命名空间），**磁盘不落明文 DEX 文件、不生成 odex**（关掉了"读明文文件/备份"这一类最易利用的泄漏）；解密后源 `byte[]` 立即清零。API<26 自动回退原文件方案（不回归）。
    - ⚠️ **运行期内存 dump 仍未 100% 防护**：DEX 一旦被 ART 加载运行，优化后的代码必存在于进程内存，frida-dexdump 等仍可扫到。当前 P2 已关闭**磁盘明文**与**启动期整段明文大块**两个泄漏点，并已加 **`GxAntiDump` 检测层**（拦默认配置脱壳工具）；但要做到"运行期明文 DEX 不驻留内存"，必须做 **DEX 指令抽取（native 层 hook ART 方法，按需解密/还原方法字节码）**——该方案版本相关、极易崩，属独立的**高风险 P3**。方法级抽取（P3.2 批量还原）已落地但覆盖率有限；壳自身 DEX 已在 P8 加密，静态提取无法获得明文壳。
    - 待规划：P3 指令抽取（需独立真机验证）、关键逻辑 native 化深化。
