@@ -28,6 +28,11 @@ import platform
 import config
 import stamp
 
+# Windows 下 --windowed exe 调起 console 子进程（javac/java/clang 均为 console
+# 子系统）会为其单独分配一个控制台窗口 → 加固时黑窗频闪。加此 flag 抑制。
+# 非 Windows 该常量降级为 0，无副作用。
+_SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_RUNTIME = os.path.join(HERE, "src", "java", "com", "gx", "runtime")
 NATIVE_SRC = os.path.join(HERE, "src", "native")
@@ -215,7 +220,7 @@ def _build_java(st):
         subprocess.check_call([
             config.JAVAC, "--release", "8", "-encoding", "UTF-8",
             "-cp", ANDROID_JAR, "-d", classes_dir,
-        ] + cf)
+        ] + cf, creationflags=_SUBPROC_FLAGS)
         class_files = []
         for _r, _d, _fs in os.walk(classes_dir):
             for _f in _fs:
@@ -228,7 +233,7 @@ def _build_java(st):
             config.JAVA, "-cp", D8, "com.android.tools.r8.D8",
             "--lib", ANDROID_JAR, "--min-api", "21",
             "--output", dex_out,
-        ] + class_files)
+        ] + class_files, creationflags=_SUBPROC_FLAGS)
         produced = glob.glob(os.path.join(dex_out, "classes*.dex"))
         if not produced:
             raise RuntimeError("d8 未产出任何 dex for %s" % cls_key)
@@ -341,7 +346,7 @@ def _build_native(st):
                 if abi == "arm64-v8a" or f not in _hook_files]
         subprocess.check_call(
             [clang, "--shared", "-fPIC", "-O2", "-o", out] + srcs +
-            ["-llog", "-lz"])
+            ["-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
         print("[*] native 构建完成 (%s): %s" % (abi, out))
     if not built:

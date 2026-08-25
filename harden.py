@@ -34,6 +34,11 @@ import traceback
 
 import config
 import verify_payload
+
+# Windows 下 --windowed exe 调起 console 子进程（java/aapt/adb/zipalign/keytool
+# 均为 console 子系统）会为其单独分配控制台窗口 → 加固时黑窗频闪。加此 flag
+# 抑制；非 Windows 降级为 0，无副作用。
+_SUBPROC_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 from Crypto.Cipher import AES
 from Crypto.Hash import HMAC, SHA256
 from axml_editor import patch_manifest as _axml_patch
@@ -82,7 +87,7 @@ def run(cmd, cwd=None, env=None, check=True):
     t0 = time.time()
     p = subprocess.Popen(cmd, cwd=cwd, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         bufsize=0)
+                         bufsize=0, creationflags=_SUBPROC_FLAGS)
     buf = []
     while True:
         raw = p.stdout.readline()
@@ -142,12 +147,14 @@ def extract_cert_der(ks, alias, storepass):
             base += ["-storetype", "PKCS12"]
         try:
             r = subprocess.run(base, capture_output=True, check=True,
-                               env=env_with_android())
+                               env=env_with_android(),
+                               creationflags=_SUBPROC_FLAGS)
             _ = _decode_bytes(r.stdout or b"")
         except subprocess.CalledProcessError:
             # 部分 keystore 需显式声明类型，重试
             r = subprocess.run(base + ["-storetype", "PKCS12"], capture_output=True,
-                               check=True, env=env_with_android())
+                               check=True, env=env_with_android(),
+                               creationflags=_SUBPROC_FLAGS)
             _ = _decode_bytes(r.stdout or b"")
         with open(der, "rb") as f:
             return f.read()
