@@ -100,6 +100,13 @@ def generate():
     # Obf XOR 密钥：每构建随机，且仅存于 native（DEX 中不再出现）
     obf_key = [random.randint(0, 255) for _ in range(16)]
 
+    # P0-B 轻量：密钥派生 label 前缀，每构建随机，消除固定 "JG|" 明文分隔符。
+    # 必须同时注入 Java/C 源码（build_stub）并写入 method_restore_vectors.h，
+    # 且 harden.py 加密端从同一 stamp 读取 config.KEY_PREFIX —— 写读逐字节一致。
+    # 仅用字母/数字，避免 C/Java 字符串字面量转义问题。
+    key_prefix = "".join(random.choice(string.ascii_letters + string.digits)
+                         for _ in range(random.randint(2, 4)))
+
     return {
         "pkg": pkg,
         "pkg_underscore": pkg.replace(".", "_"),
@@ -117,6 +124,7 @@ def generate():
         "magic": magic,
         "lib_name": lib_name,
         "obf_key": obf_key,
+        "key_prefix": key_prefix,
     }
 
 

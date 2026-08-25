@@ -178,6 +178,13 @@ def _transform_java(txt, st):
     txt = txt.replace("__LIB_NAME__", st["lib_name"])
     txt = txt.replace("__SHELL_DEX_ENTRY__", st["shell_dex_entry"])
     txt = txt.replace("__PAYLOAD_ENTRY__", st["payload_entry"])
+    # 11) P0-B 轻量：密钥派生 label 前缀随机化（消除固定 "JG|" 分隔符）。
+    # 必须与 harden.py 的 config.KEY_PREFIX 及 native 侧完全同名（均来自同一 stamp），
+    # 否则写端加密密钥 ≠ 读端解密密钥 → GCM 认证失败。仅命中含 "JG|" 的代码字面量，
+    # 不影响注释。
+    kp = st["key_prefix"]
+    txt = txt.replace('"JG|shell0"', '"%s%s0"' % (kp, "shell"))
+    txt = txt.replace('"JG|" + info', '"%s" + info' % kp)
     return txt
 
 
@@ -297,8 +304,14 @@ def _sed_native(s, st):
     s = s.replace('"JGS1"', '"%s"' % st["magic"])
     # lib 名随机化（native 自保护 / maps 扫描需匹配真实随机名，否则既留指纹又扫不到自己）
     s = s.replace('"libjgguard.so"', '"lib%s.so"' % st["lib_name"])
+    # P0-B 轻量：per-method 密钥 label 前缀随机化（消除固定 "JG|m" 分隔符）。
+    # 必须与 harden.py 的 config.KEY_PREFIX 及 Java 侧完全同名（均来自同一 stamp），
+    # 否则写端加密密钥 ≠ 读端解密密钥 → GCM 认证失败。
+    kp = st["key_prefix"]
+    s = s.replace('"JG|m%u"', '"' + kp + 'm%u"')
+    s = s.replace('"JG|m%u.%u"', '"' + kp + 'm%u.%u"')
     # native 侧 log tag 随机化（JG-* 是 logcat/二进制里的指纹；
-    # 注意保留 JG| / JG|m 等 HKDF 域名分隔符——它们必须与 harden.py 一致，不能改）
+    # 注：原固定 "JG|"/"JG|m" HKDF 分隔符已随机化为 st["key_prefix"]，不再是明文 "JG|"）
     for old, key in (("JG-Native", "tag_native_log"),
                      ("JG-Integrity", "tag_integrity_log"),
                      ("JG-MethodRestore", "tag_mr_log"),
@@ -309,9 +322,42 @@ def _sed_native(s, st):
     return s
 
 
+def _regen_vectors(st):
+    """P0-B 轻量：重算原生自测向量以匹配随机 key_prefix。
+
+    method_restore_vectors.h 非 NATIVE_COMPILE（仅 test_method_restore.c 引用），
+    不走 _sed_native，故在此单独重写 V_LABEL0 / V_HMAC_KEY。
+    V_HMAC_KEY = HMAC-SHA256(V_SEED, prefix+"m0")，与原生自测
+    jg_hmac_sha256(V_SEED, prefix+"m0") 比对；GCM 向量（V_GCM1_KEY 等）自包含，
+    与 label 无关，保持不变。"""
+    from Crypto.Hash import HMAC, SHA256
+    hdr = os.path.join(TMP_NATIVE, "method_restore_vectors.h")
+    if not os.path.isfile(hdr):
+        return
+    with open(hdr, encoding="utf-8") as f:
+        s = f.read()
+    kp = st["key_prefix"]
+    new_label = (kp + "m0").encode("utf-8")
+    # V_SEED 固定（见头文件 L6-10）
+    vseed = bytes([0xdb, 0x3a, 0xb1, 0xf9, 0x96, 0xc2, 0x91, 0x1f, 0xb4, 0x56, 0xc9, 0xad,
+                   0xd0, 0xae, 0x09, 0x94, 0x8a, 0x85, 0x34, 0xca, 0x0b, 0x28, 0x8e, 0xed,
+                   0xc9, 0x41, 0xae, 0xf1, 0x1d, 0x59, 0x7b, 0x2d])
+    mac = HMAC.new(vseed, digestmod=SHA256)
+    mac.update(new_label)
+    hk = mac.digest()
+    arr = ",\n  ".join("0x%02x" % b for b in hk)
+    s = re.sub(r'#define V_LABEL0 "JG\|m0"',
+               '#define V_LABEL0 "%s"' % (kp + "m0"), s)
+    s = re.sub(r'static const unsigned char V_HMAC_KEY\[32\] = \{[^}]*\};',
+               'static const unsigned char V_HMAC_KEY[32] = {\n  %s\n};' % arr, s)
+    with open(hdr, "w", encoding="utf-8") as f:
+        f.write(s)
+
+
 def _build_native(st):
     shutil.rmtree(TMP_NATIVE, ignore_errors=True)
     shutil.copytree(NATIVE_SRC, TMP_NATIVE)
+    _regen_vectors(st)
     for fn in NATIVE_COMPILE:
         p = os.path.join(TMP_NATIVE, fn)
         with open(p, encoding="utf-8", errors="ignore") as f:

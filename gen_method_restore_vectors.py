@@ -15,7 +15,11 @@ import verify_payload
 from Crypto.Cipher import AES
 from Crypto.Hash import HMAC, SHA256
 
-OUT = os.path.join("src", "native", "method_restore_vectors.h")
+config.apply_stamp_from_file()  # 使 config.KEY_PREFIX 与本次构建一致
+
+# 输出到 build/native_tmp（与 build_stub._regen_vectors 同一落点）；提交版
+# src/native/method_restore_vectors.h 仅作中性模板（"JG|m0"），由 build_stub 复制后重写。
+OUT = os.path.join(config.BUILD_DIR, "native_tmp", "method_restore_vectors.h")
 SAMPLE1 = os.path.join(config.SAMPLES_DIR, "sample1.apk")
 SAMPLE4 = os.path.join(config.SAMPLES_DIR, "sample4.apk")
 
@@ -73,12 +77,12 @@ def main():
     plain4 = stream_plain(blob4, seed, 0)
     key4 = verify_payload.derive_method_key(seed, 0)
 
-    # HMAC 向量：label "JG|m0"（per-dex 密钥）
+    # HMAC 向量：label = KEY_PREFIX+"m0"（per-dex 密钥，与 build_stub._regen_vectors 一致）
     hmac_key = HMAC.new(seed, digestmod=SHA256)
-    hmac_key.update(b"JG|m0")
+    hmac_key.update(config.KEY_PREFIX + b"m0")
     hmac_vec = hmac_key.digest()
 
-    label0 = b"JG|m0"
+    label0 = config.KEY_PREFIX + b"m0"
 
     parts = []
     parts.append("/* 自动生成：method_restore_vectors.h — 来自真实加固数据，不可手改 */")

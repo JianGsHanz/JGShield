@@ -190,7 +190,7 @@ def derive_seed(cert_hash, salt):
 
 def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|" + label + str(idx).encode("utf-8"))
+    mac.update(config.KEY_PREFIX + label + str(idx).encode("utf-8"))
     return mac.digest()  # 32 bytes -> AES-256
 
 def encrypt_asset(seed, idx, data):
@@ -303,7 +303,7 @@ def derive_method_key(seed, dex_idx):
     降为每 dex 一次(≈0.5KB)。包体由 +15MB 降为近零增长，安全性不变
     （方法抽取反脱壳层原样保留）。沿用整包种子体系，换签即失败。"""
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|m" + str(dex_idx).encode("utf-8"))
+    mac.update(config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8"))
     return mac.digest()
 
 def extract_methods(seed, dex_idx, dex_bytes):
@@ -598,7 +598,7 @@ def self_verify(out_apk, orig_dexes):
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
-           ssl_pins=None, strengthen=None, rebuild_stub=True):
+           ssl_pins=None, strengthen="exit", rebuild_stub=True):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -757,12 +757,12 @@ def main():
     ap.add_argument("--pins", help="SSL 证书固定：host=sha256/Base64;host2=sha256/Base64（与 OkHttp "
                                     "CertificatePinner 同构）。例：api.example.com=sha256/ABCD... 。"
                                     "配置后壳在运行期做按主机证书固定，挡 root+系统证书 MITM。不指定则不启用。")
-    ap.add_argument("--strengthen", choices=["log", "exit"], default=None,
-                    help="统一响应姿态（覆盖壳默认 'log'）：log=仅记日志（fail-safe，默认，不误伤任何用户）；"
-                         "exit=检测命中（root/模拟器/frida/代理/VPN/自校验失败）即退出进程。"
-                         "⚠ 不推荐 exit：会误杀正常 VPN/海外用户（VPN 使用≠抓包，系统层面无法区分），"
-                         "仅限明确接受该代价的场景。不指定则默认 log，永不阻断。"
-                         "经 manifest meta gx.strengthen 注入，运行期生效，无需重编 stub.dex。")
+    ap.add_argument("--strengthen", choices=["log", "exit"], default="exit",
+                    help="P0-A 统一响应姿态（覆盖壳默认 'log'）：exit=检测命中（root/模拟器/frida/"
+                         "代理/VPN/自校验失败）即退出进程；log=仅记日志不阻断（调试用）。"
+                         "⚠ exit 可能误杀部分正常设备（反调试/自校验 OEM 误报），生产发布前务必在"
+                         "目标机型（如华为 A10 / 小米 A9）真机验证；如需关闭用 --strengthen log。"
+                         "经 manifest meta 注入，运行期生效，无需重编 stub.dex。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,

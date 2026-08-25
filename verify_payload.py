@@ -97,13 +97,13 @@ def seed_from_apk(apk_path):
 
 def derive_key(seed, idx, label=b"dex"):
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|" + label + str(idx).encode("utf-8"))
+    mac.update(config.KEY_PREFIX + label + str(idx).encode("utf-8"))
     return mac.digest()
 
 def derive_method_key(seed, dex_idx):
-    """与 harden.py 的 extract_methods 完全一致：HMAC(seed, "JG|m"+dexIdx)，per-dex 密钥。"""
+    """与 harden.py 的 extract_methods 完全一致：HMAC(seed, KEY_PREFIX+"m"+dexIdx)，per-dex 密钥。"""
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(b"JG|m" + str(dex_idx).encode("utf-8"))
+    mac.update(config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8"))
     return mac.digest()
 
 def _read_int(b, off):
