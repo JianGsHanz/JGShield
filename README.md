@@ -112,6 +112,7 @@ JGShield/
 | Android SDK build-tools | `aapt.exe` | `setup_tools.bat` 从本地 SDK 复制 |
 | `apktool.jar` / `uber-apk-signer.jar` / `android.jar` / `d8.jar` | 资源解码 / 签名 / 编译壳 DEX | 由 `setup_tools.bat` 下载或复制 |
 | `javac` + `d8`（JDK/Android SDK 自带） | `build_stub.py` 分两次编译：`GxApp`+`GxGuard`→加密壳 `stub.dex`、`GxBootstrap`→明文 `bootstrap.dex` | — |
+| Android NDK（r25+） | 编译 4 ABI 随机名 native `.so`（`build_stub.py` 运行时按随机包名重编） | 优先读 `ANDROID_NDK_HOME` 环境变量；未设则回退到 Windows 硬编码路径 `D:/Android/AndoridSDK/ndk/25.1.8937393`。**macOS/Linux 必须设置 `ANDROID_NDK_HOME`**（无 Windows 回退），且 NDK 预编译工具链子目录随平台自动选择（`darwin-x86_64` / `darwin-arm64` / `linux-x86_64` / `windows-x86_64`），clang 在 macOS/Linux 无 `.cmd` 后缀 |
 
 ---
 

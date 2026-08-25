@@ -22,6 +22,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import platform
 
 import config
 import stamp
@@ -35,13 +37,35 @@ TMP_CLASSES = os.path.join(HERE, "build", "classes_tmp")
 D8 = os.path.join(config.TOOLS, "d8.jar")
 ANDROID_JAR = config.ANDROID_JAR
 
-NDK = "D:/Android/AndoridSDK/ndk/25.1.8937393"
-CLANG_DIR = os.path.join(NDK, "toolchains", "llvm", "prebuilt", "windows-x86_64", "bin")
+# NDK 路径：优先读环境变量（跨平台/可移植），硬编码 Windows 路径仅作 fallback
+def _resolve_ndk():
+    for env_key in ("ANDROID_NDK_HOME", "ANDROID_NDK"):
+        env = os.environ.get(env_key)
+        if env and os.path.isdir(env):
+            return env
+    return "D:/Android/AndoridSDK/ndk/25.1.8937393"
+
+NDK = _resolve_ndk()
+
+# NDK 预编译工具链子目录随宿主平台而变：
+#   Windows -> windows-x86_64 ; macOS(Intel) -> darwin-x86_64 ;
+#   macOS(Apple Silicon) -> darwin-arm64 ; Linux -> linux-x86_64
+def _ndk_prebuilt_subdir():
+    if sys.platform.startswith("win"):
+        return "windows-x86_64"
+    if sys.platform == "darwin":
+        return "darwin-arm64" if platform.machine().startswith("arm") else "darwin-x86_64"
+    return "linux-x86_64"
+
+CLANG_DIR = os.path.join(NDK, "toolchains", "llvm", "prebuilt", _ndk_prebuilt_subdir(), "bin")
+
+# Windows 上 NDK clang 是 .cmd 批处理包装；macOS/Linux 无扩展名
+_CLANG_EXT = ".cmd" if sys.platform.startswith("win") else ""
 ABIS = {
-    "arm64-v8a": "aarch64-linux-android21-clang.cmd",
-    "armeabi-v7a": "armv7a-linux-androideabi21-clang.cmd",
-    "x86_64": "x86_64-linux-android21-clang.cmd",
-    "x86": "i686-linux-android21-clang.cmd",
+    "arm64-v8a": "aarch64-linux-android21-clang" + _CLANG_EXT,
+    "armeabi-v7a": "armv7a-linux-androideabi21-clang" + _CLANG_EXT,
+    "x86_64": "x86_64-linux-android21-clang" + _CLANG_EXT,
+    "x86": "i686-linux-android21-clang" + _CLANG_EXT,
 }
 # 编入单一 .so 的源文件（test_method_restore.c 为独立自测，不编入）
 NATIVE_COMPILE = [
