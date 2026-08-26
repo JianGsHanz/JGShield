@@ -26,6 +26,8 @@ tools/
 # libjgguard.so 是加固壳强依赖的 native 产物，必须与 jg_guard.c 同步，强制入库
 !tools/libjgguard/
 !tools/libjgguard/*.so
+# obf.dex 是 --dex-obf 功能强依赖的解密器，由源码 src/java/com/jiagu/obf/ObfStr.java 编译。
+# 因 tools/ 整目录被忽略，用 `git add -f tools/obf.dex` 强制入库（与 libjgguard.so 同等强依赖）。
 
 # ---- Keystores (never commit keys) ----
 *.jks
