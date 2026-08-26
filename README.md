@@ -181,6 +181,9 @@ python3 jiagu_gui.py          # 开发态 GUI
 :: 单个 APK 加固
 python harden.py input.apk -o output/hardened_input.apk
 
+:: DEX 字符串加密（opt-in，默认关闭）：把 App 自身 DEX 的 const-string 改为密文+解密器调用
+python harden.py input.apk -o output/hardened_input.apk --dex-obf
+
 :: 批量加固整个目录（逐个静态回测）
 python batch_harden.py --input-dir test_apks --output-dir output
 
@@ -247,6 +250,11 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
    - 加固核心支持把原始 `assets/` 加密进 `z9` 载荷并从 APK 剥离（关闭资源明文泄漏），运行时由壳解密还原进 `AssetManager`。
    - **默认不开启**（CLI 需显式 `--assets-encrypt`）：因为运行时还原依赖反射绕过隐藏 API 合并 `AssetManager`，在部分 OEM/高版本 ROM 上可能失败，失败后 App 会缺资源而崩。
    - 若开启后某 App 报 assets 缺失/资源找不到，**去掉 `--assets-encrypt` 重新加固即可恢复**（assets 留在 APK 内，与未加固行为一致）。
+5. **DEX 字符串加密（实验性、默认关闭）**：
+   - 加固核心支持在把 App DEX 加密进载荷**之前**，把其中的 `const-string` 改写为 `base64(XOR(KEY))` 密文 + 调用解密器 `ObfStr.d`；解密器以独立 `obf.dex`（纯 java.lang，无 android 依赖）随载荷加载，与 App DEX 同一 classloader，运行时还原明文。
+   - **直接打掉「JADX + LLM 读 DEX」的语义来源**，对被动 LLM 逆向杠杆最大；不碰类名/方法名，不触发 manifest/反射/JNI 崩坏。
+   - **默认不开启**（CLI 需显式 `--dex-obf`）：因为这是对 App 业务 DEX 的改写，需真机验证「不误杀正常启动」后才用于生产。
+   - ⚠️ **诚实边界**：这是「混淆」不是「加密」——DEX 解密加载后明文常驻内存，攻击者跑起来即可抽；价值在抬高**静态** AI 逆向成本（让静态 JADX+LLM 直接读不到业务字符串），不杜绝动态抽取。解密器类名 `Lcom/jiagu/obf/ObfStr;` 在 v1 为稳妥未随机化。
 
 ---
 

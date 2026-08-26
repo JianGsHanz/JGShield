@@ -34,6 +34,7 @@ import traceback
 
 import config
 import verify_payload
+import dex_obf as dex_obf_mod
 
 # Windows 下 --windowed exe 调起 console 子进程（java/aapt/adb/zipalign/keytool
 # 均为 console 子系统）会为其单独分配控制台窗口 → 加固时黑窗频闪。加此 flag
@@ -607,7 +608,7 @@ def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
            ssl_pins=None, strengthen="exit", rebuild_stub=True,
-           wb_kdf=False, antidump=False, antifrida=False):
+           wb_kdf=False, antidump=False, antifrida=False, dex_obf=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -645,6 +646,15 @@ def harden(input_apk, output_apk=None, keep=False,
         raise RuntimeError("APK 中未找到任何 classes*.dex")
     orig_dexes = read_dexes(input_apk, dex_names)
     _lap(sw, "收集DEX")
+
+    # 1.1) DEX 字符串加密（opt-in，默认关）：在加密进载荷 *之前* 改写 App 自身 DEX 的
+    #      const-string -> base64(XOR) + 调用解密器；解密器以独立 obf.dex 随载荷加载。
+    #      直接打掉 "JADX + LLM 读 DEX" 的语义来源，对被动 LLM 杠杆最大；不碰类名/方法名，
+    #      不触发 manifest/反射/JNI 崩坏。防 AI 静态逆向，非 "杜绝"（DEX 解密后明文常驻）。
+    if dex_obf:
+        print("[1.1] DEX 字符串加密（opt-in）：apktool 改写 smali 中 const-string ...")
+        orig_dexes, obf_count = dex_obf_mod.obfuscate_apk(input_apk, work)
+        print("[1.1] 加密后 DEX 数:", len(orig_dexes), "改写 const-string 条数:", obf_count)
 
     # 1.5) 原始 assets（可选加密剥离；默认关闭，避免运行时还原失败导致 App 缺资源）
     assets = []
@@ -711,6 +721,11 @@ def harden(input_apk, output_apk=None, keep=False,
             total_methods += len(entries)
         print("[3.1] 抽取方法指令数: %d（需 P3.3 运行时还原，当前产物不可独立运行）" % total_methods,
               flush=True)
+    if dex_obf:
+        # 解密器 obf.dex 以独立条目随载荷加载（与 App DEX 同一 classloader），运行时被
+        # App 的 const-string->ObfStr.d 调用解析。不做方法抽取（否则破坏解密器自身）。
+        extracted_dexes.append(dex_obf_mod.load_obf_dex())
+        print("[3.1*] 注入解密器 obf.dex（随载荷加载，不方法抽取）")
     payload = build_payload(seed, extracted_dexes, assets if assets else None,
                             method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
@@ -801,6 +816,13 @@ def main():
                          "攻击者仍可 patch 响应函数（GxAntiFrida.respond / STRENGTHEN_RESPONSE）或自定义 dump，"
                          "本层只发信号、断不断由 STRENGTHEN_RESPONSE 统一收口；默认姿态 log 仅记录。"
                          "开关默认关，需真机+frida 反向验证后才用于生产。")
+    ap.add_argument("--dex-obf", action="store_true",
+                    help="DEX 字符串加密（opt-in，默认关闭）：在加密进载荷前把 App 自身 DEX 的"
+                         "const-string 改写为密文+调用解密器(ObfStr.d)，运行时还原。直接打掉"
+                         "「JADX+LLM 读 DEX」的语义来源，对被动 LLM 杠杆最大；不碰类名/方法名，"
+                         "不触发 manifest/反射/JNI 崩坏。⚠ 诚实边界：这是「混淆」不是「加密」——"
+                         "DEX 解密加载后明文常驻，攻击者跑起来即可抽；价值在抬高静态 AI 成本。"
+                         "开关默认关，需真机验证无误杀后才用于生产。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
@@ -812,7 +834,8 @@ def main():
                strengthen=args.strengthen,
                wb_kdf=args.wb_kdf,
                antidump=args.antidump,
-               antifrida=args.antifrida)
+               antifrida=args.antifrida,
+               dex_obf=args.dex_obf)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
