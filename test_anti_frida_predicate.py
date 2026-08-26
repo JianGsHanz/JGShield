@@ -44,10 +44,10 @@ def _collect_meta(manifest_data):
         elem = ax._parse_start_element(data, cs)
         kname = kval = None
         for a in elem['attributes']:
-            if a['ns'] == android_uri_idx and a['name'] == name_attr_idx:
+            if a['name'] in (ax.RES_ANDROID_NAME, name_attr_idx):
                 if a['data_type'] == ax.TYPE_STRING and a['data'] < len(strings):
                     kname = strings[a['data']]
-            if a['ns'] == android_uri_idx and a['name'] == value_attr_idx:
+            if a['name'] in (ax.RES_ANDROID_VALUE, value_attr_idx):
                 if a['data_type'] == ax.TYPE_STRING and a['data'] < len(strings):
                     kval = strings[a['data']]
         if kname is not None:
@@ -74,6 +74,8 @@ def _sample_manifest():
 
 FRIDA_SIGS = ["frida", "frida-agent", "frida-gadget", "libfrida",
               "gum-js-loop", "linjector", "re.frida.server"]
+XPOSED_SIGS = ["de.robv.android.xposed", "XposedBridge", "riru", "lspd", "lspose", "xposed"]
+SIG_XOR_KEY = 0x37
 
 
 def _strcasestr(hay, needle):
@@ -91,6 +93,10 @@ def _maps_frida(line):
     return any(_strcasestr(_maps_path(line), s) for s in FRIDA_SIGS)
 
 
+def _maps_xposed(line):
+    return any(_strcasestr(_maps_path(line), s) for s in XPOSED_SIGS)
+
+
 def _tracerpid_hit(status_line):
     if status_line.startswith("TracerPid:"):
         try:
@@ -100,12 +106,42 @@ def _tracerpid_hit(status_line):
     return False
 
 
-def _mask(maps, tracerpid, port):
+def _mask(maps, tracerpid, port, ptrace=False, xposed=False):
     m = 0
     if maps:      m |= 1
     if tracerpid: m |= 2
     if port:      m |= 4
+    if ptrace:    m |= 8
+    if xposed:    m |= 16
     return m
+
+
+def _verify_xor_tables():
+    """解析 jg_anti_frida.c 中的 FRIDA_SIGS / XPOSED_SIGS 字节表，XOR 解码后
+    必须与预期明文签名完全一致（防止手工 XOR/粘贴错位导致漏检 / 误检）。"""
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), "src", "native",
+                            "jg_anti_frida.c"), "r", encoding="utf-8").read()
+
+    def grab(name):
+        m = re.search(name + r"\[\]\[(\d+)\]\s*=\s*\{(.*?)\};", src, re.S)
+        assert m, "门禁: 未在 .c 找到 %s" % name
+        groups = re.findall(r"\{([^}]*)\}", m.group(2))
+        out = []
+        for g in groups:
+            bs = [int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", g)]
+            s = ""
+            for b in bs:
+                if b == 0x00:
+                    break
+                s += chr(b ^ SIG_XOR_KEY)
+            out.append(s)
+        return out
+
+    assert grab("FRIDA_SIGS") == FRIDA_SIGS, \
+        "FRIDA_SIGS XOR 解码 != 预期明文（漏检风险）: %s" % grab("FRIDA_SIGS")
+    assert grab("XPOSED_SIGS") == XPOSED_SIGS, \
+        "XPOSED_SIGS XOR 解码 != 预期明文（漏检风险）: %s" % grab("XPOSED_SIGS")
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
@@ -138,27 +174,37 @@ def _main():
     assert (config.META_ANTIFRIDA, "1") not in pairs_off, \
         "antifrida=False 不得注入 meta（默认关闭），实际: %s" % (pairs_off,)
 
-    # 2.3 读端判定镜像：maps frida 签名（大小写不敏感、误报红线）。
-    # 路径列 = maps 行最后一个空格之后（与 native _scan_maps_frida 一致）。
+    # 2.3 读端判定镜像：native 签名表 XOR 解码必须与明文一致（漏检红线）
+    _verify_xor_tables()
+
+    # 2.4 maps frida 签名（大小写不敏感、误报红线）。路径列 = maps 行最后一个空格之后。
     assert _maps_frida("7b8c000000-7b8c001000 rw-p 00000000 00:00 0 /data/app/com.x/lib/libfrida-agent.so") is True
     assert _maps_frida("7b8c000000-7b8c001000 rw-p 00000000 00:00 0 re.frida.server") is True
     assert _maps_frida("7b8c000000-7b8c001000 r-xp 00000000 08:01 456 /data/app/com.x/base.apk") is False  # 正常 APK 不误报
     assert _maps_frida("7b8c000000-7b8c001000 rw-p 00000000 00:00 0 [anon:gmain]") is False  # 排除泛化串
 
-    # 2.4 TracerPid 解析
+    # 2.4b maps Xposed/LSPosed 签名（A3）
+    assert _maps_xposed("7b8c000000-7b8c001000 r--p 00000000 08:01 789 /data/app/com.x/lib/libxposed_art.so") is True
+    assert _maps_xposed("7b8c000000-7b8c001000 r-xp 00000000 08:01 999 /data/adb/lspd/lib/lspd.dex") is True
+    assert _maps_xposed("7b8c000000-7b8c001000 r-xp 00000000 08:01 456 /data/app/com.x/base.apk") is False  # 正常 APK 不误报
+
+    # 2.5 TracerPid 解析
     assert _tracerpid_hit("TracerPid:\t0") is False
     assert _tracerpid_hit("TracerPid:\t12345") is True
     assert _tracerpid_hit("Name:\tcom.x") is False
 
-    # 2.5 位掩码组合（与 GxAntiFrida.detect mask!=0 对应）
+    # 2.6 位掩码组合（与 GxAntiFrida.detect mask!=0 对应；bit3=ptrace, bit4=xposed）
     assert _mask(False, False, False) == 0
     assert _mask(True,  False, False) == 1
     assert _mask(False, True,  False) == 2
     assert _mask(False, False, True)  == 4
-    assert _mask(True,  True,  True)  == 7
+    assert _mask(False, False, False, True)  == 8
+    assert _mask(False, False, False, False, True) == 16
+    assert _mask(True,  True,  True, True, True) == 31
 
     print("[gate] A·强反 Frida 写端 manifest 注入 (开/关): OK")
-    print("[gate] A·强反 Frida 读端判定镜像 (maps/TracerPid/port -> mask): OK")
+    print("[gate] A·强反 Frida XOR 签名表解码校验: OK")
+    print("[gate] A·强反 Frida 读端判定镜像 (maps-frida/maps-xposed/TracerPid/port/ptrace -> mask): OK")
     print("[gate]   注: native scanJNI 运行期一致性 + 真机+frida 反向验证 = 用户本机范畴，沙箱不执行")
     return 0
 

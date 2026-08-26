@@ -212,6 +212,11 @@ public class GxApp {
 
     private static Application load(Context base, Application proxy, File shellDir) throws Exception {
         String origApp = readMeta(base, META_ORIG);
+        // 相对类名（以 '.' 开头）需拼接包名，与 PackageParser.buildClassName 一致；
+        // 否则 Class.forName(".App4") 抛 "Invalid name" 导致壳启动崩溃。
+        if (origApp != null && origApp.startsWith(".")) {
+            origApp = base.getPackageName() + origApp;
+        }
         File dexDir = new File(shellDir, "dex");
         if (!dexDir.exists()) dexDir.mkdirs();
 
@@ -1251,9 +1256,11 @@ class GxAntiDump {
 
 /**
  * A·强反 Frida 检测层（被动检测）：壳运行期经 native GxAntiFrida_scanJNI 扫描
- *   frida 特征（maps 路径签名 / TracerPid / 默认端口），返回位掩码，命中经统一
- *   STRENGTHEN_RESPONSE 收口。属于「检测」而非「杜绝」：攻击者仍可 patch 响应函数
- *   或自定义 dump，故本层只发信号、断不断由 STRENGTHEN_RESPONSE 统一决定。
+ *   frida / Xposed 特征（maps 路径签名 / TracerPid / 默认端口 / 主动 ptrace 自检 /
+ *   Xposed-LSPosed 签名），返回位掩码，命中经统一 STRENGTHEN_RESPONSE 收口。
+ *   属于「检测」而非「杜绝」：攻击者仍可 patch 响应函数或自定义 dump，故本层只发信号、
+ *   断不断由 STRENGTHEN_RESPONSE 统一决定。签名串在 native 端 XOR 混淆（A1），
+ *   抗 string+grep+patch 攻击路。
  * 铁律：
  *   1. 默认关闭（meta "gx.antifrida"="1" 才启用）；ANTI_FRIDA_ENABLED=false 时
  *      start() 直接返回，native 根本不被调用，零运行期开销。
@@ -1298,18 +1305,30 @@ class GxAntiFrida {
         }
     }
 
-    /** 调 native 扫描，位掩码任一命中即视为 frida 注入。 */
+    /** 调 native 扫描，位掩码任一命中即视为注入框架存在。 */
     private static boolean detect() {
         try {
             int mask = scanJNI();
             if (mask != 0) {
-                Log.w(TAG, "frida signal mask=0x" + Integer.toHexString(mask));
+                Log.w(TAG, "hook signal mask=0x" + Integer.toHexString(mask) + " [" + maskDesc(mask) + "]");
                 return true;
             }
         } catch (Throwable t) {
             // native 未加载/异常 → 视为未命中（fail-safe）
         }
         return false;
+    }
+
+    /** 位掩码解码为可读描述（真机 logcat 验证用）。 */
+    private static String maskDesc(int mask) {
+        StringBuilder sb = new StringBuilder();
+        if ((mask & 1)  != 0) sb.append("maps-frida ");
+        if ((mask & 2)  != 0) sb.append("tracerpid ");
+        if ((mask & 4)  != 0) sb.append("port ");
+        if ((mask & 8)  != 0) sb.append("ptrace ");
+        if ((mask & 16) != 0) sb.append("xposed ");
+        if (sb.length() == 0) sb.append("raw(0x").append(Integer.toHexString(mask)).append(")");
+        return sb.toString().trim();
     }
 
     /** 与 GxGuard 同一 .so（libjgguard）：Java_com_gx_runtime_GxAntiFrida_scanJNI。 */

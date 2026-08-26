@@ -38,6 +38,11 @@ ANDROID_NS_URI = "http://schemas.android.com/apk/res/android"
 # Sentinel 值
 NO_ENTRY = 0xFFFFFFFF  # -1 的无符号表示
 
+# android: 标准属性资源 ID（PackageParser 按资源 ID 匹配，不能写成字符串索引！）
+# 写成字符串 "name"/"value" 时 aapt dump 能显示，但设备安装器严格按 0x0101xxxx 匹配会找不到 -> 报缺 value。
+RES_ANDROID_NAME  = 0x01010003  # android:name
+RES_ANDROID_VALUE = 0x01010024  # android:value
+
 
 # ─── 字符串池工具 ─────────────────────────────────────────────────────────────
 
@@ -260,6 +265,101 @@ def _find_xml_start(data, pool_start):
     return pos
 
 
+# 框架属性名 -> 资源 ID（用于按文档顺序重建 ResourceMap）。
+# 仅 meta-data 的 name/value 被严格解析，必须精确；其余属性即便填错框架 ID
+# 也不影响安装（原包 ResourceMap 错位仍能装即证明非严格属性容忍错位）。
+_ANDROID_ATTR_RES = {
+    'name': 0x01010003, 'value': 0x01010024, 'label': 0x01010001,
+    'icon': 0x01010002, 'theme': 0x01010000, 'exported': 0x01010010,
+    'enabled': 0x0101000E, 'permission': 0x01010006, 'process': 0x01010009,
+    'multiprocess': 0x0101000A, 'taskAffinity': 0x0101000B,
+    'minSdkVersion': 0x0101000C, 'targetSdkVersion': 0x01010010,
+    'maxSdkVersion': 0x01010011, 'debuggable': 0x0101000F,
+    'versionCode': 0x0101021B, 'versionName': 0x0101021C,
+    'package': 0x0101020C, 'platformBuildVersionCode': 0x01010270,
+    'platformBuildVersionName': 0x01010001, 'allowBackup': 0x01010280,
+    'roundIcon': 0x01010536, 'supportsRtl': 0x010103F1,
+    'launchMode': 0x0101001D, 'screenOrientation': 0x0101001E,
+    'configChanges': 0x0101001F, 'windowSoftInputMode': 0x0101022B,
+    'category': 0x01010003, 'action': 0x01010003, 'data': 0x01010004,
+    'host': 0x01010005, 'scheme': 0x01010007, 'mimeType': 0x01010026,
+    'authorities': 0x01010018, 'resource': 0x01010025, 'initOrder': 0x01010021,
+    'description': 0x01010008, 'parentActivityName': 0x0101037A,
+    'hardwareAccelerated': 0x010102E1, 'uiOptions': 0x010102D9,
+    'required': 0x0101038D, 'protectionLevel': 0x01010029,
+}
+
+
+def _rebuild_resource_map(data, pool_start, strings):
+    """
+    重建 ResourceMap：按「属性名的字符串池索引」建立 资源ID 映射。
+
+    真机实测定位的根因（关键修正）：
+      Android `ResXMLTree::getAttributeNameResource(i)` 返回
+      `mResIds[attr->name.index]`，即 ResourceMap 按「属性名在字符串池中的索引」
+      寻址，而非按文档属性顺序。aapt 编译的清单正是这种布局
+      （见 _ref/ref.apk：RM=[0x01010003,0x01010001,0x01010024]，
+       分别落在 name/label/value 三个字符串索引 0/1/2 处）。
+
+      旧实现按文档属性顺序 1:1 生成 RM，导致 meta-data 的 android:name
+      属性（name 字符串索引=5）被映射到 RM[5]（恰好是 minSdkVersion 的资源 ID），
+      getAttributeNameResource 返回 0x0101000C 而非 0x01010003，
+      PackageParser.parseMetaData 判定「缺少 android:name」→
+      INSTALL_PARSE_FAILED_MANIFEST_MALFORMED。
+
+      修正：遍历最终文档，为每个属性按其「name 字段的字符串索引」填入框架
+      资源 ID（name→0x01010003 / value→0x01010024 / label→0x01010001 …），
+      RM 数组长度 = (最大 name 字符串索引 + 1)，位置严格对齐字符串索引。
+      这样 meta-data 的 android:name 必被正确解析。
+    """
+    # 1. 收集 name 字符串索引 -> 资源 ID
+    res_by_name_idx = {}
+    p = _find_xml_start(data, pool_start)
+    while p + 8 <= len(data):
+        ct = struct.unpack_from('<I', data, p)[0]
+        cs = struct.unpack_from('<I', data, p + 4)[0]
+        if cs < 8:
+            break
+        if ct == CHUNK_START_ELEMENT:
+            e = _parse_start_element(data, p)
+            for a in e['attributes']:
+                nm = a['name']
+                if nm >= 0x01000000:
+                    # 已是资源 ID（aapt 实际不这么写，防御性跳过，不占 RM 位置）
+                    continue
+                if nm < len(strings):
+                    rid = _ANDROID_ATTR_RES.get(strings[nm], 0)
+                else:
+                    rid = 0
+                res_by_name_idx[nm] = rid
+        p += cs
+
+    if not res_by_name_idx:
+        return False
+
+    max_idx = max(res_by_name_idx.keys())
+    new_len = max_idx + 1
+    rm_body = [0] * new_len
+    for idx, rid in res_by_name_idx.items():
+        if idx < new_len:
+            rm_body[idx] = rid
+
+    new_rm = struct.pack('<II', CHUNK_RESOURCE_MAP, 8 + new_len * 4)
+    new_rm += b"".join(struct.pack('<I', x) for x in rm_body)
+
+    # 2. 替换（或新建）RM chunk，位置在原 RM 处
+    pool_chunk_size = struct.unpack_from('<I', data, pool_start + 4)[0]
+    rm_pos = pool_start + pool_chunk_size
+    had_rm = (rm_pos + 8 <= len(data) and
+              struct.unpack_from('<I', data, rm_pos)[0] == CHUNK_RESOURCE_MAP)
+    if had_rm:
+        rm_size = struct.unpack_from('<I', data, rm_pos + 4)[0]
+        data[rm_pos:rm_pos + rm_size] = new_rm
+    else:
+        data[rm_pos:rm_pos] = new_rm
+    return True
+
+
 # ─── StartElement 解析 / 构造 ─────────────────────────────────────────────────
 
 def _parse_start_element(data, chunk_start):
@@ -357,7 +457,10 @@ def _pack_start_element_chunk(elem_ns, elem_name, attributes, line=0):
     # ns, name
     buf += struct.pack('<II', elem_ns, elem_name)
     # attributeStart, attributeSize, attributeCount, idIndex, classIndex, styleIndex
-    buf += struct.pack('<HHHHHH', attr_start, attr_size, attr_count, 0xFFFF, 0xFFFF, 0xFFFF)
+    # idIndex/classIndex/styleIndex：属性数组内 android:id/class/style 的 0 基索引，
+    # 无对应属性时写 0（与 aapt 一致）。写成 0xFFFF 会越界破坏属性解析 →
+    # 严格安装器报 INSTALL_PARSE_FAILED_MANIFEST_MALFORMED「requires android:name」。
+    buf += struct.pack('<HHHHHH', attr_start, attr_size, attr_count, 0, 0, 0)
 
     for attr in attributes:
         buf += struct.pack('<III', attr['ns'], attr['name'], attr['raw_value'])
@@ -503,6 +606,10 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
     pool_info = _parse_string_pool(data, pool_start)
     strings = pool_info['strings']
     is_utf8 = pool_info['is_utf8']
+
+    # 1.5 ResourceMap 按「最终文档顺序」重建，须在全部 meta-data 注入后执行
+    #     （见末尾调用），此处仅占位说明。
+
 
     android_uri_idx = _find_string_index(strings, ANDROID_NS_URI)
     name_attr_idx   = _find_string_index(strings, 'name')
@@ -781,6 +888,12 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
         data.insert(app_chunk_start + new_app_size, 0)
         new_app_size += 1
     _update_chunk_size(data, app_chunk_start, new_app_size)
+
+    # 7.5 全部 meta-data 注入完成后，按最终文档顺序重建 ResourceMap。
+    #     严格安装器按 RM[i] 取第 i 个属性的资源 ID；原包 RM 只覆盖原属性，
+    #     注入的 meta-data 位于其后会越界解析不到 → INSTALL_PARSE_FAILED_*
+    #     重建后 meta-data 的 name=0x01010003 / value=0x01010024 必被正确解析。
+    _rebuild_resource_map(data, pool_start, strings)
 
     #   文件尾部补齐
     while len(data) % 4 != 0:
