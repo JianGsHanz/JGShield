@@ -79,6 +79,7 @@ ABIS = {
 NATIVE_COMPILE = [
     "jg_guard.c", "jg_method_restore.c", "jg_integrity.c",
     "jg_inline_hook.c", "jg_method_restore_hook.c", "jg_hook_bridge.S",
+    "jg_anti_frida.c",
 ]
 
 # Obf 旧密钥（与 GxApp.java 原 deriveKey() 一致），用于把源码中旧密文串解码为明文以便重编码
@@ -132,6 +133,8 @@ def _transform_java(txt, st):
     txt = txt.replace('"gx.strengthen"', '"%s"' % st["meta_strengthen"])
     # P0-C 内存级 anti-dump 开关 meta 键随机化（防 grep 固定 "gx.antidump"）
     txt = txt.replace('"gx.antidump"', '"%s"' % st["meta_antidump"])
+    # A·强反 Frida 开关 meta 键随机化（防 grep 固定 "gx.antifrida"）
+    txt = txt.replace('"gx.antifrida"', '"%s"' % st["meta_antifrida"])
     # 2.5) payload 条目名（壳读取端必须 == harden 写入端，否则读不到载荷崩溃）
     txt = re.sub(r'PAYLOAD_ENTRY\s*=\s*"[^"]*"',
                  'PAYLOAD_ENTRY = "%s"' % st["payload_entry"], txt)

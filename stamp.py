@@ -75,6 +75,8 @@ def generate(wb_kdf=False):
     meta_strengthen = _uniq(used, lambda: "e" + _seg(4) + "." + "f" + _seg(4))
     # P0-C 内存级 anti-dump 开关 meta：默认不注入（关闭）；--antidump 时 harden 注入值 "1"。
     meta_antidump = _uniq(used, lambda: "g" + _seg(4) + "." + "h" + _seg(4))
+    # A·强反 Frida 开关 meta：默认不注入（关闭）；--antifrida 时 harden 注入值 "1"。
+    meta_antifrida = _uniq(used, lambda: "i" + _seg(4) + "." + "j" + _seg(4))
 
     def _tag():
         return "".join(random.choice(string.ascii_letters + string.digits)
@@ -130,6 +132,7 @@ def generate(wb_kdf=False):
         "meta_ssl": meta_ssl,
         "meta_strengthen": meta_strengthen,
         "meta_antidump": meta_antidump,
+        "meta_antifrida": meta_antifrida,
         "tag_app": tags["app"], "tag_native": tags["native"], "tag_at": tags["at"],
         "tag_ad": tags["ad"], "tag_ssl": tags["ssl"], "tag_vpn": tags["vpn"],
         "tag_native_log": tags["native_log"], "tag_integrity_log": tags["integrity_log"],

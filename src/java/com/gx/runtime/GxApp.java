@@ -122,6 +122,11 @@ public class GxApp {
                 // 按铁律「脆弱特性默认关 + opt-in + 真机验证」处理，未显式开启绝不运行扫描。
                 String ad = mb.getString("gx.antidump");
                 if ("1".equals(ad)) GxAntiDump.ANTI_DUMP_ENABLED = true;
+                // A·强反 Frida 总开关：加固期经 --antifrida 注入 meta "gx.antifrida"="1" 才启用。
+                // 默认不注入（关闭）——Frida 检测是被动信号，攻击者可 patch 响应函数绕过，
+                // 按铁律「脆弱特性默认关 + opt-in + 真机验证」处理。
+                String af = mb.getString("gx.antifrida");
+                if ("1".equals(af)) GxAntiFrida.ANTI_FRIDA_ENABLED = true;
             }
         } catch (Throwable ignored) {}
 
@@ -171,6 +176,13 @@ public class GxApp {
             GxAntiDump.start(base);
         } catch (Throwable t) {
             Log.w(TAG, "anti-dump start skipped", t);
+        }
+        // A·强反 Frida（检测层）：独立守护线程，启动即查 + 周期轮询，命中经 STRENGTHEN_RESPONSE 收口。
+        // 默认 ANTI_FRIDA_ENABLED=false 时 start() 直接返回，不浪费线程/扫描（满足「默认关」铁律）。
+        try {
+            GxAntiFrida.start(base);
+        } catch (Throwable t) {
+            Log.w(TAG, "anti-frida start skipped", t);
         }
 
         // 启动 native 反篡改守护线程（下沉到 .so，更难被 hook；与 Java 层互为备份）。
@@ -1233,6 +1245,84 @@ class GxAntiDump {
             return;
         }
         Log.w(TAG, "anti-dump confirmed -> System.exit");
+        try { System.exit(1); } catch (Throwable ignored) {}
+    }
+}
+
+/**
+ * A·强反 Frida 检测层（被动检测）：壳运行期经 native GxAntiFrida_scanJNI 扫描
+ *   frida 特征（maps 路径签名 / TracerPid / 默认端口），返回位掩码，命中经统一
+ *   STRENGTHEN_RESPONSE 收口。属于「检测」而非「杜绝」：攻击者仍可 patch 响应函数
+ *   或自定义 dump，故本层只发信号、断不断由 STRENGTHEN_RESPONSE 统一决定。
+ * 铁律：
+ *   1. 默认关闭（meta "gx.antifrida"="1" 才启用）；ANTI_FRIDA_ENABLED=false 时
+ *      start() 直接返回，native 根本不被调用，零运行期开销。
+ *   2. 异常全吞，绝不外抛、绝不影响 App 启动。
+ *   3. 误报红线：native 仅匹配 frida 明确签名串，宁可漏检不可误伤正常设备。
+ */
+class GxAntiFrida {
+    private static final String TAG = "GX-AF";
+    private static final long INTERVAL_MS = 2000;
+    // A·强反 Frida 总开关：加固期经 manifest meta "gx.antifrida"="1" 注入才为 true；默认 false（关闭）。
+    static volatile boolean ANTI_FRIDA_ENABLED = false;
+
+    static void start(Context ctx) {
+        // 默认关：不浪费线程/扫描，native 不被调用
+        if (!ANTI_FRIDA_ENABLED) return;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    loop();
+                } catch (Throwable ignored) {
+                    Log.w(TAG, "anti-frida loop ended", ignored);
+                }
+            }
+        });
+        t.setName("gx-anti-frida");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void loop() {
+        // 启动即查一次；之后周期轮询
+        if (detect()) respond();
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                Thread.sleep(INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (detect()) respond();
+        }
+    }
+
+    /** 调 native 扫描，位掩码任一命中即视为 frida 注入。 */
+    private static boolean detect() {
+        try {
+            int mask = scanJNI();
+            if (mask != 0) {
+                Log.w(TAG, "frida signal mask=0x" + Integer.toHexString(mask));
+                return true;
+            }
+        } catch (Throwable t) {
+            // native 未加载/异常 → 视为未命中（fail-safe）
+        }
+        return false;
+    }
+
+    /** 与 GxGuard 同一 .so（libjgguard）：Java_com_gx_runtime_GxAntiFrida_scanJNI。 */
+    static native int scanJNI();
+
+    private static void respond() {
+        // 统一收口到 STRENGTHEN_RESPONSE（与 GxAntiDump / GxTamper / GxAntiDebug / native jg_guard 一致）。
+        if (!"exit".equals(GxApp.STRENGTHEN_RESPONSE)) {
+            Log.w(TAG, "frida detected but STRENGTHEN_RESPONSE="
+                    + GxApp.STRENGTHEN_RESPONSE + " (log-only)");
+            return;
+        }
+        Log.w(TAG, "frida confirmed -> System.exit");
         try { System.exit(1); } catch (Throwable ignored) {}
     }
 }

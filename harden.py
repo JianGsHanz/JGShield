@@ -607,7 +607,7 @@ def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
            ssl_pins=None, strengthen="exit", rebuild_stub=True,
-           wb_kdf=False, antidump=False):
+           wb_kdf=False, antidump=False, antifrida=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -661,11 +661,12 @@ def harden(input_apk, output_apk=None, keep=False,
                            "android:name 是资源引用而非字符串），请用 apktool 文本流")
     patched_manifest = _axml_patch(manifest_data, orig_app,
                                    shell_app_class=config.BOOTSTRAP_APP,
-                                   ssl_pins=ssl_pins, strengthen=strengthen, antidump=antidump,
+                                   ssl_pins=ssl_pins, strengthen=strengthen, antidump=antidump, antifrida=antifrida,
                                    meta_orig=config.META_ORIG,
                                    meta_ssl=config.META_SSL_PINS,
                                    meta_strengthen=config.META_STRENGTHEN,
-                                   meta_antidump=config.META_ANTIDUMP)
+                                   meta_antidump=config.META_ANTIDUMP,
+                                   meta_antifrida=config.META_ANTIFRIDA)
     if ssl_pins:
         print("[2*] 注入 SSL pinning meta: %s (%d host(s))"
               % (config.META_SSL_PINS, ssl_pins.count(';') + 1))
@@ -676,6 +677,9 @@ def harden(input_apk, output_apk=None, keep=False,
     if antidump:
         print("[2*] 注入 P0-C 内存级 anti-dump 开关 meta: %s = 1 (默认关,opt-in)" % config.META_ANTIDUMP)
         print("[!] 警告: 内存扫描可能误命中 ART 另拷的匿名 DEX 区，需真机验证后再用于生产。")
+    if antifrida:
+        print("[2*] 注入 A·强反 Frida 开关 meta: %s = 1 (默认关,opt-in)" % config.META_ANTIFRIDA)
+        print("[!] 警告: frida 检测为被动信号，攻击者可 patch 响应函数绕过，需真机+frida 反向验证后才用于生产。")
     print("[2] 原 Application:", orig_app)
     _lap(sw, "改Manifest(二进制)")
 
@@ -790,6 +794,13 @@ def main():
                          "「杜绝」——DEX 必被 ART 明文执行，内存里永远有明文副本，只提 dump 成本、给运行期"
                          "信号。且可能误命中 ART 另拷的匿名 DEX 区导致自爆，已排除自家 direct-buffer 区间但"
                          "残留未覆盖风险；开关默认关，需真机+frida 反向验证后才用于生产。")
+    ap.add_argument("--antifrida", action="store_true",
+                    help="A·强反 Frida（opt-in，默认关闭）：壳运行期经 native 扫描 frida 特征"
+                         "（maps 路径签名 / TracerPid / 默认端口 27042-27043），命中且 --strengthen exit"
+                         "则退出进程，否则仅记日志。⚠ 诚实边界：这是「被动检测」不是「杜绝」——"
+                         "攻击者仍可 patch 响应函数（GxAntiFrida.respond / STRENGTHEN_RESPONSE）或自定义 dump，"
+                         "本层只发信号、断不断由 STRENGTHEN_RESPONSE 统一收口；默认姿态 log 仅记录。"
+                         "开关默认关，需真机+frida 反向验证后才用于生产。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
@@ -800,7 +811,8 @@ def main():
                ssl_pins=args.pins,
                strengthen=args.strengthen,
                wb_kdf=args.wb_kdf,
-               antidump=args.antidump)
+               antidump=args.antidump,
+               antifrida=args.antifrida)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
