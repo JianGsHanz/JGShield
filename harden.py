@@ -189,8 +189,12 @@ def derive_seed(cert_hash, salt):
     return mac.digest()
 
 def derive_key(seed, idx, label=b"dex"):
+    msg = config.KEY_PREFIX + label + str(idx).encode("utf-8")
+    if config.WB_KDF:
+        import whitebox_kdf
+        return whitebox_kdf.wb_derive(seed, msg, config.WB_SECRET)
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(config.KEY_PREFIX + label + str(idx).encode("utf-8"))
+    mac.update(msg)
     return mac.digest()  # 32 bytes -> AES-256
 
 def encrypt_asset(seed, idx, data):
@@ -302,8 +306,12 @@ def derive_method_key(seed, dex_idx):
     (≈11.65MB) 提升到 ~3x(≈4MB)，且 21 万方法的 28B IV/tag 固定开销(≈5.7MB)
     降为每 dex 一次(≈0.5KB)。包体由 +15MB 降为近零增长，安全性不变
     （方法抽取反脱壳层原样保留）。沿用整包种子体系，换签即失败。"""
+    msg = config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8")
+    if config.WB_KDF:
+        import whitebox_kdf
+        return whitebox_kdf.wb_derive(seed, msg, config.WB_SECRET)
     mac = HMAC.new(seed, digestmod=SHA256)
-    mac.update(config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8"))
+    mac.update(msg)
     return mac.digest()
 
 def extract_methods(seed, dex_idx, dex_bytes):
@@ -598,7 +606,8 @@ def self_verify(out_apk, orig_dexes):
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
-           ssl_pins=None, strengthen="exit", rebuild_stub=True):
+           ssl_pins=None, strengthen="exit", rebuild_stub=True,
+           wb_kdf=False, antidump=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -620,7 +629,7 @@ def harden(input_apk, output_apk=None, keep=False,
     #     rebuild_stub=False 时跳过重建、直接复用已有 build/stamp.json + 产物（快速迭代用）。
     if rebuild_stub:
         import build_stub
-        build_stub.main()
+        build_stub.main(wb_kdf=wb_kdf)
     config.apply_stamp_from_file()
 
     print("=" * 60)
@@ -652,10 +661,11 @@ def harden(input_apk, output_apk=None, keep=False,
                            "android:name 是资源引用而非字符串），请用 apktool 文本流")
     patched_manifest = _axml_patch(manifest_data, orig_app,
                                    shell_app_class=config.BOOTSTRAP_APP,
-                                   ssl_pins=ssl_pins, strengthen=strengthen,
+                                   ssl_pins=ssl_pins, strengthen=strengthen, antidump=antidump,
                                    meta_orig=config.META_ORIG,
                                    meta_ssl=config.META_SSL_PINS,
-                                   meta_strengthen=config.META_STRENGTHEN)
+                                   meta_strengthen=config.META_STRENGTHEN,
+                                   meta_antidump=config.META_ANTIDUMP)
     if ssl_pins:
         print("[2*] 注入 SSL pinning meta: %s (%d host(s))"
               % (config.META_SSL_PINS, ssl_pins.count(';') + 1))
@@ -663,6 +673,9 @@ def harden(input_apk, output_apk=None, keep=False,
         print("[2*] 注入统一响应姿态 meta: %s = %s" % (config.META_STRENGTHEN, strengthen))
         if strengthen == "exit":
             print("[!] 警告: exit 模式会误杀正常 VPN/海外用户，不推荐用于面向海外用户的 app。")
+    if antidump:
+        print("[2*] 注入 P0-C 内存级 anti-dump 开关 meta: %s = 1 (默认关,opt-in)" % config.META_ANTIDUMP)
+        print("[!] 警告: 内存扫描可能误命中 ART 另拷的匿名 DEX 区，需真机验证后再用于生产。")
     print("[2] 原 Application:", orig_app)
     _lap(sw, "改Manifest(二进制)")
 
@@ -763,6 +776,20 @@ def main():
                          "⚠ exit 可能误杀部分正常设备（反调试/自校验 OEM 误报），生产发布前务必在"
                          "目标机型（如华为 A10 / 小米 A9）真机验证；如需关闭用 --strengthen log。"
                          "经 manifest meta 注入，运行期生效，无需重编 stub.dex。")
+    ap.add_argument("--wb-kdf", action="store_true",
+                    help="P0-B 真白盒密钥派生（opt-in，默认关闭）：把 HMAC(seed,msg) 再经一次以每构建"
+                         "随机 wb_secret 预处理态为起点的 SHA256 融合，去除 .so 内连续 seed 字面量与可被"
+                         "一行 HMAC() 直接复用的干净派生。⚠ 诚实边界：离线无服务端，seed 仍可由 APK 证书"
+                         "+salt 重建，白盒仅提逆向成本、不补保密性（真墙是 VMP/服务端密钥，不在本次范围）。"
+                         "开启后 native 走 WB_KDF 烘焙路径，需 build_stub 重编 4 ABI。沙箱仅能验数学等价"
+                         "（白盒≠clean 且确定），运行期一致性需真机+frida 反向验证后才可默认开启。")
+    ap.add_argument("--antidump", action="store_true",
+                    help="P0-C 内存级 anti-dump（opt-in，默认关闭）：壳运行期扫 /proc/self/maps，对匿名/"
+                         "memfd 区域读首 4 字节是否 DEX 魔数（frida-dexdump / memfd 内存 dump 特征），"
+                         "命中且 --strengthen exit 则退出进程，否则仅记日志。⚠ 诚实边界：这是「检测」不是"
+                         "「杜绝」——DEX 必被 ART 明文执行，内存里永远有明文副本，只提 dump 成本、给运行期"
+                         "信号。且可能误命中 ART 另拷的匿名 DEX 区导致自爆，已排除自家 direct-buffer 区间但"
+                         "残留未覆盖风险；开关默认关，需真机+frida 反向验证后才用于生产。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
@@ -771,7 +798,9 @@ def main():
                assets_encrypt=args.assets_encrypt,
                method_extract=args.method_extract,
                ssl_pins=args.pins,
-               strengthen=args.strengthen)
+               strengthen=args.strengthen,
+               wb_kdf=args.wb_kdf,
+               antidump=args.antidump)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

@@ -117,6 +117,11 @@ public class GxApp {
             if (mb != null) {
                 String s = mb.getString("gx.strengthen");
                 if ("exit".equals(s) || "log".equals(s)) STRENGTHEN_RESPONSE = s;
+                // P0-C 内存级 anti-dump 总开关：加固期经 --antidump 注入 meta "gx.antidump"="1" 才启用。
+                // 默认不注入（关闭）——内存扫描有自检误报残留风险（ART 可能把 DEX 另拷匿名区），
+                // 按铁律「脆弱特性默认关 + opt-in + 真机验证」处理，未显式开启绝不运行扫描。
+                String ad = mb.getString("gx.antidump");
+                if ("1".equals(ad)) GxAntiDump.ANTI_DUMP_ENABLED = true;
             }
         } catch (Throwable ignored) {}
 
@@ -536,6 +541,9 @@ class GxDecryptor {
             buf.position(0);
             // 源明文立即清零（缓冲区随后由 ART 拷贝，加载后可被 GC 回收）
             Arrays.fill(dex, (byte) 0);
+            // P0-C：登记本段直接缓冲区的真实内存基址，供 anti-dump 内存扫描排除「自己的 DEX」，
+            // 避免扫描命中自有 InMemoryDexClassLoader DEX 导致自爆（best-effort，取不到基址则不排除）。
+            GxAntiDump.addSelfDex(directAddress(buf), dex.length);
             out.add(buf);
         }
         // P3 方法还原接入点（受 METHOD_RESTORE_ENABLED 总开关控制，fail-safe）。
@@ -579,6 +587,19 @@ class GxDecryptor {
             }
         }
         return out;
+    }
+
+    /** best-effort 取 direct ByteBuffer 的真实内存基址（java.nio.DirectByteBuffer.address 私有字段）。
+     *  取不到返回 0（调用方据此跳过排除，属已知残留风险）。仅用于 P0-C 内存扫描排除自有 DEX。 */
+    private static long directAddress(ByteBuffer buf) {
+        if (buf == null || !buf.isDirect()) return 0;
+        try {
+            java.lang.reflect.Field f = buf.getClass().getDeclaredField("address");
+            f.setAccessible(true);
+            return f.getLong(buf);
+        } catch (Throwable t) {
+            return 0;
+        }
     }
 
     /** 重算 DEX 头校验和：checksum(偏移8)=adler32(data[12:])，signature(偏移12)=sha1(data[32:])。
@@ -1013,6 +1034,18 @@ class GxAntiDump {
     private static final long INTERVAL_MS = 2000;
     private static volatile java.io.File appDataDir;   // /data/data/<pkg>
 
+    // P0-C 内存级 anti-dump 总开关：加固期经 meta "gx.antidump"="1" 注入才为 true；默认 false（关闭）。
+    static volatile boolean ANTI_DUMP_ENABLED = false;
+    // 自有 DEX 直接缓冲区内存区间 [start, start+len)，由解密加载时登记（best-effort），扫描时排除，
+    // 避免命中自家 InMemoryDexClassLoader DEX 导致自爆。仅在该表非空后内存扫描才生效（规避启动竞态）。
+    private static final java.util.List<long[]> SELF_DEX = new java.util.ArrayList<>();
+
+    static void addSelfDex(long addr, long len) {
+        if (addr != 0 && len > 0) {
+            synchronized (SELF_DEX) { SELF_DEX.add(new long[]{addr, addr + len}); }
+        }
+    }
+
     static void start(Context ctx) {
         try {
             java.io.File fd = ctx.getFilesDir();
@@ -1049,7 +1082,7 @@ class GxAntiDump {
 
     /** 综合检测，任一命中即视为正在被脱壳。每个子检测独立 try-catch，互不影响。 */
     private static boolean detect() {
-        return dumpDirsExist() || localTmpMarkers();
+        return dumpDirsExist() || localTmpMarkers() || scanMemoryForDex();
     }
 
     /** 脱壳工具默认输出目录（目录存在即命中；正常 App 不会创建 dump/app_dump 这类名字）。 */
@@ -1109,6 +1142,87 @@ class GxAntiDump {
             // ignore
         }
         return false;
+    }
+
+    /** P0-C 内存级脱壳检测：扫 /proc/self/maps，对匿名(/memfd)区域读首 4 字节是否 DEX 魔数
+     *  （"dex\n"=0x64 65 78 0A，或 compact "dey\n"=0x64 65 79 0A）。这是 frida-dexdump / memfd
+     *  内存 dump 的本质特征：解密后的 DEX 以匿名/共享内存形态驻留，首 4 字节即 DEX 魔数。
+     *  ⚠ 诚实边界：本扫描是「检测」不是「杜绝」——DEX 必被 ART 明文执行，内存里永远有明文副本，
+     *     只能提高 dump 成本、给运行期一个告警/阻断信号，无法让 AI 逆向器读不到。
+     *  ⚠ 误报残留：若 ART 把本壳 DEX 另拷到匿名区（SELF_DEX 未覆盖），可能误命中自家 DEX → 自爆。
+     *     故仅当 SELF_DEX 非空（已登记自家 DEX 区间）才扫描，且排除这些区间；开关默认关，需真机验证。
+     *  fail-safe：任何异常都视为未命中，绝不因扫描失败而阻断正常启动。 */
+    private static boolean scanMemoryForDex() {
+        if (!ANTI_DUMP_ENABLED) return false;
+        // 启动竞态保护：自家 DEX 尚未登记时不扫描（避免命中尚未排除的自家 DEX）。
+        synchronized (SELF_DEX) { if (SELF_DEX.isEmpty()) return false; }
+        try {
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream("/proc/self/maps")));
+            String line;
+            while ((line = br.readLine()) != null) {
+                int sp = line.indexOf('-');
+                if (sp <= 0) continue;
+                // pathname：maps 行末尾（若无则为匿名映射）；/memfd: 是 memfd_create 内存 dump 特征。
+                int idx = line.indexOf('/', sp);
+                String path = (idx >= 0) ? line.substring(idx).trim() : "";
+                boolean anon = path.isEmpty();
+                boolean memfd = path.startsWith("/memfd:") || path.contains("memfd");
+                if (!anon && !memfd) continue;   // 文件映射（含 APK 自身）一律跳过，属合法
+                long start = parseMapsStart(line, sp);
+                if (start < 0) continue;
+                if (inSelfDex(start)) continue;  // 排除自家加载的 DEX 区间
+                if (readDexMagic(start)) {
+                    Log.w(TAG, "anti-dump(memory): DEX magic @0x" + Long.toHexString(start)
+                            + " region=" + (path.isEmpty() ? "<anonymous>" : path));
+                    return true;
+                }
+            }
+            br.close();
+        } catch (Throwable t) {
+            // fail-safe：扫描异常不阻断
+        }
+        return false;
+    }
+
+    /** 解析 maps 行起始地址（十六进制，行首到首个 '-'）。失败返回 -1。 */
+    private static long parseMapsStart(String line, int sp) {
+        try {
+            return Long.parseLong(line.substring(0, sp).trim(), 16);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 地址是否落在已登记的自家 DEX 区间内（排除自检误报）。 */
+    private static boolean inSelfDex(long addr) {
+        synchronized (SELF_DEX) {
+            for (long[] r : SELF_DEX) {
+                if (addr >= r[0] && addr < r[1]) return true;
+            }
+        }
+        return false;
+    }
+
+    /** 读 /proc/self/mem 指定地址首 4 字节，判断是否 DEX 魔数。fail-safe：异常返回 false。 */
+    private static boolean readDexMagic(long start) {
+        java.io.RandomAccessFile mem = null;
+        try {
+            mem = new java.io.RandomAccessFile("/proc/self/mem", "r");
+            mem.seek(start);
+            byte[] head = new byte[4];
+            int n = mem.read(head);
+            if (n != 4) return false;
+            // "dex\n" / "dey\n"
+            return (head[0] == 0x64 && head[1] == 0x65 && head[3] == 0x0a
+                    && (head[2] == 0x78 || head[2] == 0x79));
+        } catch (Throwable t) {
+            return false;   // 读不可访问地址会抛 IOException/EOFException -> 视为非 DEX
+        } finally {
+            if (mem != null) {
+                try { mem.close(); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     private static void respond() {

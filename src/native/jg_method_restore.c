@@ -32,6 +32,10 @@
 #include <android/log.h>
 
 #include "jg_crypto.h"
+#ifdef WB_KDF
+/* P0-B 真白盒：仅 -DWB_KDF 时引入白盒 KDF（WB_STATE 已烘焙进该头）。 */
+#include "whitebox_kdf.h"
+#endif
 
 #define TAG "JG-MethodRestore"
 #define JG_PAGE 4096
@@ -115,11 +119,17 @@ int jg_restore_methods(uint8_t *dex, size_t dex_len,
             uint32_t insns_size = jg_rd32(meta, (size_t)e * 12 + 8);
             total += (size_t)insns_size * 2;
         }
-        /* per-dex 密钥：HMAC(seed, "JG|m"+dexIdx)，整 dex 方法码一次 GCM */
+        /* per-dex 密钥：HMAC(seed, key_prefix+"m"+dexIdx)，整 dex 方法码一次 GCM
+         * （label 中的 "JG|m" 已由 build_stub 注入随机 key_prefix） */
         char label[64];
         int ll = snprintf(label, sizeof(label), "JG|m%u", dex_idx);
         uint8_t key[32];
+#ifdef WB_KDF
+        /* P0-B 真白盒：final = SHA256_cont(WB_STATE, HMAC(seed, label)) */
+        wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
+#else
         jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
+#endif
         const uint8_t *iv = sblob;
         const uint8_t *ct = sblob + 12;
         size_t ctlen = (size_t)sln - 12 - 16;
@@ -234,7 +244,12 @@ int jg_verify_methods(const uint8_t *dex, size_t dex_len,
         char label[64];
         int ll = snprintf(label, sizeof(label), "JG|m%u", dex_idx);
         uint8_t key[32];
+#ifdef WB_KDF
+        /* P0-B 真白盒：final = SHA256_cont(WB_STATE, HMAC(seed, label)) */
+        wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
+#else
         jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
+#endif
         const uint8_t *iv = sblob;
         const uint8_t *ct = sblob + 12;
         size_t ctlen = (size_t)sln - 12 - 16;

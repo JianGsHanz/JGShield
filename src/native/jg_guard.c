@@ -32,6 +32,10 @@
 #include <arpa/inet.h>
 #include <android/log.h>
 #include "jg_crypto.h"
+#ifdef WB_KDF
+/* P0-B 真白盒：仅 -DWB_KDF 时引入白盒 KDF（WB_STATE 已烘焙进该头）。 */
+#include "whitebox_kdf.h"
+#endif
 
 #define TAG "JG-Native"
 
@@ -244,7 +248,13 @@ Java_com_gx_runtime_GxKeys_nativeKeyFor(JNIEnv *env, jclass clazz,
     jbyte *inf = (*env)->GetByteArrayElements(env, info, NULL);
     jsize inflen = (*env)->GetArrayLength(env, info);
     uint8_t out[32];
+#ifdef WB_KDF
+    /* P0-B 真白盒：final = SHA256_cont(WB_STATE, HMAC(seed, info))；
+     * WB_STATE 由 build_stub 烘焙进 whitebox_kdf.h（与 Python 写端逐字节一致）。 */
+    wb_key_for((const uint8_t*)sd, (const uint8_t*)inf, (size_t)inflen, out);
+#else
     jg_hmac_sha256((const uint8_t*)sd, (size_t)sdlen, (const uint8_t*)inf, (size_t)inflen, out);
+#endif
     (*env)->ReleaseByteArrayElements(env, seedArr, sd, JNI_ABORT);
     (*env)->ReleaseByteArrayElements(env, info, inf, JNI_ABORT);
     jbyteArray res = (*env)->NewByteArray(env, 32);

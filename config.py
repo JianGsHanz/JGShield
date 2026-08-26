@@ -187,9 +187,17 @@ META_SSL_PINS = "gx.ssl_pins"
 # P-CAPTURE 统一响应姿态：加固期注入，壳运行期读取覆盖默认 "log"
 # 取值 "log"（默认，fail-safe，仅记日志）或 "exit"（命中即退出进程）。
 META_STRENGTHEN = "gx.strengthen"
+# P0-C 内存级 anti-dump 开关 meta 名（默认 "gx.antidump"，apply_stamp 覆盖为随机值）。
+# 仅 --antidump 开启时 harden 把该 meta 值写为 "1"，壳运行期读取启用内存扫描。
+META_ANTIDUMP = "gx.antidump"
 # P0-B 轻量：密钥派生 label 前缀（默认 "JG|"，apply_stamp 覆盖为随机值）。
 # harden.py 加密端与壳解密端必须共用此变量，保证写读逐字节一致。
 KEY_PREFIX = b"JG|"
+# P0-B 真白盒：是否启用白盒融合派生（默认 False，opt-in，仅 --wb-kdf 开启）。
+# 开启时 WB_SECRET 参与派生，native 侧经 WB_KDF 烘焙的 WB_STATE 融合，
+# 与 harden/verify 的 whitebox_kdf.wb_derive 逐字节一致。
+WB_KDF = False
+WB_SECRET = b""
 SHELL_APP = "com.gx.runtime.GxApp"
 # 载荷 ZIP 条目名（默认 z9，随机化由 stamp 覆盖）
 PAYLOAD_ENTRY = "z9"
@@ -206,17 +214,20 @@ _STAMP_PATH = os.path.join(BUILD_DIR, "stamp.json")
 
 def apply_stamp(st):
     global MAGIC, META_ORIG, META_SSL_PINS, META_STRENGTHEN, SHELL_APP, PAYLOAD_ENTRY, LIB_NAME
-    global SHELL_DEX_ENTRY, BOOTSTRAP_APP, KEY_PREFIX
+    global SHELL_DEX_ENTRY, BOOTSTRAP_APP, KEY_PREFIX, WB_KDF, WB_SECRET, META_ANTIDUMP
     MAGIC = st["magic"].encode("utf-8") if isinstance(st["magic"], str) else st["magic"]
     META_ORIG = st["meta_orig"]
     META_SSL_PINS = st["meta_ssl"]
     META_STRENGTHEN = st["meta_strengthen"]
+    META_ANTIDUMP = st["meta_antidump"]
     SHELL_APP = st["pkg"] + "." + st["classes"]["GxApp"]
     PAYLOAD_ENTRY = st["payload_entry"]
     LIB_NAME = st["lib_name"]
     SHELL_DEX_ENTRY = st["shell_dex_entry"]
     BOOTSTRAP_APP = st["pkg"] + "." + st["classes"]["GxBootstrap"]
     KEY_PREFIX = st["key_prefix"].encode("utf-8")
+    WB_KDF = bool(st["wb_kdf"])
+    WB_SECRET = bytes(st["wb_secret"]) if st.get("wb_secret") else b""
 
 
 def apply_stamp_from_file(path=_STAMP_PATH):

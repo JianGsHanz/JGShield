@@ -59,8 +59,12 @@ def _uniq(used, gen):
             return v
 
 
-def generate():
-    """生成一份随机化 stamp。"""
+def generate(wb_kdf=False):
+    """生成一份随机化 stamp。
+
+    wb_kdf: 是否启用 P0-B 真白盒融合派生（默认 False，opt-in，仅 --wb-kdf 开启）。
+    开启时 wb_secret 仍随机生成并烘焙进 .so 的 WB_STATE；关闭时 wb_secret 仍生成
+    但 native 走干净 HMAC、WB_STATE 无意义。"""
     used = set()
 
     pkg = _uniq(used, lambda: _seg(4) + "." + _seg(4))
@@ -69,6 +73,8 @@ def generate():
     meta_orig = _uniq(used, lambda: "a" + _seg(4) + "." + "b" + _seg(4))
     meta_ssl = _uniq(used, lambda: "c" + _seg(4) + "." + "d" + _seg(4))
     meta_strengthen = _uniq(used, lambda: "e" + _seg(4) + "." + "f" + _seg(4))
+    # P0-C 内存级 anti-dump 开关 meta：默认不注入（关闭）；--antidump 时 harden 注入值 "1"。
+    meta_antidump = _uniq(used, lambda: "g" + _seg(4) + "." + "h" + _seg(4))
 
     def _tag():
         return "".join(random.choice(string.ascii_letters + string.digits)
@@ -107,6 +113,15 @@ def generate():
     key_prefix = "".join(random.choice(string.ascii_letters + string.digits)
                          for _ in range(random.randint(2, 4)))
 
+    # P0-B 真白盒：白盒融合密钥（每 stub 随机）。非密钥本身，而是用于把干净
+    # HMAC(seed, msg) 再经一次以 wb_secret 预处理态为起点的 SHA256，使 .so 内
+    # 不再出现连续的 seed 字面量、也不再有可被一行 HMAC() 直接复用的干净派生。
+    # 诚实边界：seed 仍可由 APK 证书+salt 重建 → 白盒只提成本不补秘密；默认关，
+    # 仅 --wb-kdf 开启。wb_secret 仅以「融合后的 WB_STATE」形式出现在 .so/烘焙期，
+    # 不暴露连续字面量。
+    wb_kdf = bool(wb_kdf)
+    wb_secret = [random.randint(0, 255) for _ in range(32)]
+
     return {
         "pkg": pkg,
         "pkg_underscore": pkg.replace(".", "_"),
@@ -114,6 +129,7 @@ def generate():
         "meta_orig": meta_orig,
         "meta_ssl": meta_ssl,
         "meta_strengthen": meta_strengthen,
+        "meta_antidump": meta_antidump,
         "tag_app": tags["app"], "tag_native": tags["native"], "tag_at": tags["at"],
         "tag_ad": tags["ad"], "tag_ssl": tags["ssl"], "tag_vpn": tags["vpn"],
         "tag_native_log": tags["native_log"], "tag_integrity_log": tags["integrity_log"],
@@ -125,6 +141,8 @@ def generate():
         "lib_name": lib_name,
         "obf_key": obf_key,
         "key_prefix": key_prefix,
+        "wb_kdf": wb_kdf,
+        "wb_secret": wb_secret,
     }
 
 

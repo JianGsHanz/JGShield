@@ -467,9 +467,9 @@ def get_orig_app_class(manifest_data):
 
 
 def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_APP,
-                   ssl_pins=None, strengthen=None,
+                   ssl_pins=None, strengthen=None, antidump=None,
                    meta_orig=config.META_ORIG, meta_ssl=config.META_SSL_PINS,
-                   meta_strengthen=config.META_STRENGTHEN):
+                   meta_strengthen=config.META_STRENGTHEN, meta_antidump=config.META_ANTIDUMP):
     """
     修改二进制 AndroidManifest.xml：
 
@@ -536,6 +536,11 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
         for s in [meta_strengthen, strengthen]:
             if _find_string_index(strings, s) == -1:
                 new_strings_needed.append(s)
+    # P0-C 内存级 anti-dump 开关 meta：仅 --antidump 时注入 meta_antidump="1"，壳运行期读取启用扫描
+    if antidump:
+        for s in [meta_antidump, "1"]:
+            if _find_string_index(strings, s) == -1:
+                new_strings_needed.append(s)
     # 注：删除 appComponentFactory 属性时无需把 appComponentFactory / 空串 加入字符串池
 
     # 4. 向字符串池追加新字符串（在 XML 修改前完成，避免偏移追踪困扰）
@@ -561,6 +566,8 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
     ssl_pins_val_idx = _find_string_index(strings, ssl_pins) if ssl_pins else -1
     strengthen_idx     = _find_string_index(strings, meta_strengthen) if strengthen else -1
     strengthen_val_idx = _find_string_index(strings, strengthen) if strengthen else -1
+    antidump_idx     = _find_string_index(strings, meta_antidump) if antidump else -1
+    antidump_val_idx = _find_string_index(strings, "1") if antidump else -1
 
     # 重新定位 application（字符串池修改后位置可能后移）
     xml_start = _find_xml_start(data, 8)
@@ -704,6 +711,29 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
         str_meta_end = _pack_end_element_chunk(
             elem_ns=NO_ENTRY, elem_name=meta_data_idx, line=app_elem['line'])
         insertion = insertion + str_meta_start + str_meta_end
+    # P0-C 内存级 anti-dump 开关 meta-data 子元素
+    if antidump and antidump_idx >= 0 and antidump_val_idx >= 0:
+        ad_meta_attrs = [
+            {
+                'ns':        android_uri_idx,
+                'name':      name_attr_idx,
+                'raw_value': antidump_idx,
+                'data_type': TYPE_STRING,
+                'data':      antidump_idx,
+            },
+            {
+                'ns':        android_uri_idx,
+                'name':      value_attr_idx,
+                'raw_value': antidump_val_idx,
+                'data_type': TYPE_STRING,
+                'data':      antidump_val_idx,
+            },
+        ]
+        ad_meta_start = _pack_start_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, attributes=ad_meta_attrs, line=app_elem['line'])
+        ad_meta_end = _pack_end_element_chunk(
+            elem_ns=NO_ENTRY, elem_name=meta_data_idx, line=app_elem['line'])
+        insertion = insertion + ad_meta_start + ad_meta_end
     insertion_size = len(insertion)
     # 注意：meta-data 是独立的子 chunk，不计入 application StartElement 的 chunkSize
     # app_size_growth 仅记录 application 元素自身的变化（如新增属性），不包含子元素

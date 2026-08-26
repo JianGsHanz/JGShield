@@ -27,6 +27,7 @@ import platform
 
 import config
 import stamp
+import whitebox_kdf
 
 # Windows 下 --windowed exe 调起 console 子进程（javac/java/clang 均为 console
 # 子系统）会为其单独分配一个控制台窗口 → 加固时黑窗频闪。加此 flag 抑制。
@@ -129,6 +130,8 @@ def _transform_java(txt, st):
     txt = txt.replace('"gx.orig_app"', '"%s"' % st["meta_orig"])
     txt = txt.replace('"gx.ssl_pins"', '"%s"' % st["meta_ssl"])
     txt = txt.replace('"gx.strengthen"', '"%s"' % st["meta_strengthen"])
+    # P0-C 内存级 anti-dump 开关 meta 键随机化（防 grep 固定 "gx.antidump"）
+    txt = txt.replace('"gx.antidump"', '"%s"' % st["meta_antidump"])
     # 2.5) payload 条目名（壳读取端必须 == harden 写入端，否则读不到载荷崩溃）
     txt = re.sub(r'PAYLOAD_ENTRY\s*=\s*"[^"]*"',
                  'PAYLOAD_ENTRY = "%s"' % st["payload_entry"], txt)
@@ -354,10 +357,31 @@ def _regen_vectors(st):
         f.write(s)
 
 
+def _bake_whitebox_kdf(st):
+    """P0-B 真白盒：把 WB_STATE 烘焙进 TMP_NATIVE/whitebox_kdf.h（仅 wb_kdf 开启时）。
+
+    WB_STATE = SHA256 处理完 wb_secret 的 64B 填充块后的中间态(8×uint32)，
+    由 whitebox_kdf.wb_state_c_array 计算，与 Python 写端（harden/verify 的
+    whitebox_kdf.wb_derive）逐字节一致 → 写读对称。clean 构建不调用本函数，
+    native 走干净 HMAC，whitebox_kdf.h 保持模板默认零值（且不被 include）。"""
+    wb_secret = bytes(st["wb_secret"])
+    state = whitebox_kdf.wb_state_c_array(wb_secret)
+    hdr_path = os.path.join(TMP_NATIVE, "whitebox_kdf.h")
+    with open(hdr_path, encoding="utf-8") as f:
+        s = f.read()
+    s = s.replace("#define WB_STATE {0,0,0,0,0,0,0,0}",
+                  "#define WB_STATE {%s}" % state)
+    with open(hdr_path, "w", encoding="utf-8") as f:
+        f.write(s)
+    print("[*] 白盒 KDF 已烘焙 WB_STATE 进 whitebox_kdf.h")
+
+
 def _build_native(st):
     shutil.rmtree(TMP_NATIVE, ignore_errors=True)
     shutil.copytree(NATIVE_SRC, TMP_NATIVE)
     _regen_vectors(st)
+    if st.get("wb_kdf"):
+        _bake_whitebox_kdf(st)
     for fn in NATIVE_COMPILE:
         p = os.path.join(TMP_NATIVE, fn)
         with open(p, encoding="utf-8", errors="ignore") as f:
@@ -392,6 +416,7 @@ def _build_native(st):
                 if abi == "arm64-v8a" or f not in _hook_files]
         subprocess.check_call(
             [clang, "--shared", "-fPIC", "-O2", "-o", out] + srcs +
+            (["-DWB_KDF"] if st.get("wb_kdf") else []) +
             ["-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
         print("[*] native 构建完成 (%s): %s" % (abi, out))
@@ -399,10 +424,10 @@ def _build_native(st):
         raise RuntimeError("未构建任何 ABI 的 native 库")
 
 
-def main():
+def main(wb_kdf=False):
     # 确保可写构建目录存在（冻结态 exe/build 是首次运行，目录尚不存在）
     os.makedirs(config.BUILD_DIR, exist_ok=True)
-    st = stamp.generate()
+    st = stamp.generate(wb_kdf=wb_kdf)
     stamp.write(stamp.STAMP_PATH, st)
     _build_java(st)
     _build_native(st)
