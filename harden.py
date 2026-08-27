@@ -608,7 +608,8 @@ def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
            ssl_pins=None, strengthen="log", rebuild_stub=True,
-           wb_kdf=False, antidump=False, antifrida=False, dex_obf=False):
+           wb_kdf=False, antidump=False, antifrida=False, dex_obf=False,
+           dex_rename=False, dex_cfg=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -647,12 +648,14 @@ def harden(input_apk, output_apk=None, keep=False,
     orig_dexes = read_dexes(input_apk, dex_names)
     _lap(sw, "收集DEX")
 
-    # 1.1) DEX 字符串加密（opt-in，默认关）：在加密进载荷 *之前* 改写 App 自身 DEX 的
-    #      const-string -> base64(XOR) + 调用解密器；解密器以独立 obf.dex 随载荷加载。
-    #      直接打掉 "JADX + LLM 读 DEX" 的语义来源，对被动 LLM 杠杆最大；不碰类名/方法名，
-    #      不触发 manifest/反射/JNI 崩坏。防 AI 静态逆向，非 "杜绝"（DEX 解密后明文常驻）。
-    if dex_obf:
-        print("[1.1] DEX 字符串加密（opt-in）：apktool 改写 smali 中 const-string ...")
+    # 1.1) DEX 混淆（L1 字符串加密 / L3 标识符重命名 / L2 弱控制流，全部 opt-in 默认关）：
+    #      在加密进载荷 *之前* 改写 App 自身 DEX。三者在同一 apktool decode 目录内串行跑。
+    #      - L1: const-string -> base64(XOR) + 调用解密器；不打类名/方法名。
+    #      - L3: App 自有包类/方法/字段改名（keep=组件+生命周期+native+布局View）；对抗静态 AI。
+    #      - L2: verifier 安全弱控制流（插无用条件分支+死块）；真·平坦化留给 B2(native/OLLVM)。
+    #      均非 "杜绝"（DEX 解密后明文常驻）；脆弱特性绝不默认开，需逐 App 真机验证。
+    if dex_obf or dex_rename or dex_cfg:
+        print("[1.1] DEX 混淆（opt-in）：apktool 改写 smali ...")
         # B3'：解密器类名每次加固随机化（消除固定静态锚点 Lcom/jiagu/obf/ObfStr;）
         dec_class = dex_obf_mod.gen_dec_class()
         try:
@@ -661,9 +664,14 @@ def harden(input_apk, output_apk=None, keep=False,
             print("  [warn] obf.dex 随机编译失败，回退固定解密器:", _e)
             dec_class = dex_obf_mod.DEC_CLASS
             obf_dex_bytes = dex_obf_mod.load_obf_dex()
-        orig_dexes, obf_count = dex_obf_mod.obfuscate_apk(input_apk, work, dec_class)
-        print("[1.1] 加密后 DEX 数:", len(orig_dexes), "改写 const-string 条数:", obf_count,
-              "解密器类:", dec_class)
+        orig_dexes, obf_stats = dex_obf_mod.obfuscate_apk(
+            input_apk, work, dec_class,
+            do_str=dex_obf, do_rename=dex_rename, do_cfg=dex_cfg)
+        print("[1.1] 混淆后 DEX 数:", len(orig_dexes),
+              "| L1 字符串:", obf_stats["str"],
+              "| L3 改名类:", obf_stats["rename_classes"], "改文件:", obf_stats["rename_files"],
+              "| L2 控制流方法:", obf_stats["cfg_methods"],
+              "| 解密器类:", dec_class)
 
     # 1.5) 原始 assets（可选加密剥离；默认关闭，避免运行时还原失败导致 App 缺资源）
     assets = []
@@ -834,6 +842,17 @@ def main():
                          "不触发 manifest/反射/JNI 崩坏。⚠ 诚实边界：这是「混淆」不是「加密」——"
                          "DEX 解密加载后明文常驻，攻击者跑起来即可抽；价值在抬高静态 AI 成本。"
                          "开关默认关，需真机验证无误杀后才用于生产。")
+    ap.add_argument("--dex-rename", action="store_true",
+                    help="DEX 标识符重命名（L3，opt-in，默认关闭）：把 App 自有包的类/方法/字段名改成"
+                         "无意义短名，对抗「JADX+LLM 输出变废话」。keep 集合=manifest 四大组件+Application"
+                         "生命周期回调+native 方法(JNI 符号绑定)+布局自定义 View，其余全改。⚠ keep 集合是"
+                         "误杀生死线；反射按字符串动态拼类名等不在 keep 范围，属已知风险。默认关，需逐 App"
+                         "真机验证不误杀后才用于生产。")
+    ap.add_argument("--dex-cfg", action="store_true",
+                    help="DEX 弱控制流混淆（L2，opt-in，默认关闭）：verifier 安全的弱版——给方法分配新"
+                         "寄存器并插入「无用条件分支+死块」，改变 CFG 形状、干扰线性反编译，但不影响语义、"
+                         "不崩 ART。⚠ 这是弱版，强度远低于 OLLVM；真·CFG 平坦化留给 B2(native/OLLVM)。"
+                         "默认关，需真机验证后才用于生产。")
     args = ap.parse_args()
     try:
         harden(args.input, args.output, args.keep,
@@ -846,7 +865,9 @@ def main():
                wb_kdf=args.wb_kdf,
                antidump=args.antidump,
                antifrida=args.antifrida,
-               dex_obf=args.dex_obf)
+               dex_obf=args.dex_obf,
+               dex_rename=args.dex_rename,
+               dex_cfg=args.dex_cfg)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
