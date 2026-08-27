@@ -607,7 +607,7 @@ def self_verify(out_apk, orig_dexes):
 def harden(input_apk, output_apk=None, keep=False,
            ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
            assets_encrypt=False, method_extract=False,
-           ssl_pins=None, strengthen="exit", rebuild_stub=True,
+           ssl_pins=None, strengthen="log", rebuild_stub=True,
            wb_kdf=False, antidump=False, antifrida=False, dex_obf=False):
     _t0 = time.time()
     sw = {"t": _t0}
@@ -799,12 +799,13 @@ def main():
     ap.add_argument("--pins", help="SSL 证书固定：host=sha256/Base64;host2=sha256/Base64（与 OkHttp "
                                     "CertificatePinner 同构）。例：api.example.com=sha256/ABCD... 。"
                                     "配置后壳在运行期做按主机证书固定，挡 root+系统证书 MITM。不指定则不启用。")
-    ap.add_argument("--strengthen", choices=["log", "exit"], default="exit",
-                    help="P0-A 统一响应姿态（覆盖壳默认 'log'）：exit=检测命中（root/模拟器/frida/"
-                         "代理/VPN/自校验失败）即退出进程；log=仅记日志不阻断（调试用）。"
-                         "⚠ exit 可能误杀部分正常设备（反调试/自校验 OEM 误报），生产发布前务必在"
-                         "目标机型（如华为 A10 / 小米 A9）真机验证；如需关闭用 --strengthen log。"
-                         "经 manifest meta 注入，运行期生效，无需重编 stub.dex。")
+    ap.add_argument("--strengthen", choices=["log", "exit"], default="log",
+                    help="P0-A 统一响应姿态（默认 'log'=仅记日志不阻断，调试/测试用；符合「脆弱特性"
+                         "绝不默认开」铁律）。exit=检测命中（root/模拟器/frida/代理/VPN/自校验失败）即"
+                         "退出进程，为生产强化选项，须显式开启。⚠ exit 会杀进程，在 root/模拟器/部分 OEM 机"
+                         "上会误杀正常 App（如 MIUI 自动重启前台 Activity 形成闪屏死循环）；生产发布前务必在"
+                         "目标机型（如华为 A10 / 小米 A9）真机验证。经 manifest meta 注入，运行期生效，"
+                         "无需重编 stub.dex。")
     ap.add_argument("--wb-kdf", action="store_true",
                     help="P0-B 真白盒密钥派生（opt-in，默认关闭）：把 HMAC(seed,msg) 再经一次以每构建"
                          "随机 wb_secret 预处理态为起点的 SHA256 融合，去除 .so 内连续 seed 字面量与可被"
