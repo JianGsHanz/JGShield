@@ -254,7 +254,8 @@ python harden.py input.apk --ks my.keystore --ksAlias myalias --ksPass <密码> 
    - 加固核心支持在把 App DEX 加密进载荷**之前**，把其中的 `const-string` 改写为 `base64(XOR(KEY))` 密文 + 调用解密器 `ObfStr.d`；解密器以独立 `obf.dex`（纯 java.lang，无 android 依赖）随载荷加载，与 App DEX 同一 classloader，运行时还原明文。
    - **直接打掉「JADX + LLM 读 DEX」的语义来源**，对被动 LLM 逆向杠杆最大；不碰类名/方法名，不触发 manifest/反射/JNI 崩坏。
    - **默认不开启**（CLI 需显式 `--dex-obf`）：因为这是对 App 业务 DEX 的改写，需真机验证「不误杀正常启动」后才用于生产。
-   - ⚠️ **诚实边界**：这是「混淆」不是「加密」——DEX 解密加载后明文常驻内存，攻击者跑起来即可抽；价值在抬高**静态** AI 逆向成本（让静态 JADX+LLM 直接读不到业务字符串），不杜绝动态抽取。解密器类名 `Lcom/jiagu/obf/ObfStr;` 在 v1 为稳妥未随机化。
+   - ⚠️ **诚实边界**：这是「混淆」不是「加密」——DEX 解密加载后明文常驻内存，攻击者跑起来即可抽；价值在抬高**静态** AI 逆向成本（让静态 JADX+LLM 直接读不到业务字符串），不杜绝动态抽取。
+   - **解密器类名每次加固随机化**（B3'）：`gen_dec_class()` 从模板实时 `javac+d8` 编译 obf.dex，类名形如 `La7F3k/pQ2xZ;`（包名+类名均随机，无 `com/jiagu/obf` 前缀）。消除固定静态锚点 `Lcom/jiagu/obf/ObfStr;`（逆向者 grep `ObfStr;->d` 即可定位全部解密点），与壳指纹随机化（P7）同源思路。随机编译失败才回退固定名。
 
 ---
 

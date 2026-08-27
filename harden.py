@@ -653,8 +653,17 @@ def harden(input_apk, output_apk=None, keep=False,
     #      不触发 manifest/反射/JNI 崩坏。防 AI 静态逆向，非 "杜绝"（DEX 解密后明文常驻）。
     if dex_obf:
         print("[1.1] DEX 字符串加密（opt-in）：apktool 改写 smali 中 const-string ...")
-        orig_dexes, obf_count = dex_obf_mod.obfuscate_apk(input_apk, work)
-        print("[1.1] 加密后 DEX 数:", len(orig_dexes), "改写 const-string 条数:", obf_count)
+        # B3'：解密器类名每次加固随机化（消除固定静态锚点 Lcom/jiagu/obf/ObfStr;）
+        dec_class = dex_obf_mod.gen_dec_class()
+        try:
+            obf_dex_bytes = dex_obf_mod.compile_obf_dex(dec_class, work)
+        except Exception as _e:
+            print("  [warn] obf.dex 随机编译失败，回退固定解密器:", _e)
+            dec_class = dex_obf_mod.DEC_CLASS
+            obf_dex_bytes = dex_obf_mod.load_obf_dex()
+        orig_dexes, obf_count = dex_obf_mod.obfuscate_apk(input_apk, work, dec_class)
+        print("[1.1] 加密后 DEX 数:", len(orig_dexes), "改写 const-string 条数:", obf_count,
+              "解密器类:", dec_class)
 
     # 1.5) 原始 assets（可选加密剥离；默认关闭，避免运行时还原失败导致 App 缺资源）
     assets = []
@@ -724,8 +733,9 @@ def harden(input_apk, output_apk=None, keep=False,
     if dex_obf:
         # 解密器 obf.dex 以独立条目随载荷加载（与 App DEX 同一 classloader），运行时被
         # App 的 const-string->ObfStr.d 调用解析。不做方法抽取（否则破坏解密器自身）。
-        extracted_dexes.append(dex_obf_mod.load_obf_dex())
-        print("[3.1*] 注入解密器 obf.dex（随载荷加载，不方法抽取）")
+        # 类名已在 step1.1 随机化（B3'），obf_dex_bytes 与 smali 引用保持一致。
+        extracted_dexes.append(obf_dex_bytes)
+        print("[3.1*] 注入解密器 obf.dex（随载荷加载，类 %s，不方法抽取）" % dec_class)
     payload = build_payload(seed, extracted_dexes, assets if assets else None,
                             method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
