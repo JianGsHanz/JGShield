@@ -80,3 +80,4 @@ _nofla.*
 android-ndk-*.zip
 llvm-project-llvmorg-*/
 ollvm-14/
+tools/gen_security_keys.py
