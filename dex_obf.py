@@ -49,10 +49,14 @@ D8_JAR = os.path.join(config.TOOLS, "d8.jar")
 
 
 def _javac_path():
-    """从 config.JAVA(java.exe) 派生同目录 javac.exe。"""
+    """从 config.JAVA 派生同目录 javac（平台正确命名：java.exe→javac.exe / java→javac）。"""
     j = config.JAVA
     if j and os.path.basename(j).lower().startswith("java"):
-        return os.path.join(os.path.dirname(j), "javac.exe")
+        # 不能硬编码 .exe（macOS/Linux 的 java 无扩展名）；按 java 的实际命名派生
+        _name = "javac.exe" if j.lower().endswith(".exe") else "javac"
+        _c = os.path.join(os.path.dirname(j), _name)
+        if os.path.isfile(_c):
+            return _c
     return "javac"  # PATH 回退
 
 

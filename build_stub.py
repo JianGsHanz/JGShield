@@ -530,7 +530,14 @@ def _build_native(st):
             # 该 OLLVM NDK 为 clang18，隐含函数声明默认按错误论处；原壳源码 jg_inline_hook.c
             # 用到 process_vm_writev（NDK25/clang14 仅告警）在此变硬错。加 -Wno-error 仅降级该告警，
             # 不改壳源码语义，使 OLLVM 路径可编译（行为等价于旧 NDK）。
-            obf_flags = OLLVM_PASS_NAMES + ["-Wno-error=implicit-function-declaration"]
+            obf_flags = OLLVM_PASS_NAMES + [
+                "-Wno-error=implicit-function-declaration",
+                # -unwindlib=none 必须显式给：upstream clang 对 Android 目标默认
+                # rtlib=compiler-rt（ToolChain::GetDefaultRuntimeLibType）→ 链接时无条件
+                # 追加 -l:libunwind.a，而 NDK r23+ sysroot 没有它（Ubuntu VM 实锤）。
+                # 壳 .so 是纯 C 无异常，不依赖 libunwind；-unwindlib 自 clang8 起都支持。
+                "-unwindlib=none",
+            ]
             obf_tag = " [OLLVM]"
         else:
             clang = os.path.join(CLANG_DIR, clang_name)
