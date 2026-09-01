@@ -145,8 +145,8 @@ class JGShieldApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("JGShield — APK 一键加固工具")
-        self.geometry("980x680")
-        self.minsize(880, 600)
+        self.geometry("1020x800")
+        self.minsize(920, 680)
         self.configure(bg=C_BG)
 
         self.log_queue = queue.Queue()
@@ -201,11 +201,12 @@ class JGShieldApp(tk.Tk):
         ttk.Label(top, text="  APK 差异化一键加固（AES-256-GCM · 自定义载荷 · 签名绑定）",
                   style="Sub.TLabel").pack(side="left", padx=(2, 0), pady=(6, 0))
 
+        # 底部：进度 + 日志（必须先于卡片打包并钉在 side="bottom"：
+        # 卡片内容随功能增多变高，若控制台后打包会被整体挤出窗口可视区——踩过）
+        self._build_console()
+
         # 加固卡片（单页）
         self._build_harden_tab(self)
-
-        # 底部：进度 + 日志
-        self._build_console()
 
     def _card(self, parent):
         """返回一个带边框的白色卡片 Frame。"""
@@ -249,7 +250,7 @@ class JGShieldApp(tk.Tk):
         row.pack(fill="x")
         ttk.Label(row, text="密钥库", style="Card.TLabel", width=10).pack(side="left")
         self.ks_var = tk.StringVar()
-        # 签名证书历史：用过的 keystore 都记录，下拉即选（路径/别名始终存，密码仅勾“记住”才存）
+        # 签名证书历史：用过的 keystore 全量记录（路径/别名/密码），下拉即选自动回填
         self.ks_history = []   # [{ks, alias, ksPass?, ksKeyPass?}]，最新在前，最多 8 条
         self.ks_combo = ttk.Combobox(row, textvariable=self.ks_var)
         self.ks_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -295,15 +296,15 @@ class JGShieldApp(tk.Tk):
                    command=lambda: self.ollvm_ndk_var.set(filedialog.askdirectory(
                        title="选择 OLLVM NDK 的 bin 目录", parent=self,
                        initialdir=os.path.dirname(DEFAULT_OLLVM_NDK) or ROOT))).pack(side="left")
-        row = ttk.Frame(card, style="Card.TFrame")
-        row.pack(fill="x", pady=(2, 0))
-        ttk.Label(row, text="passes", style="Card.TLabel", width=10).pack(side="left")
+        ttk.Label(row, text="passes", style="Card.TLabel").pack(side="left", padx=(8, 0))
         self.ollvm_passes_var = tk.StringVar(value="sub,sobf")
-        self.ollvm_passes_entry = ttk.Entry(row, textvariable=self.ollvm_passes_var, width=24)
-        self.ollvm_passes_entry.pack(side="left", padx=(0, 10))
-        ttk.Label(row, text="空格/逗号分隔；本 NDK 仅 -sub/-sobf 可用，-fla/-bcf 会崩",
-                  style="CardMuted.TLabel").pack(side="left")
+        self.ollvm_passes_entry = ttk.Entry(row, textvariable=self.ollvm_passes_var, width=12)
+        self.ollvm_passes_entry.pack(side="left")
         self._toggle_ollvm()
+        ttk.Label(card,
+                  text="作用域：仅混淆 JGShield 壳 libjgguard.so（DEX 加壳 / 反调试 / 反篡改逻辑），"
+                       "不会改动你自己的 App 代码（如 security_key.cpp）。",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(4, 0))
 
         # 远端 OLLVM（路线 B：SSH 中转，可启用 -fla/-bcf 控制流混淆）
         ttk.Label(card, text="远端 OLLVM（SSH 中转，可启用 -fla/-bcf 控制流混淆）",
@@ -329,31 +330,16 @@ class JGShieldApp(tk.Tk):
         self.ollvm_remote_ndk_var = tk.StringVar(value=DEFAULT_OLLVM_REMOTE_NDK)
         self.ollvm_remote_ndk_entry = ttk.Entry(row, textvariable=self.ollvm_remote_ndk_var)
         self.ollvm_remote_ndk_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Label(row, text="远端 Linux 绝对路径", style="CardMuted.TLabel").pack(side="left")
-        row = ttk.Frame(card, style="Card.TFrame")
-        row.pack(fill="x", pady=(2, 0))
-        ttk.Label(row, text="passes", style="Card.TLabel", width=10).pack(side="left")
+        ttk.Label(row, text="passes", style="Card.TLabel").pack(side="left")
         self.ollvm_remote_passes_var = tk.StringVar(value="sub,sobf,fla,bcf")
-        self.ollvm_remote_passes_entry = ttk.Entry(row, textvariable=self.ollvm_remote_passes_var, width=24)
-        self.ollvm_remote_passes_entry.pack(side="left", padx=(0, 10))
-        ttk.Label(row, text="clang14 四件套全可用：-sub/-sobf/-fla/-bcf",
-                  style="CardMuted.TLabel").pack(side="left")
+        self.ollvm_remote_passes_entry = ttk.Entry(row, textvariable=self.ollvm_remote_passes_var, width=16)
+        self.ollvm_remote_passes_entry.pack(side="left")
         self._toggle_ollvm_remote()
-
-        # 按钮
-        row = ttk.Frame(card, style="Card.TFrame")
-        row.pack(fill="x", pady=(10, 0))
-        self.btn_harden = tk.Button(row, text="🚀  开始加固", bg=C_PRIMARY, fg="white",
-                                    activebackground=C_PRIMARY_D, activeforeground="white",
-                                    relief="flat", cursor="hand2", height=2, width=18,
-                                    font=("Microsoft YaHei UI", 11, "bold"),
-                                    command=self.start_harden)
-        self.btn_harden.pack(side="left")
 
         # 说明
         ttk.Label(card,
                   text="单个模式：输出 hardened_<原名>.apk 到输出目录。  批量模式：加固目录下全部 APK 并逐个静态自检。",
-                  style="CardMuted.TLabel").pack(side="left", padx=(12, 0), pady=(14, 0))
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(12, 0))
 
         self._toggle_harden_mode()
 
@@ -380,7 +366,7 @@ class JGShieldApp(tk.Tk):
     # ---- 底部控制台 ----
     def _build_console(self):
         bot = ttk.Frame(self)
-        bot.pack(fill="both", expand=False, padx=18, pady=(6, 12))
+        bot.pack(side="bottom", fill="x", expand=False, padx=18, pady=(6, 12))
 
         bar = ttk.Frame(bot)
         bar.pack(fill="x")
@@ -389,6 +375,13 @@ class JGShieldApp(tk.Tk):
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel",
                   width=14).pack(side="left", padx=(10, 0))
+        # 开始加固按钮放控制台栏（卡片再高也永远可见可点）
+        self.btn_harden = tk.Button(bar, text="🚀  开始加固", bg=C_PRIMARY, fg="white",
+                                    activebackground=C_PRIMARY_D, activeforeground="white",
+                                    relief="flat", cursor="hand2", width=14,
+                                    font=("Microsoft YaHei UI", 10, "bold"),
+                                    command=self.start_harden)
+        self.btn_harden.pack(side="right", padx=(8, 0))
         self.btn_stop = tk.Button(bar, text="停止", bg=C_ERR, fg="white",
                                   relief="flat", cursor="hand2", width=6, height=1,
                                   state="disabled", command=self.stop_task)
@@ -726,12 +719,11 @@ class JGShieldApp(tk.Tk):
             passes = self.ollvm_passes_var.get().strip()
             if passes:
                 ollvm_args += ["--ollvm-passes", passes]
-        # 记录签名证书历史（用过的都存；勾“记住”才连密码一起存，与设置持久化同一隐私口径）
+        # 记录签名证书历史（用过的全量保存：路径+别名+密码，选中即完整回填。
+        # 注意：jiagu_settings.json 是明文本地文件，与"记住签名信息"同一风险等级）
         if ks:
-            rec = {"ks": ks, "alias": ks_alias}
-            if self.remember_sign.get():
-                rec["ksPass"] = ks_pass
-                rec["ksKeyPass"] = ks_keypass
+            rec = {"ks": ks, "alias": ks_alias,
+                   "ksPass": ks_pass, "ksKeyPass": ks_keypass}
             self.ks_history = [r for r in self.ks_history
                                if not (r.get("ks") == ks and r.get("alias", "") == ks_alias)]
             self.ks_history.insert(0, rec)

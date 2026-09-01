@@ -13,6 +13,7 @@ output/
 # ---- Temp & scratch ----
 temp/
 work/
+backup/
 _wk/
 _batch_b2.txt
 test_repack.py
