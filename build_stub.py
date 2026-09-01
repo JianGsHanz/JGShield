@@ -19,6 +19,7 @@ build_stub.py - 按 stamp 随机化并（重）构建壳产物。
 import json
 import glob
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -572,21 +573,29 @@ def _build_native_remote(st):
     if not ndk_bin:
         raise RuntimeError("远端 OLLVM 模式已启用，但未设置 JGSHIELD_OLLVM_REMOTE_NDK_BIN"
                            "（远端已注入 OLLVM 的 NDK bin 目录）")
+    # 远端是 Linux：路径一律按 posix 处理。用户在 Windows GUI 里可能粘贴含反斜杠的
+    # 路径，且 os.path.join 在 Windows 上会拼出 '\'，拼进远端 shell 命令必然失败
+    # （踩过的坑：预检 ls -l .../bin\aarch64-linux-android21-clang 直接 exit 2）。
+    ndk_bin = ndk_bin.replace("\\", "/").rstrip("/")
     ssh, scp = _remote_bins()
     obf_flags = _resolve_ollvm_remote_passes() + ["-Wno-error=implicit-function-declaration"]
     # sysroot：默认按 <远端 NDK bin>/../sysroot 推导（NDK 标准布局），可用环境变量覆盖
     sysroot = _resolve_ollvm_remote_sysroot()
     if not sysroot:
-        sysroot = os.path.dirname(ndk_bin.rstrip("/\\")) + "/sysroot"
+        sysroot = posixpath.dirname(ndk_bin) + "/sysroot"
 
     token = "jgshield_%d" % os.getpid()
     remote_base = "~/jgshield_remote/%s" % token
-    remote_native = remote_base + "/TMP_NATIVE"  # scp -r TMP_NATIVE 落位到 remote_base/TMP_NATIVE
+    # scp -r <本地目录> host:<remote_base> 是把「目录本身」拷进 remote_base，
+    # 落位名 = 本地目录的 basename（native_tmp），而不是我们假想的 TMP_NATIVE。
+    # 远端路径必须按 basename 拼，否则 cd 失败 → && 短路 → 静默 exit 1，
+    # 编译器一行报错都看不到（踩过的坑，只能靠端到端跑才暴露）。
+    remote_native = remote_base + "/" + os.path.basename(TMP_NATIVE.rstrip("/\\"))
 
     # 0) 建远端目录（父目录必须先存在，否则首次运行 scp -r 会失败）
     _run_remote([ssh, "-p", port, host, "mkdir -p %s" % remote_base])
     # 0.1) 预检：远端 clang 是否存在（早失败，别等 4 次编译才报错）
-    _probe = os.path.join(ndk_bin, _REMOTE_CLANG["arm64-v8a"])
+    _probe = posixpath.join(ndk_bin, _REMOTE_CLANG["arm64-v8a"])
     _run_remote([ssh, "-p", port, host, "ls -l %s && ls -d %s" % (_probe, sysroot)])
 
     # 1) 传随机化后的源码到远端
@@ -595,7 +604,7 @@ def _build_native_remote(st):
     # 2) 逐 ABI 远端编译 + 回传
     built = 0
     for abi in _REMOTE_CLANG:
-        clang = os.path.join(ndk_bin, _REMOTE_CLANG[abi])
+        clang = posixpath.join(ndk_bin, _REMOTE_CLANG[abi])
         srcs = [f for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _HOOK_FILES]
         out_name = "lib%s.so" % st["lib_name"]

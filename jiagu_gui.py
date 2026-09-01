@@ -41,6 +41,14 @@ ADB_DIR = os.path.dirname(config.ADB) if os.path.isfile(config.ADB) else ""
 # OLLVM NDK 的 bin 目录默认值（用户自编译 OLLVM clang 版；本机固定路径）
 DEFAULT_OLLVM_NDK = r"D:/Android/AndoridSDK/ndk/27.2.12479018/toolchains/llvm/prebuilt/windows-x86_64/bin"
 
+# 远端 OLLVM（路线 B）默认值：Ubuntu VM 上已注入 OLLVM14 的 NDK r25b
+# 实测通过（2026-09-01）：ssh abs@172.16.139.128 免密可达，clang 14.0.6，
+# -fla/-bcf/-sub/-sobf 四件套对 aarch64-linux-android21 编译+链接全通。
+# 注意：VM 走 VMware NAT，IP 由 DHCP 分配，若改过 IP 需同步改这里。
+DEFAULT_OLLVM_REMOTE_HOST = "abs@172.16.139.128"
+DEFAULT_OLLVM_REMOTE_PORT = "22"
+DEFAULT_OLLVM_REMOTE_NDK = "/home/abs/android-ndk-r25b/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
 # 配色（light 主题）
 C_BG       = "#f4f5f7"
 C_CARD     = "#ffffff"
@@ -301,17 +309,17 @@ class JGShieldApp(tk.Tk):
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x", pady=(4, 2))
         ttk.Label(row, text="SSH host", style="Card.TLabel", width=10).pack(side="left")
-        self.ollvm_remote_host_var = tk.StringVar(value="")
+        self.ollvm_remote_host_var = tk.StringVar(value=DEFAULT_OLLVM_REMOTE_HOST)
         self.ollvm_remote_host_entry = ttk.Entry(row, textvariable=self.ollvm_remote_host_var)
         self.ollvm_remote_host_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Label(row, text="port", style="Card.TLabel", width=5).pack(side="left")
-        self.ollvm_remote_port_var = tk.StringVar(value="22")
+        self.ollvm_remote_port_var = tk.StringVar(value=DEFAULT_OLLVM_REMOTE_PORT)
         self.ollvm_remote_port_entry = ttk.Entry(row, textvariable=self.ollvm_remote_port_var, width=6)
         self.ollvm_remote_port_entry.pack(side="left")
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x", pady=(2, 0))
         ttk.Label(row, text="远端 NDK bin", style="Card.TLabel", width=10).pack(side="left")
-        self.ollvm_remote_ndk_var = tk.StringVar(value="")
+        self.ollvm_remote_ndk_var = tk.StringVar(value=DEFAULT_OLLVM_REMOTE_NDK)
         self.ollvm_remote_ndk_entry = ttk.Entry(row, textvariable=self.ollvm_remote_ndk_var)
         self.ollvm_remote_ndk_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Label(row, text="远端 Linux 绝对路径", style="CardMuted.TLabel").pack(side="left")
