@@ -218,19 +218,24 @@ _STAMP_PATH = os.path.join(BUILD_DIR, "stamp.json")
 def apply_stamp(st):
     global MAGIC, META_ORIG, META_SSL_PINS, META_STRENGTHEN, SHELL_APP, PAYLOAD_ENTRY, LIB_NAME
     global SHELL_DEX_ENTRY, BOOTSTRAP_APP, KEY_PREFIX, WB_KDF, WB_SECRET, META_ANTIDUMP, META_ANTIFRIDA
+    # 兼容旧 stamp.json：后加的键一律 .get() 兜底——exe 同级 build/ 里可能残留旧版
+    # stamp.json（如 8/25 旧构建缺 meta_antidump/key_prefix/wb_*），硬下标会让 exe
+    # 启动 import 阶段即 KeyError（踩过：KeyError 'meta_antidump'）。核心键
+    # （magic/meta_orig/meta_ssl/meta_strengthen/pkg）P1 时代就有，仍用硬下标。
     MAGIC = st["magic"].encode("utf-8") if isinstance(st["magic"], str) else st["magic"]
     META_ORIG = st["meta_orig"]
     META_SSL_PINS = st["meta_ssl"]
     META_STRENGTHEN = st["meta_strengthen"]
-    META_ANTIDUMP = st["meta_antidump"]
-    META_ANTIFRIDA = st["meta_antifrida"]
-    SHELL_APP = st["pkg"] + "." + st["classes"]["GxApp"]
-    PAYLOAD_ENTRY = st["payload_entry"]
-    LIB_NAME = st["lib_name"]
-    SHELL_DEX_ENTRY = st["shell_dex_entry"]
-    BOOTSTRAP_APP = st["pkg"] + "." + st["classes"]["GxBootstrap"]
-    KEY_PREFIX = st["key_prefix"].encode("utf-8")
-    WB_KDF = bool(st["wb_kdf"])
+    META_ANTIDUMP = st.get("meta_antidump", META_ANTIDUMP)
+    META_ANTIFRIDA = st.get("meta_antifrida", META_ANTIFRIDA)
+    _classes = st.get("classes", {})
+    SHELL_APP = st["pkg"] + "." + _classes.get("GxApp", "GxApp")
+    BOOTSTRAP_APP = st["pkg"] + "." + _classes.get("GxBootstrap", "GxBootstrap")
+    PAYLOAD_ENTRY = st.get("payload_entry", PAYLOAD_ENTRY)
+    LIB_NAME = st.get("lib_name", LIB_NAME)
+    SHELL_DEX_ENTRY = st.get("shell_dex_entry", SHELL_DEX_ENTRY)
+    KEY_PREFIX = st.get("key_prefix", KEY_PREFIX.decode("utf-8")).encode("utf-8")
+    WB_KDF = bool(st.get("wb_kdf", False))
     WB_SECRET = bytes(st["wb_secret"]) if st.get("wb_secret") else b""
 
 
