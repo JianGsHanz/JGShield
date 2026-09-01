@@ -14,6 +14,7 @@ import queue
 import threading
 import subprocess
 import re
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -130,8 +131,10 @@ def _force_utf8_stdio():
         if s is None:
             continue
         try:
-            s.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError, OSError):
+            # line_buffering=True：windowed 冻结子进程的 stdout 是块缓冲管道，
+            # 不强制行缓冲会让 GUI 日志憋成大块、长时间看不到（踩过：加固日志不显示）。
+            s.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError, OSError, TypeError):
             pass
 
 
@@ -246,7 +249,11 @@ class JGShieldApp(tk.Tk):
         row.pack(fill="x")
         ttk.Label(row, text="密钥库", style="Card.TLabel", width=10).pack(side="left")
         self.ks_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.ks_var).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        # 签名证书历史：用过的 keystore 都记录，下拉即选（路径/别名始终存，密码仅勾“记住”才存）
+        self.ks_history = []   # [{ks, alias, ksPass?, ksKeyPass?}]，最新在前，最多 8 条
+        self.ks_combo = ttk.Combobox(row, textvariable=self.ks_var)
+        self.ks_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.ks_combo.bind("<<ComboboxSelected>>", self._on_ks_selected)
         ttk.Button(row, text="浏览…", width=8,
                    command=lambda: self.ks_var.set(filedialog.askopenfilename(
                        title="选择密钥库", parent=self,
@@ -440,8 +447,13 @@ class JGShieldApp(tk.Tk):
 
     # ----------------------------- 日志 -------------------------------------
     def _log(self, text, tag=None):
+        """带时间戳写日志：每行前缀 [HH:MM:SS]，多行输入逐行打戳。"""
+        ts = time.strftime("[%H:%M:%S] ")
+        if not text.endswith("\n"):
+            text += "\n"
         self.log.configure(state="normal")
-        self.log.insert("end", text if text.endswith("\n") else text + "\n", tag)
+        for ln in text.rstrip("\n").split("\n"):
+            self.log.insert("end", ts + ln + "\n", tag)
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -510,6 +522,11 @@ class JGShieldApp(tk.Tk):
                 if d.get("ks_keypass") is not None: self.ks_keypass_var.set(d["ks_keypass"])
             except Exception:
                 pass
+        # 签名证书历史（路径/别名始终回填；密码仅在记录时勾了“记住”才存在）
+        hist = d.get("sign_history")
+        if isinstance(hist, list):
+            self.ks_history = [h for h in hist if isinstance(h, dict) and h.get("ks")]
+            self._refresh_ks_combo()
 
     def _save_settings(self):
         """保存当前配置。勾选“记住”则连同密码一起存；否则只存路径类字段并清掉密码。"""
@@ -528,6 +545,7 @@ class JGShieldApp(tk.Tk):
             "ollvm_remote_port": self.ollvm_remote_port_var.get().strip(),
             "ollvm_remote_ndk": self.ollvm_remote_ndk_var.get().strip(),
             "ollvm_remote_passes": self.ollvm_remote_passes_var.get().strip(),
+            "sign_history": self.ks_history,
         }
         if remember:
             d["ks"] = self.ks_var.get().strip()
@@ -539,6 +557,29 @@ class JGShieldApp(tk.Tk):
                 json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    # --------------------------- 签名证书历史 -------------------------------
+    def _ks_display(self, rec):
+        """下拉框显示文案：文件名 · 别名。"""
+        base = os.path.basename(rec.get("ks", "").replace("\\", "/"))
+        alias = rec.get("alias", "")
+        return base + (" · " + alias if alias else base)
+
+    def _refresh_ks_combo(self):
+        self.ks_combo["values"] = [self._ks_display(r) for r in self.ks_history]
+
+    def _on_ks_selected(self, _event=None):
+        """下拉选中一条历史 → 自动回填路径/别名/密码（密码仅当记录里存了才回填）。"""
+        i = self.ks_combo.current()
+        if not (0 <= i < len(self.ks_history)):
+            return
+        r = self.ks_history[i]
+        self.ks_var.set(r.get("ks", ""))
+        self.ks_alias_var.set(r.get("alias", ""))
+        if r.get("ksPass"):
+            self.ks_pass_var.set(r["ksPass"])
+        if r.get("ksKeyPass"):
+            self.ks_keypass_var.set(r["ksKeyPass"])
 
     def _classify(self, line):
         l = line
@@ -575,6 +616,7 @@ class JGShieldApp(tk.Tk):
             messagebox.showwarning("提示", "已有任务在运行，请先停止。", parent=self)
             return
         self._set_running(True, label + "…")
+        self._run_t0 = time.time()
         self._log("════════════════════════════════════════════════════", "head")
         self._log("▶ %s" % label, "head")
         self._log("$ " + self._format_cmd(cmd), "muted")
@@ -619,11 +661,12 @@ class JGShieldApp(tk.Tk):
                     self._log(data, self._classify(data))
                 elif kind == "done":
                     rc = data
+                    cost = time.time() - getattr(self, "_run_t0", time.time())
                     if rc == 0:
-                        self._log("✔ 任务完成（退出码 0）", "ok")
+                        self._log("✔ 任务完成（退出码 0）· 总耗时 %.1f 秒" % cost, "ok")
                         self._set_running(False, "完成")
                     else:
-                        self._log("✘ 任务结束，退出码 %s" % rc, "err")
+                        self._log("✘ 任务结束，退出码 %s · 已耗时 %.1f 秒" % (rc, cost), "err")
                         self._set_running(False, "失败")
                 elif kind == "err":
                     self._log("✘ 执行异常：%s" % data, "err")
@@ -683,6 +726,17 @@ class JGShieldApp(tk.Tk):
             passes = self.ollvm_passes_var.get().strip()
             if passes:
                 ollvm_args += ["--ollvm-passes", passes]
+        # 记录签名证书历史（用过的都存；勾“记住”才连密码一起存，与设置持久化同一隐私口径）
+        if ks:
+            rec = {"ks": ks, "alias": ks_alias}
+            if self.remember_sign.get():
+                rec["ksPass"] = ks_pass
+                rec["ksKeyPass"] = ks_keypass
+            self.ks_history = [r for r in self.ks_history
+                               if not (r.get("ks") == ks and r.get("alias", "") == ks_alias)]
+            self.ks_history.insert(0, rec)
+            del self.ks_history[8:]
+            self._refresh_ks_combo()
         # 保存当前配置（含签名信息，若勾选了“记住”）
         self._save_settings()
         if not inp:
