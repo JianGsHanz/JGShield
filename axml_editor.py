@@ -290,7 +290,25 @@ _ANDROID_ATTR_RES = {
 }
 
 
-def _rebuild_resource_map(data, pool_start, strings):
+def _read_original_rm(data, pool_start):
+    """
+    读取二进制 AXML 中【已有的】ResourceMap，返回按字符串索引排列的资源 ID 列表。
+
+    用于重建时「保留原包 RM」，避免手填字典遗漏属性导致 RM 条目被清零
+    （曾因此把 grantUriPermissions 置 0 → PackageManager 认不出该属性 →
+     默认 grantUriPermissions=false → FileProvider 启动即崩）。
+    """
+    pool_chunk_size = struct.unpack_from('<I', data, pool_start + 4)[0]
+    rm_pos = pool_start + pool_chunk_size
+    if rm_pos + 8 <= len(data) and struct.unpack_from('<I', data, rm_pos)[0] == CHUNK_RESOURCE_MAP:
+        rm_size = struct.unpack_from('<I', data, rm_pos + 4)[0]
+        cnt = (rm_size - 8) // 4
+        body = rm_pos + 8
+        return [struct.unpack_from('<I', data, body + i * 4)[0] for i in range(cnt)]
+    return None
+
+
+def _rebuild_resource_map(data, pool_start, strings, original_rm=None):
     """
     重建 ResourceMap：按「属性名的字符串池索引」建立 资源ID 映射。
 
@@ -301,18 +319,18 @@ def _rebuild_resource_map(data, pool_start, strings):
       （见 _ref/ref.apk：RM=[0x01010003,0x01010001,0x01010024]，
        分别落在 name/label/value 三个字符串索引 0/1/2 处）。
 
-      旧实现按文档属性顺序 1:1 生成 RM，导致 meta-data 的 android:name
-      属性（name 字符串索引=5）被映射到 RM[5]（恰好是 minSdkVersion 的资源 ID），
-      getAttributeNameResource 返回 0x0101000C 而非 0x01010003，
-      PackageParser.parseMetaData 判定「缺少 android:name」→
-      INSTALL_PARSE_FAILED_MANIFEST_MALFORMED。
+      **铁律：必须保留原包 RM，仅对新增属性名补条目。**
+      原包的 RM 由 aapt 编出、权威正确（含 grantUriPermissions=0x0101001B 等
+      手填字典无法覆盖的取值）。若用本地不完整字典从零重建，所有未收录的属性
+      （grantUriPermissions / readPermission / 各种自定义/框架属性）会被置 0，
+      严格安装器按资源 ID 匹配时认不出 → 默认 false/缺失 → 运行期崩溃。
+      因此：遍历最终文档时，name 索引若在原 RM 中有非零值，直接沿用原值；
+      仅当原 RM 未覆盖（真正新增的属性名）才查本地字典兜底。
 
-      修正：遍历最终文档，为每个属性按其「name 字段的字符串索引」填入框架
-      资源 ID（name→0x01010003 / value→0x01010024 / label→0x01010001 …），
-      RM 数组长度 = (最大 name 字符串索引 + 1)，位置严格对齐字符串索引。
-      这样 meta-data 的 android:name 必被正确解析。
+      meta-data 的 android:name/value 在字符串池中本就存在，其索引在原 RM 中
+      已是正确值（0x01010003 / 0x01010024），保留原 RM 即天然正确解析。
     """
-    # 1. 收集 name 字符串索引 -> 资源 ID
+    # 1. 收集 name 字符串索引 -> 资源 ID（优先沿用原 RM，字典仅兜底）
     res_by_name_idx = {}
     p = _find_xml_start(data, pool_start)
     while p + 8 <= len(data):
@@ -327,7 +345,10 @@ def _rebuild_resource_map(data, pool_start, strings):
                 if nm >= 0x01000000:
                     # 已是资源 ID（aapt 实际不这么写，防御性跳过，不占 RM 位置）
                     continue
-                if nm < len(strings):
+                # 优先用原 RM 中该索引的正确值
+                if original_rm is not None and nm < len(original_rm) and original_rm[nm] != 0:
+                    rid = original_rm[nm]
+                elif nm < len(strings):
                     rid = _ANDROID_ATTR_RES.get(strings[nm], 0)
                 else:
                     rid = 0
@@ -337,9 +358,19 @@ def _rebuild_resource_map(data, pool_start, strings):
     if not res_by_name_idx:
         return False
 
+    # RM 长度须覆盖原 RM 与最终文档中出现的最大索引
     max_idx = max(res_by_name_idx.keys())
     new_len = max_idx + 1
+    if original_rm is not None:
+        new_len = max(new_len, len(original_rm))
+
     rm_body = [0] * new_len
+    # 先铺原 RM（保证未显式出现的索引也保留原值）
+    if original_rm is not None:
+        for i, v in enumerate(original_rm):
+            if i < new_len:
+                rm_body[i] = v
+    # 再用最终文档的映射覆盖（原 RM 非零优先已在上面 rid 中处理，这里再 ensure）
     for idx, rid in res_by_name_idx.items():
         if idx < new_len:
             rm_body[idx] = rid
@@ -606,6 +637,9 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
     pool_info = _parse_string_pool(data, pool_start)
     strings = pool_info['strings']
     is_utf8 = pool_info['is_utf8']
+
+    # 1.2 读取原包 ResourceMap（重建时须保留，避免清零 grantUriPermissions 等属性）
+    original_rm = _read_original_rm(data, pool_start)
 
     # 1.5 ResourceMap 按「最终文档顺序」重建，须在全部 meta-data 注入后执行
     #     （见末尾调用），此处仅占位说明。
@@ -893,7 +927,7 @@ def patch_manifest(manifest_data, orig_app_class, shell_app_class=config.SHELL_A
     #     严格安装器按 RM[i] 取第 i 个属性的资源 ID；原包 RM 只覆盖原属性，
     #     注入的 meta-data 位于其后会越界解析不到 → INSTALL_PARSE_FAILED_*
     #     重建后 meta-data 的 name=0x01010003 / value=0x01010024 必被正确解析。
-    _rebuild_resource_map(data, pool_start, strings)
+    _rebuild_resource_map(data, pool_start, strings, original_rm)
 
     #   文件尾部补齐
     while len(data) % 4 != 0:

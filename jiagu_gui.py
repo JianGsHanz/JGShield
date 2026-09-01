@@ -38,6 +38,9 @@ else:
 # adb 所在目录
 ADB_DIR = os.path.dirname(config.ADB) if os.path.isfile(config.ADB) else ""
 
+# OLLVM NDK 的 bin 目录默认值（用户自编译 OLLVM clang 版；本机固定路径）
+DEFAULT_OLLVM_NDK = r"D:/Android/AndoridSDK/ndk/27.2.12479018/toolchains/llvm/prebuilt/windows-x86_64/bin"
+
 # 配色（light 主题）
 C_BG       = "#f4f5f7"
 C_CARD     = "#ffffff"
@@ -260,6 +263,68 @@ class JGShieldApp(tk.Tk):
         ttk.Checkbutton(row, text="记住签名信息（保存到 exe 同目录 jiagu_settings.json，含密码明文）",
                         variable=self.remember_sign, style="Card.TCheckbutton").pack(side="left")
 
+        # OLLVM 原生混淆（可选）
+        ttk.Label(card, text="OLLVM 原生混淆（可选，对抗熟悉开源方案的逆向者）",
+                  style="Card.TLabel").pack(anchor="w", pady=(12, 2))
+        self.ollvm_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(card, text="启用 OLLVM（指令替换 -sub + 字符串加密 -sobf）",
+                        variable=self.ollvm_on, style="Card.TCheckbutton",
+                        command=self._toggle_ollvm).pack(anchor="w")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(4, 2))
+        ttk.Label(row, text="OLLVM NDK", style="Card.TLabel", width=10).pack(side="left")
+        self.ollvm_ndk_var = tk.StringVar(value=DEFAULT_OLLVM_NDK)
+        self.ollvm_ndk_entry = ttk.Entry(row, textvariable=self.ollvm_ndk_var)
+        self.ollvm_ndk_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="浏览…", width=8,
+                   command=lambda: self.ollvm_ndk_var.set(filedialog.askdirectory(
+                       title="选择 OLLVM NDK 的 bin 目录", parent=self,
+                       initialdir=os.path.dirname(DEFAULT_OLLVM_NDK) or ROOT))).pack(side="left")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text="passes", style="Card.TLabel", width=10).pack(side="left")
+        self.ollvm_passes_var = tk.StringVar(value="sub,sobf")
+        self.ollvm_passes_entry = ttk.Entry(row, textvariable=self.ollvm_passes_var, width=24)
+        self.ollvm_passes_entry.pack(side="left", padx=(0, 10))
+        ttk.Label(row, text="空格/逗号分隔；本 NDK 仅 -sub/-sobf 可用，-fla/-bcf 会崩",
+                  style="CardMuted.TLabel").pack(side="left")
+        self._toggle_ollvm()
+
+        # 远端 OLLVM（路线 B：SSH 中转，可启用 -fla/-bcf 控制流混淆）
+        ttk.Label(card, text="远端 OLLVM（SSH 中转，可启用 -fla/-bcf 控制流混淆）",
+                  style="Card.TLabel").pack(anchor="w", pady=(12, 2))
+        self.ollvm_remote_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(card,
+                        text="通过 SSH 调用 Ubuntu OLLVM（需免密 SSH + 远端已注入 OLLVM 的 NDK）",
+                        variable=self.ollvm_remote_on, style="Card.TCheckbutton",
+                        command=self._toggle_ollvm_remote).pack(anchor="w")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(4, 2))
+        ttk.Label(row, text="SSH host", style="Card.TLabel", width=10).pack(side="left")
+        self.ollvm_remote_host_var = tk.StringVar(value="")
+        self.ollvm_remote_host_entry = ttk.Entry(row, textvariable=self.ollvm_remote_host_var)
+        self.ollvm_remote_host_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Label(row, text="port", style="Card.TLabel", width=5).pack(side="left")
+        self.ollvm_remote_port_var = tk.StringVar(value="22")
+        self.ollvm_remote_port_entry = ttk.Entry(row, textvariable=self.ollvm_remote_port_var, width=6)
+        self.ollvm_remote_port_entry.pack(side="left")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text="远端 NDK bin", style="Card.TLabel", width=10).pack(side="left")
+        self.ollvm_remote_ndk_var = tk.StringVar(value="")
+        self.ollvm_remote_ndk_entry = ttk.Entry(row, textvariable=self.ollvm_remote_ndk_var)
+        self.ollvm_remote_ndk_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Label(row, text="远端 Linux 绝对路径", style="CardMuted.TLabel").pack(side="left")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text="passes", style="Card.TLabel", width=10).pack(side="left")
+        self.ollvm_remote_passes_var = tk.StringVar(value="sub,sobf,fla,bcf")
+        self.ollvm_remote_passes_entry = ttk.Entry(row, textvariable=self.ollvm_remote_passes_var, width=24)
+        self.ollvm_remote_passes_entry.pack(side="left", padx=(0, 10))
+        ttk.Label(row, text="clang14 四件套全可用：-sub/-sobf/-fla/-bcf",
+                  style="CardMuted.TLabel").pack(side="left")
+        self._toggle_ollvm_remote()
+
         # 按钮
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill="x", pady=(10, 0))
@@ -279,6 +344,23 @@ class JGShieldApp(tk.Tk):
 
     def _toggle_harden_mode(self):
         pass
+
+    def _toggle_ollvm(self):
+        st = "normal" if self.ollvm_on.get() else "disabled"
+        try:
+            self.ollvm_ndk_entry.configure(state=st)
+            self.ollvm_passes_entry.configure(state=st)
+        except Exception:
+            pass
+
+    def _toggle_ollvm_remote(self):
+        st = "normal" if self.ollvm_remote_on.get() else "disabled"
+        for w in (self.ollvm_remote_host_entry, self.ollvm_remote_port_entry,
+                  self.ollvm_remote_ndk_entry, self.ollvm_remote_passes_entry):
+            try:
+                w.configure(state=st)
+            except Exception:
+                pass
 
     # ---- 底部控制台 ----
     def _build_console(self):
@@ -382,6 +464,34 @@ class JGShieldApp(tk.Tk):
         if d.get("keep") is not None:
             try: self.harden_keep.set(bool(d["keep"]))
             except Exception: pass
+        # OLLVM 配置回填
+        if d.get("ollvm_on") is not None:
+            try: self.ollvm_on.set(bool(d["ollvm_on"]))
+            except Exception: pass
+        if d.get("ollvm_ndk"):
+            try: self.ollvm_ndk_var.set(d["ollvm_ndk"])
+            except Exception: pass
+        if d.get("ollvm_passes"):
+            try: self.ollvm_passes_var.set(d["ollvm_passes"])
+            except Exception: pass
+        # 远端 OLLVM 配置回填
+        if d.get("ollvm_remote_on") is not None:
+            try: self.ollvm_remote_on.set(bool(d["ollvm_remote_on"]))
+            except Exception: pass
+        if d.get("ollvm_remote_host"):
+            try: self.ollvm_remote_host_var.set(d["ollvm_remote_host"])
+            except Exception: pass
+        if d.get("ollvm_remote_port"):
+            try: self.ollvm_remote_port_var.set(d["ollvm_remote_port"])
+            except Exception: pass
+        if d.get("ollvm_remote_ndk"):
+            try: self.ollvm_remote_ndk_var.set(d["ollvm_remote_ndk"])
+            except Exception: pass
+        if d.get("ollvm_remote_passes"):
+            try: self.ollvm_remote_passes_var.set(d["ollvm_remote_passes"])
+            except Exception: pass
+        self._toggle_ollvm()        # 回填后同步输入框可用状态
+        self._toggle_ollvm_remote()
         # 签名信息仅当上次勾选了“记住”才回填
         if d.get("remember_sign"):
             try:
@@ -402,6 +512,14 @@ class JGShieldApp(tk.Tk):
             "output": self.harden_out_var.get().strip(),
             "keep": bool(self.harden_keep.get()),
             "remember_sign": remember,
+            "ollvm_on": bool(self.ollvm_on.get()),
+            "ollvm_ndk": self.ollvm_ndk_var.get().strip(),
+            "ollvm_passes": self.ollvm_passes_var.get().strip(),
+            "ollvm_remote_on": bool(self.ollvm_remote_on.get()),
+            "ollvm_remote_host": self.ollvm_remote_host_var.get().strip(),
+            "ollvm_remote_port": self.ollvm_remote_port_var.get().strip(),
+            "ollvm_remote_ndk": self.ollvm_remote_ndk_var.get().strip(),
+            "ollvm_remote_passes": self.ollvm_remote_passes_var.get().strip(),
         }
         if remember:
             d["ks"] = self.ks_var.get().strip()
@@ -526,6 +644,37 @@ class JGShieldApp(tk.Tk):
                 sign_args += ["--ksPass", ks_pass]
             if ks_keypass:
                 sign_args += ["--ksKeyPass", ks_keypass]
+        # OLLVM（可选）：远端优先，其次本地
+        ollvm_args = []
+        # 先清掉上次可能残留的远端环境变量，避免误用
+        for _k in ("JGSHIELD_OLLVM_REMOTE", "JGSHIELD_OLLVM_REMOTE_HOST",
+                   "JGSHIELD_OLLVM_REMOTE_PORT", "JGSHIELD_OLLVM_REMOTE_NDK_BIN",
+                   "JGSHIELD_OLLVM_REMOTE_PASSES"):
+            os.environ.pop(_k, None)
+        if self.ollvm_remote_on.get():
+            rhost = self.ollvm_remote_host_var.get().strip()
+            rndk = self.ollvm_remote_ndk_var.get().strip()
+            if not rhost or not rndk:
+                messagebox.showerror("错误", "已启用远端 OLLVM，但未填写 SSH host 或远端 NDK bin。", parent=self)
+                return
+            os.environ["JGSHIELD_OLLVM_REMOTE"] = "1"
+            os.environ["JGSHIELD_OLLVM_REMOTE_HOST"] = rhost
+            os.environ["JGSHIELD_OLLVM_REMOTE_PORT"] = self.ollvm_remote_port_var.get().strip() or "22"
+            os.environ["JGSHIELD_OLLVM_REMOTE_NDK_BIN"] = rndk
+            # 远端模式用专属 passes 字段（默认 sub,sobf,fla,bcf，clang14 四件套全开）
+            rp = self.ollvm_remote_passes_var.get().strip()
+            if rp:
+                os.environ["JGSHIELD_OLLVM_REMOTE_PASSES"] = rp
+            # 远端模式不传本地 --ollvm-ndk（避免误用）
+        elif self.ollvm_on.get():
+            ndk = self.ollvm_ndk_var.get().strip()
+            if not ndk:
+                messagebox.showerror("错误", "已启用 OLLVM，但未指定 NDK bin 目录。", parent=self)
+                return
+            ollvm_args += ["--ollvm-ndk", ndk]
+            passes = self.ollvm_passes_var.get().strip()
+            if passes:
+                ollvm_args += ["--ollvm-passes", passes]
         # 保存当前配置（含签名信息，若勾选了“记住”）
         self._save_settings()
         if not inp:
@@ -537,14 +686,14 @@ class JGShieldApp(tk.Tk):
                 return
             base = os.path.basename(inp)
             out_apk = os.path.join(out, "hardened_" + base)
-            cmd = RUNNER + ["harden", inp, "-o", out_apk] + keep + sign_args
+            cmd = RUNNER + ["harden", inp, "-o", out_apk] + keep + sign_args + ollvm_args
             label = "加固 %s" % base
         else:
             if not os.path.isdir(inp):
                 messagebox.showerror("错误", "输入目录不存在。", parent=self)
                 return
             cmd = RUNNER + ["batch_harden", "--input-dir", inp,
-                            "--output-dir", out] + keep + sign_args
+                            "--output-dir", out] + keep + sign_args + ollvm_args
             label = "批量加固 %s" % os.path.basename(inp.rstrip("/\\"))
         self._run_cmd(cmd, label)
 

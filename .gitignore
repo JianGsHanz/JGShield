@@ -61,3 +61,22 @@ verify_stdout.txt
 # ===== 构建中间产物（可重建，不入库） =====
 _stubout/
 _stub_classes.jar
+
+# ===== 验证/调试辅助（保留本地，不入库） =====
+_ref/
+_frida/
+androguard.db
+androguard.db-shm
+androguard.db-wal
+_ollvm_*
+_probe/
+_diag_*.py
+_verify_exe.py
+
+# ===== OLLVM 远程构建（大件与临时，不入库） =====
+_*.log
+_*.txt
+_nofla.*
+android-ndk-*.zip
+llvm-project-llvmorg-*/
+ollvm-14/

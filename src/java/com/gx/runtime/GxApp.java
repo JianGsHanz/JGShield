@@ -220,36 +220,42 @@ public class GxApp {
         File dexDir = new File(shellDir, "dex");
         if (!dexDir.exists()) dexDir.mkdirs();
 
-        ClassLoader sysLoader = GxApp.class.getClassLoader();
+        // 注入目标 = App 自身 ClassLoader（base.getClassLoader()），而非框架/system classloader。
+        // 类加载域正确性修复：用 App 自身 classloader（含 nativeLib 路径、app 域隐藏 API 豁免）
+        // 而非框架 classloader 注入/定义原 App DEX，可同时恢复 native lib 可达性与隐藏 API 豁免，
+        // 避免类加载器分裂导致原 App 原生线程 FindClass/GetFieldID 拿不到类。
+        // 注：华为 A10 的 0xa01 SIGBUS 与此无关——BISIM 二分已证实其根因在 ylyk 自带的
+        //     libSecShell.so（DEX 完整性校验在加固后的新布局下失效），JGShield 壳 so 在 tombstone 出现 0 次。
+        ClassLoader appLoader = base.getClassLoader();
 
-        // P2：fileless 内存加载（API>=26）。解密进 ByteBuffer 直接注入 sysLoader，
+        // P2：fileless 内存加载（API>=26）。解密进 ByteBuffer 直接注入 App 自身 ClassLoader，
         // 磁盘不落明文文件；解密后源 byte[] 立即清零。失败（含 OEM 限制）自动回退文件方案。
         if (android.os.Build.VERSION.SDK_INT >= 26) {
             try {
                 List<ByteBuffer> bufs = GxDecryptor.decryptBuffers(base);
-                GxLoader.injectDexFromBuffers(sysLoader, bufs);
+                GxLoader.injectDexFromBuffers(appLoader, bufs);
                 Log.i(TAG, "load: fileless inject OK (no plaintext on disk)");
             } catch (Throwable t) {
                 Log.w(TAG, "load: fileless failed, fallback to file", t);
                 List<File> dexFiles = GxDecryptor.decrypt(base, dexDir);
-                GxLoader.injectDexElements(sysLoader, dexFiles);
+                GxLoader.injectDexElements(appLoader, dexFiles);
             }
         } else {
             List<File> dexFiles = GxDecryptor.decrypt(base, dexDir);
-            GxLoader.injectDexElements(sysLoader, dexFiles);
+            GxLoader.injectDexElements(appLoader, dexFiles);
         }
         Log.i(TAG, "load: injectDexElements OK");
 
         restoreAssets(base);  // 自包含 try-catch，失败仅记日志、不影响启动
 
-        GxLoader.setClassLoader(base, sysLoader);
+        GxLoader.setClassLoader(base, appLoader);
 
         Log.i(TAG, "load: origApp=" + origApp);
         Application realApp = null;
         if (origApp != null && !origApp.isEmpty()
                 && !origApp.equals(Application.class.getName())
                 && !origApp.equals(GxApp.class.getName())) {
-            Class<?> cls = Class.forName(origApp, true, sysLoader);
+            Class<?> cls = Class.forName(origApp, true, appLoader);
             realApp = (Application) cls.newInstance();
             Log.i(TAG, "load: realApp=" + realApp.getClass().getName());
 
@@ -1373,8 +1379,9 @@ class GxLoader {
     }
 
     /**
-     * 将解密出的原始 DEX 文件注入到框架 ClassLoader 的 DexPathList.dexElements 中。
-     * 替代新建 PathClassLoader 方案，使原 App 与壳共享 ClassLoader 及原生库命名空间。
+     * 将解密出的原始 DEX 文件注入到【App 自身 ClassLoader】的 DexPathList.dexElements 中。
+     * 用 App 自身 classloader（含 nativeLib 路径、app 域隐藏 API）而非框架 classloader，
+     * 以避免类加载器分裂导致原 App 原生线程 FindClass 失败→native 崩溃（见 load() 注释）。
      */
     @SuppressWarnings("unchecked")
     static void injectDexElements(ClassLoader loader, List<File> dexFiles) throws Exception {
@@ -1472,8 +1479,8 @@ class GxLoader {
 
     /**
      * P2：fileless 注入。用公开 API InMemoryDexClassLoader 在内存中加载 DEX（不产生 odex 文件，
-     * 因此磁盘不落明文），再偷取其 dexElements 注入 sysLoader 的 pathList。
-     * 定义加载器仍是 sysLoader（Element 在其 pathList 内），原生库命名空间不变（方案 B 延续）。
+     * 因此磁盘不落明文），再偷取其 dexElements 注入【App 自身 ClassLoader】的 pathList。
+     * 定义加载器仍是 App 自身 classloader（Element 在其 pathList 内），原生库可达性不变。
      *
      * 之所以用 InMemoryDexClassLoader 而非 dalvik.system.DexFile(ByteBuffer)：后者是隐藏构造器，
      * 在部分 OEM（如华为 EMUI）的 ART 上被阉割（NoSuchMethodException），且编译期静态引用

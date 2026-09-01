@@ -100,7 +100,16 @@ def main():
     ap.add_argument("--ksPass", help="密钥库密码")
     ap.add_argument("--ksKeyPass", help="密钥密码(默认同密钥库密码)")
     ap.add_argument("--skip-verify", action="store_true", help="跳过静态回测（大幅提速）")
+    ap.add_argument("--ollvm-ndk", metavar="DIR",
+                    help="OLLVM NDK 的 bin 目录（clang 混淆版）；指定后壳 native 启用 OLLVM 混淆")
+    ap.add_argument("--ollvm-passes", metavar="PASS...",
+                    help="OLLVM pass 列表，空格/逗号分隔（如 sub,sobf）；需与 --ollvm-ndk 同时指定")
     args = ap.parse_args()
+    # OLLVM opt-in：注入环境变量，供 build_stub 在 harden 时读取（每次 harden 重解析）
+    if args.ollvm_ndk:
+        os.environ["JGSHIELD_OLLVM_NDK_BIN"] = args.ollvm_ndk
+    if args.ollvm_passes:
+        os.environ["JGSHIELD_OLLVM_PASSES"] = args.ollvm_passes
     ok_count, total, _ = run_batch(args.input_dir, args.output_dir, args.keep,
                                    args.ks, args.ksAlias, args.ksPass, args.ksKeyPass,
                                    skip_verify=args.skip_verify)

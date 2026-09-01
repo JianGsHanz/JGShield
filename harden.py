@@ -853,7 +853,43 @@ def main():
                          "寄存器并插入「无用条件分支+死块」，改变 CFG 形状、干扰线性反编译，但不影响语义、"
                          "不崩 ART。⚠ 这是弱版，强度远低于 OLLVM；真·CFG 平坦化留给 B2(native/OLLVM)。"
                          "默认关，需真机验证后才用于生产。")
+    ap.add_argument("--ollvm-ndk", metavar="DIR",
+                    help="OLLVM 混淆 NDK 的 clang bin 目录（如 D:/Android/AndoridSDK/ndk/27.2.../"
+                         "toolchains/llvm/prebuilt/windows-x86_64/bin）。指定后壳 native 编译改用该 OLLVM "
+                         "clang 并附加控制流扁平化等混淆 pass（每构建随机 seed）。不指定则普通 NDK，行为不变。")
+    ap.add_argument("--ollvm-passes", metavar="PASS...",
+                    help="OLLVM pass 组合覆盖（空格分隔，如 'fla sub sobf' 关掉默认风险最高的 -bcf）。"
+                         "需与 --ollvm-ndk 同时指定才生效。")
+    ap.add_argument("--ollvm-remote-host", metavar="USER@HOST",
+                    help="远端 OLLVM 模式（路线 B）：通过 SSH 调用 Ubuntu 上 OLLVM14 clang 编 .so。"
+                         "填 SSH host 即启用；需同时 --ollvm-remote-ndk 指远端已注入 OLLVM 的 NDK bin。")
+    ap.add_argument("--ollvm-remote-port", metavar="PORT", default="22",
+                    help="远端 OLLVM 的 SSH 端口（默认 22）。")
+    ap.add_argument("--ollvm-remote-ndk", metavar="DIR",
+                    help="远端 OLLVM 模式下，Ubuntu 上已注入 OLLVM clang 的 NDK bin 绝对路径（Linux）。")
+    ap.add_argument("--ollvm-remote-passes", metavar="PASS...",
+                    help="远端 OLLVM 的 pass 组合覆盖（默认 sub,sobf,fla,bcf 全开）。")
+    ap.add_argument("--ollvm-remote-sysroot", metavar="DIR",
+                    help="远端 NDK 的 sysroot（默认按 <--ollvm-remote-ndk>/../sysroot 推导）。"
+                         "自编的 stock LLVM 没有 NDK 那个自动定位 sysroot 的私有补丁，必须显式指定。")
     args = ap.parse_args()
+    # OLLVM opt-in：CLI 值注入环境变量，供 build_stub 在 import 时读取（main() 内会再解析一次）
+    if args.ollvm_ndk:
+        os.environ["JGSHIELD_OLLVM_NDK_BIN"] = args.ollvm_ndk
+    if args.ollvm_passes:
+        os.environ["JGSHIELD_OLLVM_PASSES"] = args.ollvm_passes
+    # 远端 OLLVM（路线 B）：host 非空即启用
+    if args.ollvm_remote_host:
+        if not args.ollvm_remote_ndk:
+            ap.error("--ollvm-remote-host 需配合 --ollvm-remote-ndk（远端已注入 OLLVM 的 NDK bin）")
+        os.environ["JGSHIELD_OLLVM_REMOTE"] = "1"
+        os.environ["JGSHIELD_OLLVM_REMOTE_HOST"] = args.ollvm_remote_host
+        os.environ["JGSHIELD_OLLVM_REMOTE_PORT"] = args.ollvm_remote_port
+        os.environ["JGSHIELD_OLLVM_REMOTE_NDK_BIN"] = args.ollvm_remote_ndk
+        if args.ollvm_remote_passes:
+            os.environ["JGSHIELD_OLLVM_REMOTE_PASSES"] = args.ollvm_remote_passes
+        if args.ollvm_remote_sysroot:
+            os.environ["JGSHIELD_OLLVM_REMOTE_SYSROOT"] = args.ollvm_remote_sysroot
     try:
         harden(args.input, args.output, args.keep,
                ks=args.ks, ks_alias=args.ksAlias,

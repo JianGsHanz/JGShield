@@ -55,6 +55,112 @@ def _resolve_ndk():
 
 NDK = _resolve_ndk()
 
+# OLLVM 混淆 NDK（可选，opt-in）：
+# 设为“带 OLLVM 的 clang 所在 bin 目录”（如 D:/Android/AndoridSDK/ndk/27.2.../.../bin），
+# 原生壳编译即改用该 clang 并附加 -fla/-sub/-bcf/-sobf 混淆 pass。
+# 未设置时退回普通 NDK（25.1），行为完全不变。用途：对抗熟悉 mocika-shield 的逆向者，
+# 把壳 native（解密/反调/反篡改逻辑）做控制流扁平化 + 指令替换 + 字符串加密，抬高逆向成本。
+def _resolve_ollvm():
+    env = os.environ.get("JGSHIELD_OLLVM_NDK_BIN")
+    if not env:
+        return None
+    # 兼容 Git-Bash 的 /d/... 形式（原生 Python 的 os.path 不认这种 POSIX 风格），
+    # 统一转成 Windows 盘符路径 D:/...，避免「目录存在却 isdir 判定为 None」而退回普通 NDK。
+    if env.startswith("/") and len(env) >= 3 and env[2] == "/":
+        env = env[1].upper() + ":" + env[2:]
+    if os.path.isdir(env):
+        return env
+    return None
+
+# OLLVM pass 组合：指令替换(-sub) + 字符串加密(-sobf)。
+# 实测该 OLLVM 构建(clang18)对真实壳 native 代码只有 -sub/-sobf 可用：
+#   - -fla(控制流扁平化) 与 -bcf(虚假控制流) 均会令 clang 段错误(0xC0000005)，
+#     崩溃点在 @jg_aes256gcm_decrypt 的 "Canonicalize natural loops"；-fla 仅 -O0 不崩但
+#     生成未优化膨胀代码，不可用于生产。属 OLLVM 在该 clang 版本上的已知不稳定。
+#   - 如需 -fla/-bcf，可经 JGSHIELD_OLLVM_PASSES 自行开启（在此 NDK 上大概率崩溃），或换用
+#     基于更老 clang(如 14/15)的 OLLVM 构建。
+# 仅启用 OLLVM 时生效。
+def _resolve_ollvm_passes():
+    # 默认直接返回 flag 形式（与下方解析分支一致），否则会被当成 clang 的输入文件名而编译失败
+    default = ["-mllvm", "-sub", "-mllvm", "-sobf"]
+    raw = os.environ.get("JGSHIELD_OLLVM_PASSES")
+    if not raw:
+        return default
+    # 同时支持空格与逗号分隔（"sub sobf" / "sub,sobf"），避免逗号写法被当成单个无效 pass 名而静默失效
+    names = [x for x in raw.replace(",", " ").split() if x]
+    flags = []
+    for n in names:
+        flags += ["-mllvm", "-%s" % n]
+    return flags
+
+# 模块级默认（main() 每次调用会重新解析，使 GUI 重复加固 / 环境变量变更即时生效）
+OLLVM_NDK_BIN = _resolve_ollvm()
+OLLVM_PASS_NAMES = _resolve_ollvm_passes()
+
+# ── 远端 OLLVM（路线 B：SSH 中转）──────────────────────────────────────────────
+# 背景：Windows 当前 OLLVM NDK(clang18) 只能跑 -sub/-sobf；-fla/-bcf 在壳 native 上
+# 触发 clang ICE（Canonicalize natural loops）。用户在 Ubuntu 原生编出 OLLVM14 clang
+# （四件套全可用），并把该 clang 注入 NDK r25c 的 bin（覆盖 NDK 自带 clang，使 NDK 的
+# aarch64-linux-android21-clang 等包装脚本改用 OLLVM clang）。Windows 侧 JGShield 通过
+# SSH 把随机化后的 native 源传到 VM，远端用 NDK 包装脚本编 4 ABI .so，再 scp 回本地。
+# 启用条件：JGSHIELD_OLLVM_REMOTE=1 且 _HOST / _NDK_BIN 均设置。
+def _resolve_ollvm_remote():
+    return bool(os.environ.get("JGSHIELD_OLLVM_REMOTE"))
+
+def _resolve_ollvm_remote_host():
+    return os.environ.get("JGSHIELD_OLLVM_REMOTE_HOST", "").strip()
+
+def _resolve_ollvm_remote_port():
+    return os.environ.get("JGSHIELD_OLLVM_REMOTE_PORT", "22").strip()
+
+def _resolve_ollvm_remote_ndk_bin():
+    # 远端“已注入 OLLVM 的 NDK bin”绝对路径（Linux，无 .cmd）
+    return os.environ.get("JGSHIELD_OLLVM_REMOTE_NDK_BIN", "").strip()
+
+def _resolve_ollvm_remote_sysroot():
+    """远端 NDK 的 sysroot。
+
+    必须显式传 --sysroot：NDK 自带的 clang 有个私有补丁（按 binary 位置 bin/../sysroot
+    自动定位），我们自编的 stock LLVM 没有该补丁，不给就会找不到 <android/log.h>、
+    链接时找不到 -llog/-lz。默认按 <远端 NDK bin>/../sysroot 推导，可用环境变量覆盖。
+    """
+    return os.environ.get("JGSHIELD_OLLVM_REMOTE_SYSROOT", "").strip()
+
+
+def _resolve_ollvm_remote_passes():
+    # OLLVM14 四件套全可用，默认开满；可用 JGSHIELD_OLLVM_REMOTE_PASSES 覆盖
+    raw = os.environ.get("JGSHIELD_OLLVM_REMOTE_PASSES") or "sub,sobf,fla,bcf"
+    names = [x for x in raw.replace(",", " ").split() if x]
+    flags = []
+    for n in names:
+        flags += ["-mllvm", "-%s" % n]
+    return flags
+
+def _remote_bins():
+    # 优先系统 PATH 的 ssh/scp（Git for Windows 自带）；否则退 .exe
+    ssh = shutil.which("ssh") or "ssh.exe"
+    scp = shutil.which("scp") or "scp.exe"
+    return ssh, scp
+
+def _run_remote(cmd):
+    # Windows 下 ssh/scp 走 Git-Bash 的 MSYS 运行时，会自动把形似 Windows 路径的参数
+    # 转换（如 E:/jiagu/... → /e/jiagu/...）。本地源路径本是 Windows 路径、远端目标
+    # ~/xxx 不应被转 → 统一禁掉 MSYS 路径转换，让 scp/ssh 收到字面量（与 adb 处理一致）。
+    env = None
+    if sys.platform.startswith("win"):
+        env = dict(os.environ)
+        env["MSYS_NO_PATHCONV"] = "1"
+    print("[remote] %s" % " ".join(cmd))
+    subprocess.check_call(cmd, creationflags=_SUBPROC_FLAGS, env=env)
+
+# 远端 Linux 下 NDK clang 无 .cmd 扩展名
+_REMOTE_CLANG = {
+    "arm64-v8a": "aarch64-linux-android21-clang",
+    "armeabi-v7a": "armv7a-linux-androideabi21-clang",
+    "x86_64": "x86_64-linux-android21-clang",
+    "x86": "i686-linux-android21-clang",
+}
+
 # NDK 预编译工具链子目录随宿主平台而变：
 #   Windows -> windows-x86_64 ; macOS(Intel) -> darwin-x86_64 ;
 #   macOS(Apple Silicon) -> darwin-arm64 ; Linux -> linux-x86_64
@@ -81,6 +187,9 @@ NATIVE_COMPILE = [
     "jg_inline_hook.c", "jg_method_restore_hook.c", "jg_hook_bridge.S",
     "jg_anti_frida.c",
 ]
+
+# 内联 hook 子系统仅 AArch64 编入（jg_hook_bridge.S 为纯 AArch64 汇编）
+_HOOK_FILES = {"jg_inline_hook.c", "jg_method_restore_hook.c", "jg_hook_bridge.S"}
 
 # Obf 旧密钥（与 GxApp.java 原 deriveKey() 一致），用于把源码中旧密文串解码为明文以便重编码
 _OLD_KSEED = [0x13572A6C, 0x4E1B3679, 0x0D516874, 0x2B3F4452]
@@ -400,6 +509,10 @@ def _build_native(st):
     with open(guard_path, "w", encoding="utf-8") as f:
         f.write(g)
 
+    # 远端 OLLVM（路线 B）：本地完成源码随机化后，传给 Ubuntu VM 编译
+    if _resolve_ollvm_remote():
+        return _build_native_remote(st)
+
     # 内联 hook 子系统（jg_inline_hook.c / jg_method_restore_hook.c / jg_hook_bridge.S）
     # 是 AArch64 专属、仅 opt-in 的实验特性（P3.3，默认关闭）。其中 jg_hook_bridge.S
     # 为纯 AArch64 汇编，编入 32 位 ABI 会直接报错。故仅在 arm64-v8a 编入 hook 文件，
@@ -408,7 +521,21 @@ def _build_native(st):
 
     built = 0
     for abi, clang_name in ABIS.items():
-        clang = os.path.join(CLANG_DIR, clang_name)
+        # OLLVM opt-in：启用时改用混淆 NDK 的 clang 并附加可配混淆 pass；否则普通 NDK。
+        # 注：该 OLLVM 构建不支持 -seed（实测 "Unknown command line argument '-seed'"），
+        # 故每构建的混淆结构差异来自壳 native 源码内已按构建随机化的常量（OBF_KEY / 随机 TAG /
+        # lib_name 等，由 stamp 注入）——这些随机值进入被混淆函数的 IR，使各构建产物天然不同。
+        if OLLVM_NDK_BIN:
+            clang = os.path.join(OLLVM_NDK_BIN, clang_name)
+            # 该 OLLVM NDK 为 clang18，隐含函数声明默认按错误论处；原壳源码 jg_inline_hook.c
+            # 用到 process_vm_writev（NDK25/clang14 仅告警）在此变硬错。加 -Wno-error 仅降级该告警，
+            # 不改壳源码语义，使 OLLVM 路径可编译（行为等价于旧 NDK）。
+            obf_flags = OLLVM_PASS_NAMES + ["-Wno-error=implicit-function-declaration"]
+            obf_tag = " [OLLVM]"
+        else:
+            clang = os.path.join(CLANG_DIR, clang_name)
+            obf_flags = []
+            obf_tag = ""
         out_dir = os.path.join(config.LIBJGGUARD_DIR, abi)
         os.makedirs(out_dir, exist_ok=True)
         # 清理旧随机名的 .so，避免散落多个库
@@ -418,16 +545,83 @@ def _build_native(st):
         srcs = [os.path.join(TMP_NATIVE, f) for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _hook_files]
         subprocess.check_call(
-            [clang, "--shared", "-fPIC", "-O2", "-o", out] + srcs +
+            [clang, "--shared", "-fPIC", "-O2"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
             ["-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
-        print("[*] native 构建完成 (%s): %s" % (abi, out))
+        print("[*] native 构建完成%s (%s): %s" % (obf_tag, abi, out))
+    if not built:
+        raise RuntimeError("未构建任何 ABI 的 native 库")
+
+
+def _build_native_remote(st):
+    """路线 B：本地已完成源码随机化，scp 到 Ubuntu VM，ssh 调远端注入 OLLVM 的 NDK clang
+    编出 4 ABI 的 lib<lib_name>.so，再 scp 回 tools/libjgguard/<abi>/。保留每次随机化。"""
+    host = _resolve_ollvm_remote_host()
+    if not host:
+        raise RuntimeError("远端 OLLVM 模式已启用，但未设置 JGSHIELD_OLLVM_REMOTE_HOST")
+    port = _resolve_ollvm_remote_port()
+    ndk_bin = _resolve_ollvm_remote_ndk_bin()
+    if not ndk_bin:
+        raise RuntimeError("远端 OLLVM 模式已启用，但未设置 JGSHIELD_OLLVM_REMOTE_NDK_BIN"
+                           "（远端已注入 OLLVM 的 NDK bin 目录）")
+    ssh, scp = _remote_bins()
+    obf_flags = _resolve_ollvm_remote_passes() + ["-Wno-error=implicit-function-declaration"]
+    # sysroot：默认按 <远端 NDK bin>/../sysroot 推导（NDK 标准布局），可用环境变量覆盖
+    sysroot = _resolve_ollvm_remote_sysroot()
+    if not sysroot:
+        sysroot = os.path.dirname(ndk_bin.rstrip("/\\")) + "/sysroot"
+
+    token = "jgshield_%d" % os.getpid()
+    remote_base = "~/jgshield_remote/%s" % token
+    remote_native = remote_base + "/TMP_NATIVE"  # scp -r TMP_NATIVE 落位到 remote_base/TMP_NATIVE
+
+    # 0) 建远端目录（父目录必须先存在，否则首次运行 scp -r 会失败）
+    _run_remote([ssh, "-p", port, host, "mkdir -p %s" % remote_base])
+    # 0.1) 预检：远端 clang 是否存在（早失败，别等 4 次编译才报错）
+    _probe = os.path.join(ndk_bin, _REMOTE_CLANG["arm64-v8a"])
+    _run_remote([ssh, "-p", port, host, "ls -l %s && ls -d %s" % (_probe, sysroot)])
+
+    # 1) 传随机化后的源码到远端
+    _run_remote([scp, "-P", port, "-r", TMP_NATIVE, "%s:%s" % (host, remote_base)])
+
+    # 2) 逐 ABI 远端编译 + 回传
+    built = 0
+    for abi in _REMOTE_CLANG:
+        clang = os.path.join(ndk_bin, _REMOTE_CLANG[abi])
+        srcs = [f for f in NATIVE_COMPILE
+                if abi == "arm64-v8a" or f not in _HOOK_FILES]
+        out_name = "lib%s.so" % st["lib_name"]
+        wb = "-DWB_KDF" if st.get("wb_kdf") else ""
+        # -unwindlib=none 必须显式给：upstream clang 对 Android 目标无条件追加
+        # -l:libunwind.a（clang/lib/Driver/ToolChains/CommonArgs.cpp 的 AddUnwindLibrary），
+        # 而 NDK r23+ 的 sysroot 已移除 libunwind → 不关掉就链接失败。
+        # NDK 自带的 clang 有私有补丁规避，我们自编的 stock LLVM 没有。
+        cmd = ("cd %s && %s --sysroot=%s -unwindlib=none --shared -fPIC -O2 %s %s -o %s %s -llog -lz"
+               % (remote_native, clang, sysroot, " ".join(obf_flags), wb,
+                  out_name, " ".join(srcs)))
+        _run_remote([ssh, "-p", port, host, cmd])
+
+        out_dir = os.path.join(config.LIBJGGUARD_DIR, abi)
+        os.makedirs(out_dir, exist_ok=True)
+        for old in glob.glob(os.path.join(out_dir, "lib*.so")):
+            os.remove(old)
+        _run_remote([scp, "-P", port, "%s:%s/%s" % (host, remote_native, out_name),
+                     os.path.join(out_dir, out_name)])
+        built += 1
+        print("[*] native 构建完成 [REMOTE OLLVM] (%s): %s" % (abi, out_name))
+
+    # 3) 清理远端临时目录
+    _run_remote([ssh, "-p", port, host, "rm -rf %s" % remote_base])
     if not built:
         raise RuntimeError("未构建任何 ABI 的 native 库")
 
 
 def main(wb_kdf=False):
+    # 重新解析 OLLVM 配置（模块级已解析一次；此处再解析以支持 GUI 重复加固 / 环境变量变更即时生效）
+    global OLLVM_NDK_BIN, OLLVM_PASS_NAMES
+    OLLVM_NDK_BIN = _resolve_ollvm()
+    OLLVM_PASS_NAMES = _resolve_ollvm_passes()
     # 确保可写构建目录存在（冻结态 exe/build 是首次运行，目录尚不存在）
     os.makedirs(config.BUILD_DIR, exist_ok=True)
     st = stamp.generate(wb_kdf=wb_kdf)
