@@ -298,11 +298,14 @@ Java_com_gx_runtime_GxBootstrap_nativeDeriveShellKey(JNIEnv *env, jclass clazz,
 
     /* info = KEY_PREFIX + "shell" + idx；前缀随 stamp 随机化（见 build_stub._sed_native）。
      * 必须用字符串字面量 "JG|shell0" 以便 _sed_native 替换为随机前缀，禁止手写字节，
-     * 否则写端(随机前缀)与读端(死 JG|)密钥不等 → GCM BAD_DECRYPT（P0-A 引入的回归）。 */
+     * 否则写端(随机前缀)与读端(死 JG|)密钥不等 → GCM BAD_DECRYPT（P0-A 引入的回归）。
+     * 严禁在此函数写任何循环：壳 .so 经远端 OLLVM -fla/-bcf 混淆，-fla 对用户循环拍平
+     * 会生成非终止代码 → 启动期无限循环 → 主线程 ANR（P0-A 修复引入的二次回归）。
+     * 故用 strlen+memcpy 取字节（库函数，不受 -fla 用户循环拍平影响），函数体保持直线。 */
     const char *info_str = "JG|shell0";
     uint8_t info[16];
-    int il = 0;
-    while (info_str[il]) { info[il] = (uint8_t)info_str[il]; il++; }
+    int il = (int)strlen(info_str);
+    memcpy(info, info_str, (size_t)il);
     uint8_t key[32];
     jg_hmac_sha256(seed, 32, info, (size_t)il, key);
 
