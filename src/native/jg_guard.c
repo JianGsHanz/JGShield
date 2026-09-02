@@ -296,12 +296,13 @@ Java_com_gx_runtime_GxBootstrap_nativeDeriveShellKey(JNIEnv *env, jclass clazz,
     uint8_t seed[32];
     jg_hmac_sha256(salt, 32, certHash, 32, seed);
 
-    /* info = KEY_PREFIX("JG|") + "shell" + idx("0") = "JG|shell0" */
+    /* info = KEY_PREFIX + "shell" + idx；前缀随 stamp 随机化（见 build_stub._sed_native）。
+     * 必须用字符串字面量 "JG|shell0" 以便 _sed_native 替换为随机前缀，禁止手写字节，
+     * 否则写端(随机前缀)与读端(死 JG|)密钥不等 → GCM BAD_DECRYPT（P0-A 引入的回归）。 */
+    const char *info_str = "JG|shell0";
     uint8_t info[16];
     int il = 0;
-    info[il++] = 'J'; info[il++] = 'G'; info[il++] = '|';
-    info[il++] = 's'; info[il++] = 'h'; info[il++] = 'e'; info[il++] = 'l'; info[il++] = 'l';
-    info[il++] = '0';
+    while (info_str[il]) { info[il] = (uint8_t)info_str[il]; il++; }
     uint8_t key[32];
     jg_hmac_sha256(seed, 32, info, (size_t)il, key);
 

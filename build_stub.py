@@ -428,6 +428,10 @@ def _sed_native(s, st):
     kp = st["key_prefix"]
     s = s.replace('"JG|m%u"', '"' + kp + 'm%u"')
     s = s.replace('"JG|m%u.%u"', '"' + kp + 'm%u.%u"')
+    # P0-A 壳 DEX 密钥前缀随机化：nativeDeriveShellKey 的 info 字符串字面量
+    # "JG|shell0" 必须先替换为随机前缀，否则解密端死用 "JG|" 与写端随机前缀不等
+    # → GCM BAD_DECRYPT（与 Java 侧 build_stub 的 "JG|shell0" 替换保持一致）。
+    s = s.replace('"JG|shell0"', '"%s%s0"' % (kp, "shell"))
     # native 侧 log tag 随机化（JG-* 是 logcat/二进制里的指纹；
     # 注：原固定 "JG|"/"JG|m" HKDF 分隔符已随机化为 st["key_prefix"]，不再是明文 "JG|"）
     for old, key in (("JG-Native", "tag_native_log"),
