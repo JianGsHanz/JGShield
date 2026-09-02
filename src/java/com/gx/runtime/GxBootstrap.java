@@ -151,30 +151,25 @@ public class GxBootstrap extends Application {
         }
     }
 
-    /** 派生壳 DEX 密钥：与原壳 seed 同源（证书绑定 + 每构建随机 salt）。
-     *  简化：直接复用与 GxKeys.seed 相同的 HKDF-Extract，label 用 "JG|shell"。
-     *  必须与原 harden.py encrypt_shell_dex 的派生完全一致（见 harden.py）。 */
+    /**
+     * 派生壳 DEX 密钥（P0-A：下沉 native 白盒 KDF，配合 OLLVM 混淆关静态路线）。
+     * 纯 Java 的 HmacSHA256 派生曾被逆向报告一字不差复现（攻击路径①），故逻辑移入
+     * native（Java_com_gx_runtime_GxBootstrap_nativeDeriveShellKey，位于混淆后的壳 .so）。
+     * salt 不再直接取 payload 末 32B 明文，改为 HMAC(trailer, head) 融合（见 native 端
+     * 与 harden.py shell_salt，二者逐字节一致）。Java 侧只负责把证书 DER 与 payload 字节
+     * 交给 native，不再出现任何密钥派生常量。
+     */
     private static byte[] deriveShellKey(Context ctx) throws Exception {
-        // 读 APK 内 PAYLOAD_ENTRY 末 32B salt（与原壳载荷同 salt，保证同 seed）
         byte[] payload = readPayload(ctx, "__PAYLOAD_ENTRY__");
-        byte[] salt = new byte[32];
-        if (payload != null && payload.length >= 32) {
-            System.arraycopy(payload, payload.length - 32, salt, 0, 32);
-        } else {
-            java.util.Arrays.fill(salt, (byte) 0);
-        }
-        // cert_hash = SHA256(签名证书 DER)
         byte[] cert = readCertDer(ctx);
-        byte[] certHash = MessageDigest.getInstance("SHA-256").digest(cert);
-        // seed = HMAC-SHA256(key=salt, msg=certHash)  (HKDF-Extract)
-        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(salt, "HmacSHA256"));
-        byte[] seed = mac.doFinal(certHash);
-        // key = HMAC(seed, "JG|shell" + "0")  —— 必须与 harden.py derive_key(seed, 0, label=b"shell")
-        // 完全一致：derive_key 内部是 HMAC(seed, b"JG|" + label + str(idx)) = "JG|shell0"。
-        mac.init(new SecretKeySpec(seed, "HmacSHA256"));
-        return mac.doFinal("JG|shell0".getBytes("utf-8"));
+        if (payload == null || payload.length < 32 || cert == null || cert.length == 0) {
+            throw new IllegalStateException("shell key material missing");
+        }
+        return nativeDeriveShellKey(cert, payload);
     }
+
+    /** native 白盒壳密钥派生（jg_guard.c，编译期经 OLLVM 混淆）。 */
+    private static native byte[] nativeDeriveShellKey(byte[] certDer, byte[] payload);
 
     private static byte[] readPayload(Context ctx, String entry) throws Exception {
         String apk = ctx.getApplicationInfo().sourceDir;

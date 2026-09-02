@@ -198,6 +198,19 @@ def derive_key(seed, idx, label=b"dex"):
     mac.update(msg)
     return mac.digest()  # 32 bytes -> AES-256
 
+def shell_salt(payload):
+    """P0-A：壳 DEX 密钥的 salt 不再直接取 payload 末 32B 明文，改为
+    HMAC(key=payload[-32:], msg=payload[:32]) 融合。payload 末 32B 仍是 build_salt
+    （载荷 trailer），但攻击者拿到 payload 也不能直接当 salt 用——须经这层融合，而
+    融合逻辑已下沉 native（GxBootstrap.nativeDeriveShellKey，经 OLLVM 混淆）。
+    与 native 端 Java_com_gx_runtime_GxBootstrap_nativeDeriveShellKey 逐字节一致。"""
+    if payload is None or len(payload) < 32:
+        return b"\x00" * 32
+    trailer = payload[-32:]
+    head = payload[:32]
+    mac = HMAC.new(trailer, head, SHA256)
+    return mac.digest()
+
 def encrypt_asset(seed, idx, data):
     """加密单个 assets 条目（与 encrypt_dex 同算法，label=asset 区分密钥）。"""
     comp = zlib_compress(data)
@@ -702,10 +715,10 @@ def harden(input_apk, output_apk=None, keep=False,
         if strengthen == "exit":
             print("[!] 警告: exit 模式会误杀正常 VPN/海外用户，不推荐用于面向海外用户的 app。")
     if antidump:
-        print("[2*] 注入 P0-C 内存级 anti-dump 开关 meta: %s = 1 (默认关,opt-in)" % config.META_ANTIDUMP)
+        print("[2*] 注入 P0-C 内存级 anti-dump 开关 meta: %s = 1（默认已开；传 0 显式关闭）" % config.META_ANTIDUMP)
         print("[!] 警告: 内存扫描可能误命中 ART 另拷的匿名 DEX 区，需真机验证后再用于生产。")
     if antifrida:
-        print("[2*] 注入 A·强反 Frida 开关 meta: %s = 1 (默认关,opt-in)" % config.META_ANTIFRIDA)
+        print("[2*] 注入 A·强反 Frida 开关 meta: %s = 1（默认已开；传 0 显式关闭）" % config.META_ANTIFRIDA)
         print("[!] 警告: frida 检测为被动信号，攻击者可 patch 响应函数绕过，需真机+frida 反向验证后才用于生产。")
     print("[2] 原 Application:", orig_app)
     _lap(sw, "改Manifest(二进制)")
@@ -748,9 +761,10 @@ def harden(input_apk, output_apk=None, keep=False,
                             method_sections, salt=build_salt)
     with open(config.STUB_DEX, "rb") as f:
         stub = f.read()
-    # P8：加密壳自身 DEX（GxApp 等 12 类），与原载荷同 salt 同 seed，
-    # 但 label "JG|shell" 区分密钥；Bootstrap 端用同派生解密。
-    shell_dex_enc = encrypt_shell_dex(seed, stub)
+    # P8：加密壳自身 DEX（GxApp 等 12 类）。壳密钥的 salt 经 shell_salt 融合
+    # （非明文 payload 末 32B），与 native 端 GxBootstrap.nativeDeriveShellKey 一致。
+    shell_seed = derive_seed(cert_hash, shell_salt(payload))
+    shell_dex_enc = encrypt_shell_dex(shell_seed, stub)
     print("[3] stub.dex(%d) + 载荷(%d) -> 注入为 %s 条目；壳 DEX 加密(%d) -> %s 条目"
           % (len(stub), len(payload), config.PAYLOAD_ENTRY,
              len(shell_dex_enc), config.SHELL_DEX_ENTRY))

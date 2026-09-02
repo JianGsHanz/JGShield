@@ -262,6 +262,56 @@ Java_com_gx_runtime_GxKeys_nativeKeyFor(JNIEnv *env, jclass clazz,
     return res;
 }
 
+/* ===== P0-A：壳 DEX 密钥派生下沉（GxBootstrap）=====
+ * 与 Java_com_gx_runtime_GxBootstrap.nativeDeriveShellKey / harden.py shell_salt
+ * + encrypt_shell_dex 逐字节一致。salt 不再直接取 payload 末 32B 明文，改为
+ * HMAC(key=payload[plen-32:], msg=payload[0:32]) 融合，避免明文 salt 暴露。
+ * 本函数随壳 .so 经 OLLVM 混淆（-fla/-bcf/-sub/-sobf），静态读壳成本显著上升。
+ * 派生链：certHash = SHA256(certDer)
+ *         salt     = HMAC(trailer, head)
+ *         seed     = HMAC(salt, certHash)
+ *         key      = HMAC(seed, "JG|shell0")   // KEY_PREFIX + "shell" + idx */
+JNIEXPORT jbyteArray JNICALL
+Java_com_gx_runtime_GxBootstrap_nativeDeriveShellKey(JNIEnv *env, jclass clazz,
+        jbyteArray certDer, jbyteArray payload) {
+    (void)clazz;
+    jbyte *cert = (*env)->GetByteArrayElements(env, certDer, NULL);
+    jsize clen = (*env)->GetArrayLength(env, certDer);
+    jbyte *pay = (*env)->GetByteArrayElements(env, payload, NULL);
+    jsize plen = (*env)->GetArrayLength(env, payload);
+
+    uint8_t certHash[32];
+    jg_sha256_ctx sc; jg_sha256_init(&sc);
+    jg_sha256_update(&sc, (const uint8_t*)cert, (size_t)clen);
+    jg_sha256_final(certHash, &sc);
+
+    /* shell_salt = HMAC(key=payload[plen-32:], msg=payload[0:32]) */
+    uint8_t salt[32];
+    const uint8_t *trailer = (plen >= 32) ? (const uint8_t*)pay + (plen - 32) : (const uint8_t*)pay;
+    size_t tlen = (plen >= 32) ? 32 : (size_t)plen;
+    const uint8_t *head = (const uint8_t*)pay;
+    size_t hlen = (plen >= 32) ? 32 : (size_t)plen;
+    jg_hmac_sha256(trailer, tlen, head, hlen, salt);
+
+    uint8_t seed[32];
+    jg_hmac_sha256(salt, 32, certHash, 32, seed);
+
+    /* info = KEY_PREFIX("JG|") + "shell" + idx("0") = "JG|shell0" */
+    uint8_t info[16];
+    int il = 0;
+    info[il++] = 'J'; info[il++] = 'G'; info[il++] = '|';
+    info[il++] = 's'; info[il++] = 'h'; info[il++] = 'e'; info[il++] = 'l'; info[il++] = 'l';
+    info[il++] = '0';
+    uint8_t key[32];
+    jg_hmac_sha256(seed, 32, info, (size_t)il, key);
+
+    (*env)->ReleaseByteArrayElements(env, certDer, cert, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, payload, pay, JNI_ABORT);
+    jbyteArray out = (*env)->NewByteArray(env, 32);
+    (*env)->SetByteArrayRegion(env, out, 0, 32, (jbyte*)key);
+    return out;
+}
+
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)vm; (void)reserved;

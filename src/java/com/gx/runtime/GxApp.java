@@ -117,16 +117,14 @@ public class GxApp {
             if (mb != null) {
                 String s = mb.getString("gx.strengthen");
                 if ("exit".equals(s) || "log".equals(s)) STRENGTHEN_RESPONSE = s;
-                // P0-C 内存级 anti-dump 总开关：加固期经 --antidump 注入 meta "gx.antidump"="1" 才启用。
-                // 默认不注入（关闭）——内存扫描有自检误报残留风险（ART 可能把 DEX 另拷匿名区），
-                // 按铁律「脆弱特性默认关 + opt-in + 真机验证」处理，未显式开启绝不运行扫描。
+                // P0-C 内存级 anti-dump 总开关：默认开启（拦内存映射型 dump），
+                // 加固期可注入 meta "gx.antidump"="0" 显式关闭（仅特殊兼容场景）。
                 String ad = mb.getString("gx.antidump");
-                if ("1".equals(ad)) GxAntiDump.ANTI_DUMP_ENABLED = true;
-                // A·强反 Frida 总开关：加固期经 --antifrida 注入 meta "gx.antifrida"="1" 才启用。
-                // 默认不注入（关闭）——Frida 检测是被动信号，攻击者可 patch 响应函数绕过，
-                // 按铁律「脆弱特性默认关 + opt-in + 真机验证」处理。
+                GxAntiDump.ANTI_DUMP_ENABLED = !"0".equals(ad);
+                // A·强反 Frida 总开关：默认开启（被动信号，命中经 STRENGTHEN_RESPONSE 收口），
+                // 加固期可注入 meta "gx.antifrida"="0" 显式关闭。
                 String af = mb.getString("gx.antifrida");
-                if ("1".equals(af)) GxAntiFrida.ANTI_FRIDA_ENABLED = true;
+                GxAntiFrida.ANTI_FRIDA_ENABLED = !"0".equals(af);
             }
         } catch (Throwable ignored) {}
 
@@ -1057,8 +1055,8 @@ class GxAntiDump {
     private static final long INTERVAL_MS = 2000;
     private static volatile java.io.File appDataDir;   // /data/data/<pkg>
 
-    // P0-C 内存级 anti-dump 总开关：加固期经 meta "gx.antidump"="1" 注入才为 true；默认 false（关闭）。
-    static volatile boolean ANTI_DUMP_ENABLED = false;
+    // P0-C 内存级 anti-dump 总开关：默认开启（拦内存映射型 dump；meta "gx.antidump"="0" 才关）。
+    static volatile boolean ANTI_DUMP_ENABLED = true;
     // 自有 DEX 直接缓冲区内存区间 [start, start+len)，由解密加载时登记（best-effort），扫描时排除，
     // 避免命中自家 InMemoryDexClassLoader DEX 导致自爆。仅在该表非空后内存扫描才生效（规避启动竞态）。
     private static final java.util.List<long[]> SELF_DEX = new java.util.ArrayList<>();
@@ -1276,8 +1274,8 @@ class GxAntiDump {
 class GxAntiFrida {
     private static final String TAG = "GX-AF";
     private static final long INTERVAL_MS = 2000;
-    // A·强反 Frida 总开关：加固期经 manifest meta "gx.antifrida"="1" 注入才为 true；默认 false（关闭）。
-    static volatile boolean ANTI_FRIDA_ENABLED = false;
+    // A·强反 Frida 总开关：默认开启（命中经 STRENGTHEN_RESPONSE 收口；meta "gx.antifrida"="0" 才关）。
+    static volatile boolean ANTI_FRIDA_ENABLED = true;
 
     static void start(Context ctx) {
         // 默认关：不浪费线程/扫描，native 不被调用

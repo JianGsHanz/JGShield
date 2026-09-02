@@ -407,10 +407,12 @@ def _obf_native_c(st):
 def _sed_native(s, st):
     pkg_us = st["pkg_underscore"]
     classes = st["classes"]
-    # JNI 符号类名段随机化（仅 GxGuard/GxKeys/GxDecryptor/Obf 有 JNI）
+    # JNI 符号类名段随机化（GxGuard/GxKeys/GxDecryptor/Obf 有 JNI；
+    # P0-A 起 GxBootstrap 也新增 native 壳密钥派生，必须同步改写其 JNI 符号）
     for old, new in (("GxGuard", classes["GxGuard"]),
                      ("GxKeys", classes["GxKeys"]),
                      ("GxDecryptor", classes["GxDecryptor"]),
+                     ("GxBootstrap", classes["GxBootstrap"]),
                      ("Obf", classes["Obf"])):
         s = re.sub(r'Java_com_gx_runtime_' + re.escape(old) + r'_',
                    'Java_%s_%s_' % (pkg_us, new), s)
@@ -553,9 +555,9 @@ def _build_native(st):
         srcs = [os.path.join(TMP_NATIVE, f) for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _hook_files]
         subprocess.check_call(
-            [clang, "--shared", "-fPIC", "-O2"] + obf_flags + ["-o", out] + srcs +
+            [clang, "--shared", "-fPIC", "-O2", "-fno-ident"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
-            ["-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
+            ["-Wl,-s", "-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
         print("[*] native 构建完成%s (%s): %s" % (obf_tag, abi, out))
     if not built:
