@@ -166,18 +166,15 @@ public class GxApp {
         // onReceive 超 10s 触发 Broadcast ANR。延迟后主线程独占完成 onCreate+onReceive，恢复 <10s。
         // 功能不丢：IdleHandler 在首屏后回调一次，各防御随后自行周期轮询。
         try {
-            android.os.Looper ml = proxy.getMainLooper();
-            if (ml != null) {
-                ml.getQueue().addIdleHandler(new android.os.MessageQueue.IdleHandler() {
-                    @Override
-                    public boolean queueIdle() {
-                        startDefenses(base);
-                        return false; // 只执行一次
-                    }
-                });
-            } else {
-                startDefenses(base);
-            }
+            // 壳 boot() 运行在 Application 主线程，Looper.myQueue() (API 1+) 即主线程消息队列；
+            // 注意不能用 Looper.getQueue() (API 23+)，否则 min-api 21 的壳编译失败。
+            android.os.Looper.myQueue().addIdleHandler(new android.os.MessageQueue.IdleHandler() {
+                @Override
+                public boolean queueIdle() {
+                    startDefenses(base);
+                    return false; // 只执行一次
+                }
+            });
         } catch (Throwable t) {
             Log.w(TAG, "defer defenses failed, fallback immediate", t);
             startDefenses(base);
