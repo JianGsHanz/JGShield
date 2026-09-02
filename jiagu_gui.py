@@ -302,8 +302,7 @@ class JGShieldApp(tk.Tk):
         self.ollvm_passes_entry.pack(side="left")
         self._toggle_ollvm()
         ttk.Label(card,
-                  text="作用域：仅混淆 JGShield 壳 libjgguard.so（DEX 加壳 / 反调试 / 反篡改逻辑），"
-                       "不会改动你自己的 App 代码（如 security_key.cpp）。",
+                  text="作用域：仅混淆 JGShield 壳 libjgguard.so（DEX 加壳 / 反调试 / 反篡改逻辑）。",
                   style="CardMuted.TLabel").pack(anchor="w", pady=(4, 0))
 
         # 远端 OLLVM（路线 B：SSH 中转，可启用 -fla/-bcf 控制流混淆）
