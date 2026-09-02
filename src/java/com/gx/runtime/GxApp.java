@@ -159,6 +159,39 @@ public class GxApp {
             }
         }
 
+        // P-DEFER：启动期反篡改/anti-dump/anti-frida 防御推迟到主线程空闲(首屏渲染后)再启动，
+        // 不在「壳解密+原App初始化+静态Receiver.onReceive」冷启动窗口内与主线程抢CPU/IO。
+        // 根因：②默认开 anti 起的 GxAntiFrida/GxAntiDump 守护线程在冷启动窗口抢资源，叠加 app
+        // 自身首次初始化(JPush/极光等)阻塞，进程被广播(如 com.xiaomi.mipush.ERROR)冷启动唤醒时
+        // onReceive 超 10s 触发 Broadcast ANR。延迟后主线程独占完成 onCreate+onReceive，恢复 <10s。
+        // 功能不丢：IdleHandler 在首屏后回调一次，各防御随后自行周期轮询。
+        try {
+            android.os.Looper ml = proxy.getMainLooper();
+            if (ml != null) {
+                ml.getQueue().addIdleHandler(new android.os.MessageQueue.IdleHandler() {
+                    @Override
+                    public boolean queueIdle() {
+                        startDefenses(base);
+                        return false; // 只执行一次
+                    }
+                });
+            } else {
+                startDefenses(base);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "defer defenses failed, fallback immediate", t);
+            startDefenses(base);
+        }
+
+        // 返回 realApp 给 Bootstrap 做生命周期转发（可能为 null）
+        return realApp;
+    }
+
+    /**
+     * 启动期防御集合（反篡改/anti-dump/anti-frida/native guard/env+完整性扫描）。
+     * 由 boot() 经主线程 IdleHandler 推迟到首屏后调用，避免在冷启动窗口抢主线程导致 Broadcast ANR。
+     */
+    private static void startDefenses(Context base) {
         // 启动反篡改后台守护线程：与加载器完全隔离，异常不向外传播，绝不导致 App 闪退
         if (ANTI_TAMPER_ENABLED) {
             try {
@@ -203,9 +236,6 @@ public class GxApp {
         } catch (Throwable t) {
             Log.w(TAG, "integrityScan skipped", t);
         }
-
-        // 返回 realApp 给 Bootstrap 做生命周期转发（可能为 null）
-        return realApp;
     }
 
     private static Application load(Context base, Application proxy, File shellDir) throws Exception {
