@@ -165,19 +165,28 @@ public class GxApp {
         // 自身首次初始化(JPush/极光等)阻塞，进程被广播(如 com.xiaomi.mipush.ERROR)冷启动唤醒时
         // onReceive 超 10s 触发 Broadcast ANR。延迟后主线程独占完成 onCreate+onReceive，恢复 <10s。
         // 功能不丢：IdleHandler 在首屏后回调一次，各防御随后自行周期轮询。
-        try {
-            // 壳 boot() 运行在 Application 主线程，Looper.myQueue() (API 1+) 即主线程消息队列；
-            // 注意不能用 Looper.getQueue() (API 23+)，否则 min-api 21 的壳编译失败。
-            android.os.Looper.myQueue().addIdleHandler(new android.os.MessageQueue.IdleHandler() {
-                @Override
-                public boolean queueIdle() {
-                    startDefenses(base);
-                    return false; // 只执行一次
-                }
-            });
-        } catch (Throwable t) {
-            Log.w(TAG, "defer defenses failed, fallback immediate", t);
-            startDefenses(base);
+        //
+        // P-MAINPROC（2026-09-03 闪屏卡死修复 A 方案）：防御只在【主进程】启动。
+        // :pushcore 等子进程（无 UI、无敏感代码）跳过整套防御——子进程内 anti-frida 守护线程
+        // （含已移除的 fork+PTRACE_ATTACH 自检）与 native guard/扫描徒增引导耗时并可能干扰其
+        // binder 服务就绪（极光 JPush DataShare 主↔辅进程握手竞争 → 主线程同步 binder 死等 → 闪屏 ANR）。
+        if (isMainProcess(base)) {
+            try {
+                // 壳 boot() 运行在 Application 主线程，Looper.myQueue() (API 1+) 即主线程消息队列；
+                // 注意不能用 Looper.getQueue() (API 23+)，否则 min-api 21 的壳编译失败。
+                android.os.Looper.myQueue().addIdleHandler(new android.os.MessageQueue.IdleHandler() {
+                    @Override
+                    public boolean queueIdle() {
+                        startDefenses(base);
+                        return false; // 只执行一次
+                    }
+                });
+            } catch (Throwable t) {
+                Log.w(TAG, "defer defenses failed, fallback immediate", t);
+                startDefenses(base);
+            }
+        } else {
+            Log.i(TAG, "non-main process: deferred defenses skipped (isMainProcess=false)");
         }
 
         // 返回 realApp 给 Bootstrap 做生命周期转发（可能为 null）
@@ -232,6 +241,17 @@ public class GxApp {
             GxGuard.integrityScan();
         } catch (Throwable t) {
             Log.w(TAG, "integrityScan skipped", t);
+        }
+    }
+
+    /** 是否主进程（processName==包名）。:pushcore 等子进程返回 false。
+     *  用于跳过仅主进程需要的启动期重活（防御套件/完整性校验）。判定失败保守按主进程处理。 */
+    static boolean isMainProcess(Context ctx) {
+        try {
+            String pn = ctx.getApplicationInfo().processName;
+            return pn == null || pn.equals(ctx.getPackageName());
+        } catch (Throwable t) {
+            return true;
         }
     }
 
@@ -528,12 +548,15 @@ class GxDecryptor {
                 } catch (Throwable t) {
                     Log.w("GX", "fixDexChecksum skipped dex[" + i + "] (file path <26)", t);
                 }
-                // P-INTEGRITY：还原后自校验（抽样），fail-safe
-                try {
-                    int mism = nativeVerifyDex(buf, payload, seed, i, 64);
-                    Log.i("GX", "integrity dex_idx=" + i + " mismatches=" + mism + " (file path <26)");
-                } catch (Throwable t) {
-                    Log.w("GX", "integrity check skipped dex[" + i + "] (file path <26)", t);
+                // P-INTEGRITY：还原后自校验（抽样），fail-safe。仅在主进程执行
+                // （P-MAINPROC：子进程跳过，缩短引导；还原本身仍需，故在校验外层判断）。
+                if (GxApp.isMainProcess(ctx)) {
+                    try {
+                        int mism = nativeVerifyDex(buf, payload, seed, i, 64);
+                        Log.i("GX", "integrity dex_idx=" + i + " mismatches=" + mism + " (file path <26)");
+                    } catch (Throwable t) {
+                        Log.w("GX", "integrity check skipped dex[" + i + "] (file path <26)", t);
+                    }
                 }
             }
             // 取回修正后的字节落盘：先写 .tmp，flush+close 后 rename 为 .dex，
@@ -624,14 +647,18 @@ class GxDecryptor {
             }
             // P-INTEGRITY：DEX 还原后自校验——抽样解密载荷并与内存 live dex 比对，
             // 不匹配数 >0 表示还原失败或已被篡改。采样上限控制主线程耗时，避免启动期 ANR。
-            // fail-safe：异常仅记日志不阻断启动。
-            for (int i = 0; i < out.size(); i++) {
-                try {
-                    int mism = nativeVerifyDex(out.get(i), payload, seed, i, 64);
-                    Log.i("GX", "integrity dex_idx=" + i + " mismatches=" + mism);
-                } catch (Throwable t) {
-                    Log.w("GX", "integrity check skipped dex " + i, t);
+            // fail-safe：异常仅记日志不阻断启动。仅在主进程执行（P-MAINPROC：子进程跳过）。
+            if (GxApp.isMainProcess(ctx)) {
+                for (int i = 0; i < out.size(); i++) {
+                    try {
+                        int mism = nativeVerifyDex(out.get(i), payload, seed, i, 64);
+                        Log.i("GX", "integrity dex_idx=" + i + " mismatches=" + mism);
+                    } catch (Throwable t) {
+                        Log.w("GX", "integrity check skipped dex " + i, t);
+                    }
                 }
+            } else {
+                Log.i("GX", "non-main process: integrity verify skipped (" + out.size() + " dex)");
             }
         }
         return out;
@@ -1317,7 +1344,9 @@ class GxAntiFrida {
                 }
             }
         });
-        t.setName("gx-anti-frida");
+        // 线程名绝不含 "frida"/"gum" 等关键字：jg_integrity scan_threads 会枚举 /proc/self/task
+        // 匹配可疑线程名，若守护线程自身含 "frida" 必然自误报（thread_hits=1，每次启动必现）。
+        t.setName("gx-sec-mon");
         t.setDaemon(true);
         t.start();
     }
