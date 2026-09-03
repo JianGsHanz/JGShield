@@ -8,6 +8,8 @@ import android.os.Build;
 import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
@@ -31,7 +33,8 @@ import javax.crypto.spec.SecretKeySpec;
  * 但**极简**——只做三件事：
  *   1) 自举加载 lib<LIB_NAME>.so（字面量，早于任何 native 调用）；
  *   2) 从加密 zip 条目 __SHELL_DEX_ENTRY__ 读出 AES-GCM 加密的 GxApp 壳 DEX，
- *      解密后用 InMemoryDexClassLoader 注入 sysLoader（无磁盘明文）；
+ *      解密后注入 sysLoader：API26+ 用 InMemoryDexClassLoader(内存、无磁盘明文)，
+ *      <26 落盘 DexFile.loadDex 注入(同 GxApp.injectDexElements 的 <26 分支，平台限制)；
  *   3) 反射调用 GxApp.boot(base, this) 驱动真正的壳完成原 App 解密/启动，
  *      并把返回的 realApp 收下用于生命周期转发。
  *
@@ -104,20 +107,54 @@ public class GxBootstrap extends Application {
         Object[] existing = (Object[]) fDexElements.get(pathList);
         if (existing == null) existing = new Object[0];
 
-        Class<?> imdcClass = Class.forName("dalvik.system.InMemoryDexClassLoader");
-        Constructor<?> imdcCtor = imdcClass.getConstructor(ByteBuffer[].class, ClassLoader.class);
-        ByteBuffer[] arr = new ByteBuffer[]{buf};
-        Object imdc = imdcCtor.newInstance(arr, sysLoader);
-        Object imPathList = fPathList.get(imdc);
-        Object[] imElements = (Object[]) fDexElements.get(imPathList);
-        if (imElements == null || imElements.length == 0) {
-            throw new IOException("shell InMemoryDexClassLoader produced no elements");
-        }
         Class<?> elementClass = existing.getClass().getComponentType();
-        Object[] merged = (Object[]) java.lang.reflect.Array.newInstance(
-                elementClass, imElements.length + existing.length);
-        System.arraycopy(imElements, 0, merged, 0, imElements.length);
-        System.arraycopy(existing, 0, merged, imElements.length, existing.length);
+        Object[] merged;
+        if (Build.VERSION.SDK_INT >= 26) {
+            // API 26+：InMemoryDexClassLoader 内存加载，无磁盘明文（fileless）
+            Class<?> imdcClass = Class.forName("dalvik.system.InMemoryDexClassLoader");
+            Constructor<?> imdcCtor = imdcClass.getConstructor(ByteBuffer[].class, ClassLoader.class);
+            ByteBuffer[] arr = new ByteBuffer[]{buf};
+            Object imdc = imdcCtor.newInstance(arr, sysLoader);
+            Object imPathList = fPathList.get(imdc);
+            Object[] imElements = (Object[]) fDexElements.get(imPathList);
+            if (imElements == null || imElements.length == 0) {
+                throw new IOException("shell InMemoryDexClassLoader produced no elements");
+            }
+            merged = (Object[]) java.lang.reflect.Array.newInstance(
+                    elementClass, imElements.length + existing.length);
+            System.arraycopy(imElements, 0, merged, 0, imElements.length);
+            System.arraycopy(existing, 0, merged, imElements.length, existing.length);
+        } else {
+            // API<26：无 InMemoryDexClassLoader，DEX 必须落盘（fileless 不可得，平台能力限制，非 bug）。
+            // 与 GxApp.injectDexElements 的 <26 分支一致：DexFile.loadDex 落盘 + 反射构造 Element，
+            // 绕开 DexClassLoader 在部分 7.x ROM 上「No original dex files found」的黑盒行为。
+            File optDir = new File(base.getCacheDir(), "gxbootopt");
+            optDir.mkdirs();
+            optDir.setWritable(true, false);
+            File dexFile = File.createTempFile("gxboot", ".dex", optDir);
+            FileOutputStream fos = new FileOutputStream(dexFile);
+            try { fos.write(shellDex); } finally { fos.close(); }
+            String out = new File(optDir, "gxboot.odex").getAbsolutePath();
+            dalvik.system.DexFile df = dalvik.system.DexFile.loadDex(
+                    dexFile.getAbsolutePath(), out, 0);
+            Constructor<?> ctor2 = null, ctor4 = null;
+            try {
+                ctor2 = elementClass.getDeclaredConstructor(File.class, dalvik.system.DexFile.class);
+                ctor2.setAccessible(true);
+            } catch (Throwable t) { /* 回退 4 参 */ }
+            try {
+                ctor4 = elementClass.getDeclaredConstructor(
+                        File.class, boolean.class, File.class, dalvik.system.DexFile.class);
+                ctor4.setAccessible(true);
+            } catch (Throwable t) { /* 回退 2 参 */ }
+            Object elem = null;
+            if (ctor2 != null) elem = ctor2.newInstance(dexFile, df);
+            else if (ctor4 != null) elem = ctor4.newInstance(dexFile, false, null, df);
+            if (elem == null) throw new IOException("shell <26 element build failed");
+            merged = (Object[]) java.lang.reflect.Array.newInstance(elementClass, 1 + existing.length);
+            merged[0] = elem;
+            System.arraycopy(existing, 0, merged, 1, existing.length);
+        }
         fDexElements.set(pathList, merged);
 
         // 2) 反射驱动真正的壳 GxApp.boot(base, this)
