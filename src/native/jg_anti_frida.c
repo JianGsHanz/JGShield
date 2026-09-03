@@ -14,19 +14,20 @@
  * 抗 AI / 抗熟悉开源方案逆向者的补强（A1-A3）：
  *   A1. frida / xposed 签名串在 .so 中以 XOR(0x37) 存储，运行时解码后匹配；
  *       .so 二进制里搜不到明文 "frida"/"XposedBridge"，阻断 strings+grep+patch 最便宜的攻击路。
- *   A2.（已移除，2026-09-03）原“fork 子进程对父进程 PTRACE_ATTACH”自检：PTRACE_ATTACH
- *       会 group-stop 目标进程的全部线程，多线程 App（推送/binder 密集）在 MIUI 上反复被
- *       打断——实测与启动期 binder 握手卡死、ANR 收集器 dumpJavaBacktrace 超时相关，且违背
- *       jg_guard.c「不引入自 ptrace，调试器检测由 TracerPid 扫描覆盖」设计；被动 TracerPid
- *       (bit1) 已覆盖“正被调试”检测，故删除（自误报根因：Java 守护线程名 gx-anti-frida）。
+ *   A2. fork 子进程对父进程做 PTRACE_SEIZE（非 PTRACE_ATTACH）：成功=父此前未被 trace，
+ *       失败(EPERM)=父已被 frida/gdb trace（一个进程只能有一个 tracer）。关键修正
+ *       (2026-09-03)：原实现用 PTRACE_ATTACH 会 group-stop 目标全部线程，多线程 App 在 MIUI
+ *       上每 2s 被反复打断，实测与启动期 binder 握手卡死、ANR dumpJavaBacktrace 超时有关；
+ *       PTRACE_SEIZE 仅声明 tracer 关系、不停止目标线程，检测能力不变且不再冻结全进程。
+ *       EINVAL(极旧内核<3.4 不支持 SEIZE)保守判未命中。
  *   A3. maps 扫描 Xposed / LSPosed / riru / lspd / lspose 签名，覆盖 AI 常用 LSPosed hook。
  *
  * 返回位掩码：
  *   bit0 (1)  = maps 路径命中 frida 签名
  *   bit1 (2)  = TracerPid != 0
  *   bit2 (4)  = frida 默认端口开放(27042/27043)
+ *   bit3 (8)  = 主动 ptrace 自检：本进程已被 trace（frida/gdb），PTRACE_SEIZE 实现
  *   bit4 (16) = maps 路径命中 Xposed/LSPosed 签名
- *   （bit3 主动 ptrace 自检已移除，见 A2）
  */
 #include <jni.h>
 #include <string.h>
@@ -178,6 +179,31 @@ static int _scan_port(int port) {
     return (r == 0) ? 1 : 0;
 }
 
+/* A2: 主动 ptrace 自检（不 group-stop）。
+ * 思路：fork 子进程对父进程做 PTRACE_SEIZE。
+ *   - 成功 → 父进程此前未被 trace（detach 还原），子进程 _exit(0)；
+ *   - EPERM → 父进程已被 frida/gdb trace（一个进程只能有一个 tracer），子进程 _exit(2) 命中；
+ *   - EINVAL → 内核不支持 SEIZE（Android < 3.4），子进程 _exit(1) 保守未命中。
+ * PTRACE_SEIZE 仅声明 tracer 关系、不向目标线程发 SIGSTOP，故不会 group-stop 父进程全部线程，
+ * 区别于原 PTRACE_ATTACH 实现（已实测在 MIUI 多线程 App 上引发启动期 binder 卡死）。 */
+static int _scan_ptrace_self(void) {
+    pid_t child = fork();
+    if (child < 0) return 0;          /* fork 失败 → 保守判未命中 */
+    if (child == 0) {
+        pid_t parent = getppid();
+        if (ptrace(PTRACE_SEIZE, parent, 0, 0) == 0) {
+            ptrace(PTRACE_DETACH, parent, 0, 0);
+            _exit(0);                  /* 父未被 trace */
+        }
+        if (errno == EINVAL) _exit(1); /* 内核不支持 SEIZE, 保守未命中 */
+        _exit(2);                      /* EPERM 等: 父已被 trace, 命中 */
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) return 0;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 2) return 1;
+    return 0;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_gx_runtime_GxAntiFrida_scanJNI(JNIEnv* env, jclass clazz) {
     (void)env; (void)clazz;
@@ -185,6 +211,7 @@ Java_com_gx_runtime_GxAntiFrida_scanJNI(JNIEnv* env, jclass clazz) {
     if (_scan_maps_frida())                       mask |= 1;   /* bit0 frida maps */
     if (_scan_tracer_pid())                       mask |= 2;   /* bit1 TracerPid */
     if (_scan_port(27042) || _scan_port(27043))   mask |= 4;   /* bit2 frida port */
+    if (_scan_ptrace_self())                      mask |= 8;   /* bit3 ptrace self (SEIZE) */
     if (_scan_maps_xposed())                      mask |= 16;  /* bit4 Xposed/LSPosed */
     return (jint)mask;
 }
