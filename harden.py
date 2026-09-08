@@ -35,6 +35,7 @@ import traceback
 import config
 import verify_payload
 import dex_obf as dex_obf_mod
+import vmp_protect as vmp_mod  # T4-lite VMP 方法虚拟化（--vmp，opt-in 默认关）
 
 # Windows 下 --windowed exe 调起 console 子进程（java/aapt/adb/zipalign/keytool
 # 均为 console 子系统）会为其单独分配控制台窗口 → 加固时黑窗频闪。加此 flag
@@ -261,27 +262,23 @@ def build_payload(seed, dex_list, asset_list=None, method_sections=None, salt=No
         blob = encrypt_asset(seed, i, data)
         out += struct.pack("<I", len(blob))
         out += blob
-    # P3.1 方法区段：每个被抽取 DEX 一条 (dex_idx, stream_blob, entries)。
-    # 整 dex 方法码拼成一条流、整体压缩+整体加密为 stream_blob(一次 GCM)；
-    # entries 记录每个方法在流内的 (method_idx, code_off, insns_size, offset_in_stream, len_in_stream)。
+    # P3.4 方法区段：每个被抽取 DEX 一条 (dex_idx, entry_count, [per-method 条目]...)。
+    # 每方法条目 = (method_idx[4], code_off[4], insns_size[4], blob_len[4], blob)。
+    # blob = iv(12)+AES-256-GCM(zlib(insns))+tag(16)，per-method 独立密钥 JG|m{dex}.{method}。
     # 位于资产区段之后；解析器读完 dex+asset 后自然停在末尾，不受影响。
+    # 运行时：加载期 nativeRestoreMethods 批量解密写回（保 A9 校验）；解释桥 hook 在方法
+    # 执行前 O(1) 单方法还原；空闲 N 秒后 nativeReencryptSweep 将该方法 NOP 擦除。
     msecs = method_sections or []
     out += struct.pack("<I", len(msecs))
-    for (dex_idx, blob, entries) in msecs:
+    for (dex_idx, _blob, entries) in msecs:
         out += struct.pack("<I", dex_idx)
         out += struct.pack("<I", len(entries))
-        out += struct.pack("<I", len(blob))
-        out += blob
-        # P6：方法元数据表整体 zlib 压缩，避免 21 万方法 × 20B 裸 u32 占 ~4MB。
-        # 仅存 (method_idx, code_off, insns_size) 三项；offset_in_stream / len_in_stream
-        # 可由 insns_size 在还原端按序累加推得，无需存储。整体压缩后 212993×12B → ~1MB。
-        if entries:
-            meta = b"".join(struct.pack("<III", m[0], m[1], m[2]) for m in entries)
-        else:
-            meta = b""
-        meta_blob = zlib_compress(meta)
-        out += struct.pack("<I", len(meta_blob))
-        out += meta_blob
+        for (method_idx, code_off, insns_size, blob) in entries:
+            out += struct.pack("<I", method_idx)
+            out += struct.pack("<I", code_off)
+            out += struct.pack("<I", insns_size)
+            out += struct.pack("<I", len(blob))
+            out += blob
     # 盐 trailer：每次构建随机 32B，追加在所有区段之后（载荷最末）。
     # 所有解析器（native / verify / 壳）读完 dex+asset+method 区段后自然停住，
     # 从不读到这 32B；仅需「读末 32B 取 salt」即可还原派生种子。向后兼容旧解析逻辑。
@@ -312,15 +309,17 @@ def _u32(b, off):
     return (b[off] & 0xff) | ((b[off+1] & 0xff) << 8) \
         | ((b[off+2] & 0xff) << 16) | ((b[off+3] & 0xff) << 24)
 
-def derive_method_key(seed, dex_idx):
-    """P3 方法段 per-dex 密钥：HMAC(seed, "JG|m"+dexIdx)。
+def derive_method_key(seed, dex_idx, method_idx):
+    """P3 方法段 per-method 密钥：HMAC(seed, "JG|m"+dexIdx+"."+methodIdx)。
 
-    整 dex 的方法码拼成一条流、整体压缩后整体用此密钥加密（一次 GCM）。
-    相比旧版「逐方法压缩+逐方法加密」：明文方法码 12.58MB 由压缩比 ~1.08x
-    (≈11.65MB) 提升到 ~3x(≈4MB)，且 21 万方法的 28B IV/tag 固定开销(≈5.7MB)
-    降为每 dex 一次(≈0.5KB)。包体由 +15MB 降为近零增长，安全性不变
-    （方法抽取反脱壳层原样保留）。沿用整包种子体系，换签即失败。"""
-    msg = config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8")
+    P3.4 起改为【逐方法】独立加密：每个方法的 insns 单独 zlib+GCM（一次 GCM/方法），
+    label 含 dexIdx+methodIdx，使运行时 hook 可在「方法首次执行/空闲擦除后再调用」时
+    O(1) 单方法解密写回（无需为单个热方法解密整 dex 拼流）。代价：每方法 28B IV/tag
+    固定开销（21 万方法 ≈5.7MB）+ 失去跨方法 zlib 压缩（包体较 P6 逐 dex 整段略增，
+    但换来「per-method 解密即用即擦」真抗内存 dump）。沿用整包种子体系，换签即失败。
+    WB_KDF 开启时经白盒融合（与 native jg_method_restore*.c 的 #ifdef WB_KDF 分支一致）。"""
+    msg = (config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8")
+           + b"." + str(method_idx).encode("utf-8"))
     if config.WB_KDF:
         import whitebox_kdf
         return whitebox_kdf.wb_derive(seed, msg, config.WB_SECRET)
@@ -329,21 +328,19 @@ def derive_method_key(seed, dex_idx):
     return mac.digest()
 
 def extract_methods(seed, dex_idx, dex_bytes):
-    """抽取单个 DEX 每个方法的 CodeItem.insns，整 dex 拼成一条流、整体 zlib 压缩后
-    整体 AES-256-GCM 加密（per-dex 密钥，一次 GCM），并记录每个方法在流内的偏移/长度；
-    原位把 insns 回填 NOP（保留 insns_size 使 ART 仍可解析验证）。
+    """P3.4 逐方法抽取：每个方法的 CodeItem.insns 单独 zlib 压缩 + AES-256-GCM 加密
+    （per-method 密钥，一次 GCM/方法），原位把 insns 回填 NOP（保留 insns_size 使 ART
+    仍可解析验证）。运行时 hook 可在方法执行前 O(1) 单方法解密写回，空闲后再 NOP 擦除。
 
-    返回 (NOP 化后的 dex 字节, stream_blob, [(method_idx, code_off, insns_size,
-    offset_in_stream, len_in_stream), ...])。
-    - stream_blob = iv(12) + AES-256-GCM(ct+tag)，ct = zlib(concat_insns)。
-    - 运行时 native 整体解密+inflate 一次，再按 offset/len 逐方法 memcpy 回写。
-
-    相比旧版「逐方法压缩+逐方法加密」：明文方法码 12.58MB 由压缩比 ~1.08x(≈11.65MB)
-    提升到 ~3x(≈4MB)，且 21 万方法的 28B IV/tag 开销(≈5.7MB) 降为每 dex 一次(≈0.5KB)。
-    包体由 +15MB 降为近零增长，安全性不变（方法抽取反脱壳层原样保留）。"""
+    返回 (NOP 化后的 dex 字节, None, [(method_idx, code_off, insns_size, blob), ...])。
+    - blob = iv(12) + AES-256-GCM(zlib(insns)) + tag(16)；
+    - 中间元素保留为 None（历史 3 元组签名兼容 build_payload 调用点）；
+    - 运行时 native 逐方法解密（label JG|m{dex}.{method}），与 jg_method_restore_hook.c
+      jg_restore_handler / jg_method_restore.c jg_restore_methods 完全对齐。
+    相比 P6 逐 dex 整段：失去跨方法 zlib 压缩、每方法多 28B IV/tag，包体略增；
+    换来「per-method 解密即用即擦」真抗内存 dump（热方法每次调用无需解密整 dex）。"""
     dex = bytearray(dex_bytes)
-    entries = []          # (method_idx, code_off, insns_size, offset_in_stream, len_in_stream)
-    stream = bytearray()  # 按 entries 顺序拼接的 insns
+    entries = []          # (method_idx, code_off, insns_size, blob)
     class_defs_off = _u32(dex, 0x64)
     class_defs_size = _u32(dex, 0x60)
     for ci in range(class_defs_size):
@@ -373,21 +370,16 @@ def extract_methods(seed, dex_idx, dex_bytes):
                 continue
             insns_off = code_off + 16
             insns = bytes(dex[insns_off:insns_off + insns_size * 2])
-            offset = len(stream)
-            stream += insns
-            entries.append((running, code_off, insns_size, offset, insns_size * 2))
+            # 逐方法独立加密：per-method 密钥 + 各自 IV
+            key = derive_method_key(seed, dex_idx, running)
+            iv = os.urandom(12)
+            cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+            ct, tag = cipher.encrypt_and_digest(zlib_compress(insns))
+            blob = iv + ct + tag
+            entries.append((running, code_off, insns_size, blob))
             for k in range(insns_size * 2):       # 原位回填 NOP
                 dex[insns_off + k] = 0
-    # 整 dex 方法码拼流，整体压缩 + 整体加密（一次 GCM）
-    blob = b""
-    if stream:
-        comp = zlib_compress(bytes(stream))       # 整体 deflate
-        key = derive_method_key(seed, dex_idx)    # per-dex 密钥
-        iv = os.urandom(12)
-        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-        ct, tag = cipher.encrypt_and_digest(comp)
-        blob = iv + ct + tag
-    return bytes(dex), blob, entries
+    return bytes(dex), None, entries
 
 def zlib_compress(data):
     import zlib
@@ -622,7 +614,7 @@ def harden(input_apk, output_apk=None, keep=False,
            assets_encrypt=False, method_extract=False,
            ssl_pins=None, strengthen="log", rebuild_stub=True,
            wb_kdf=False, antidump=False, antifrida=False, dex_obf=False,
-           dex_rename=False, dex_cfg=False):
+           dex_rename=False, dex_cfg=False, vmp=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -735,6 +727,34 @@ def harden(input_apk, output_apk=None, keep=False,
     else:
         print("[*] 种子=HKDF-Extract(salt=随机32B, ikm=SHA256(内置证书 common))："
               "证书绑定+每次构建随机，换签即解密失败", flush=True)
+    # 3.0) T4-lite VMP 方法虚拟化（opt-in，默认关）：白名单方法在 *加密进载荷之前* 被
+    #      翻转为 native（access_flags|=ACC_NATIVE、code_off=0、原 insns 清零），运行时由
+    #      libjgguard.so 里的 jg_vmp.c 解释器执行嵌入 .rodata 的私有字节码（魔数 0xFD 0xC2）。
+    #      → 被保护方法在进程内存里没有 dalvik 明文，root dd /proc/pid/mem 抽到的是私有指令。
+    #      必须在 P3.1 方法抽取之前：native 方法 code_off=0，extract_methods 会自然跳过它们。
+    #      per-method XOR key 由 seed 派生（label="vmp"+idx），故每次构建的 .rodata 字节流都不同。
+    #      诚实边界：抬升逆向成本，不等价于"不可还原"——解释执行时私有指令仍是明文，
+    #      需配 OLLVM 混淆解释器本体（见 DESIGN.md）。
+    if vmp:
+        print("[3.0] T4-lite VMP 方法虚拟化（opt-in）：编译私有字节码 + 翻转 native ...",
+              flush=True)
+        def _vmp_key(i):
+            k = derive_key(seed, i, b"vmp")[0]
+            return k if k else 0x5A   # 0 号 key 等于没 XOR，兜底换一个非零值
+        vmp_res = vmp_mod.apply_vmp(dex_names, orig_dexes, _vmp_key, work)
+        if vmp_res:
+            orig_dexes = vmp_res["dexes"]
+            # 必须把包含 blob+JNI shim 的 .so 按本次 APK 重编（blob 是 APK 特定的）。
+            # 注意 build_stub 在 harden 里是局部导入（仅 rebuild_stub=True 时），此处必须自己导，
+            # 否则 rebuild_stub=False + --vmp 会 NameError。
+            import json
+            import build_stub as _bs
+            import stamp as _stamp
+            with open(_stamp.STAMP_PATH, encoding="utf-8") as _f:
+                _st = json.load(_f)
+            _bs._build_native(_st, vmp_shim=vmp_res["shim"])
+            print("[3.0] 虚拟化方法数: %d %s | native 已按 APK 重编（含 VMP 解释器+私有 blob）"
+                  % (vmp_res["count"], vmp_res["methods"]), flush=True)
     # P3.1 方法级指令抽取（默认关闭）：把每个方法的 insns 抽走加密、DEX 内原位回填 NOP。
     # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，待 P3.3 运行时还原。
     # 注意：开启后产物在 P3.3 之前不可独立运行（方法体为空），仅用于验证抽取链路。
@@ -867,6 +887,12 @@ def main():
                          "寄存器并插入「无用条件分支+死块」，改变 CFG 形状、干扰线性反编译，但不影响语义、"
                          "不崩 ART。⚠ 这是弱版，强度远低于 OLLVM；真·CFG 平坦化留给 B2(native/OLLVM)。"
                          "默认关，需真机验证后才用于生产。")
+    ap.add_argument("--vmp", action="store_true",
+                    help="T4-lite VMP 方法虚拟化（opt-in，默认关闭）：把白名单纯计算方法在加密进载荷之前"
+                         "翻转为 native（code_off=0、原 dalvik 体清零），运行时由 libjgguard.so 里的解释器"
+                         "执行嵌入 .rodata 的私有字节码 → 进程内存里这些方法没有 dalvik 明文，"
+                         "root dd /proc/pid/mem 抽到的是私有指令。会按本次 APK 重编 native。"
+                         "⚠ 抬升逆向成本 ≠ 不可还原：解释执行时私有指令仍是明文，需配 OLLVM 混淆解释器。")
     ap.add_argument("--ollvm-ndk", metavar="DIR",
                     help="OLLVM 混淆 NDK 的 clang bin 目录（如 D:/Android/AndoridSDK/ndk/27.2.../"
                          "toolchains/llvm/prebuilt/windows-x86_64/bin）。指定后壳 native 编译改用该 OLLVM "
@@ -917,7 +943,8 @@ def main():
                antifrida=args.antifrida,
                dex_obf=args.dex_obf,
                dex_rename=args.dex_rename,
-               dex_cfg=args.dex_cfg)
+               dex_cfg=args.dex_cfg,
+               vmp=args.vmp)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

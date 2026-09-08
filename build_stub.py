@@ -187,6 +187,9 @@ NATIVE_COMPILE = [
     "jg_guard.c", "jg_method_restore.c", "jg_integrity.c",
     "jg_inline_hook.c", "jg_method_restore_hook.c", "jg_hook_bridge.S",
     "jg_anti_frida.c",
+    "jg_ptrace_guard.c",   # P0-0904 持久 self-ptrace 防护（堵 root /proc/pid/mem 直读）
+    "jg_preload.c",        # P0-B 0907 OpenCommon 入口预载校验（赢 spawn 竞态的唯一窗口）
+    "jg_vmp.c",            # T4-lite VMP 解释器核心（私有字节码执行；per-APK shim 由 harden 生成）
 ]
 
 # 内联 hook 子系统仅 AArch64 编入（jg_hook_bridge.S 为纯 AArch64 汇编）
@@ -409,6 +412,10 @@ def _sed_native(s, st):
     classes = st["classes"]
     # JNI 符号类名段随机化（GxGuard/GxKeys/GxDecryptor/Obf 有 JNI；
     # P0-A 起 GxBootstrap 也新增 native 壳密钥派生，必须同步改写其 JNI 符号）
+    # 反内存 dump 层（2026-09-04）：GxAntiDump 在 st["classes"] 随机化表内，
+    # 但自 P0-C 回退后它已无 native 方法（纯 Java 本地检测），故不在此改写其 JNI 符号，
+    # 否则 native 会导出 Java_<pkg>_GxAntiDump_xxx 而 ART 不查找（反成死代码）。
+    # 注：GxAntiFrida 不在 classes 表内（类名保持原样），故无需也不应加入。
     for old, new in (("GxGuard", classes["GxGuard"]),
                      ("GxKeys", classes["GxKeys"]),
                      ("GxDecryptor", classes["GxDecryptor"]),
@@ -495,7 +502,7 @@ def _bake_whitebox_kdf(st):
     print("[*] 白盒 KDF 已烘焙 WB_STATE 进 whitebox_kdf.h")
 
 
-def _build_native(st):
+def _build_native(st, vmp_shim=None):
     shutil.rmtree(TMP_NATIVE, ignore_errors=True)
     shutil.copytree(NATIVE_SRC, TMP_NATIVE)
     _regen_vectors(st)
@@ -515,6 +522,12 @@ def _build_native(st):
     g += _obf_native_c(st)
     with open(guard_path, "w", encoding="utf-8") as f:
         f.write(g)
+    # VMP shim: 由 harden 按 APK 生成的 JNI 导出 + 私有 blob, 编进同一 .so。
+    # 故意不进 NATIVE_COMPILE（否则会被 _sed_native 处理）, 但拷贝进 TMP_NATIVE 随库编译。
+    extra_srcs = []
+    if vmp_shim and os.path.isfile(vmp_shim):
+        shutil.copy(vmp_shim, os.path.join(TMP_NATIVE, "jg_vmp_shim.c"))
+        extra_srcs.append("jg_vmp_shim.c")
 
     # 远端 OLLVM（路线 B）：本地完成源码随机化后，传给 Ubuntu VM 编译
     if _resolve_ollvm_remote():
@@ -558,6 +571,8 @@ def _build_native(st):
         out = os.path.join(out_dir, "lib%s.so" % st["lib_name"])
         srcs = [os.path.join(TMP_NATIVE, f) for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _hook_files]
+        for es in extra_srcs:
+            srcs.append(os.path.join(TMP_NATIVE, es))
         subprocess.check_call(
             [clang, "--shared", "-fPIC", "-O2", "-fno-ident"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
@@ -568,7 +583,7 @@ def _build_native(st):
         raise RuntimeError("未构建任何 ABI 的 native 库")
 
 
-def _build_native_remote(st):
+def _build_native_remote(st, extra_srcs=()):
     """路线 B：本地已完成源码随机化，scp 到 Ubuntu VM，ssh 调远端注入 OLLVM 的 NDK clang
     编出 4 ABI 的 lib<lib_name>.so，再 scp 回 tools/libjgguard/<abi>/。保留每次随机化。"""
     host = _resolve_ollvm_remote_host()
@@ -613,6 +628,7 @@ def _build_native_remote(st):
         clang = posixpath.join(ndk_bin, _REMOTE_CLANG[abi])
         srcs = [f for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _HOOK_FILES]
+        srcs = srcs + list(extra_srcs)
         out_name = "lib%s.so" % st["lib_name"]
         wb = "-DWB_KDF" if st.get("wb_kdf") else ""
         # -unwindlib=none 必须显式给：upstream clang 对 Android 目标无条件追加
