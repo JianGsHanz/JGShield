@@ -1,8 +1,10 @@
 # vmp_protect.py -- T4-lite VMP "进壳" 集成核心。
 #
-# 把一个 APK 里白名单方法的 DEX 字节码「脱壳」：
-#   1) 私有字节码(blob, 魔数 FD C2) 来自 PRECOMPILED_VMP（开发环境用 androguard 一次性编译内嵌）；
-#      运行时仅需用 per-build key 重新 XOR 包裹，无需 androguard；
+# 对「任意 App」通用：勾选 VMP 后自动扫描全部 DEX 的全部方法，用 vmp_compile 的
+# 安全子集闸门筛选（纯 int/long 计算、regs<=15、无 invoke/字段/数组/对象/字符串/
+# float/double/异常表），命中的方法在构建期现场编译成私有字节码：
+#   1) 私有字节码(blob, 魔数 FD C2 + per-method XOR key) 由 vmp_compile.compile 现场生成，
+#      零 androguard 依赖（打包 exe 也能跑）；
 #   2) 在原始 app DEX 里把该方法翻转为 native (access_flags|=ACC_NATIVE, code_off=0) 并清零原 insns;
 #   3) 生成 jg_vmp_shim.c: 把 blob 编进 .so .rodata, 并为每个方法导出 JNI 符号 Java_<cls>_<name>,
 #      运行时由 libjgguard.so 里的解释器(jg_vmp.c)执行私有字节码。
@@ -16,32 +18,12 @@ import struct
 import zlib
 import hashlib
 
-# 注意: androguard 仅用于「自定义白名单目标」的开发期实时编译回退，不在模块顶层 import。
-# 常规 ylyk 白名单全部预编译内嵌，运行时零 androguard 依赖，故打包 exe 也能正常工作。
-
-# 默认白名单: 4 个已验证(对照参考实现 0 mismatch)的 ylyk 纯计算方法。
-DEFAULT_WHITELIST = [
-    ("Lcom/zhuomogroup/ylyk/beans/a;",  "a", "(J)I"),
-    ("Lcom/zhuomogroup/ylyk/utils/r0;", "g", "(C)Z"),
-    ("Lcom/zhuomogroup/ylyk/utils/r0;", "h", "(C)Z"),
-    ("Lcom/zhuomogroup/ylyk/utils/p0;", "n", "(Z)I"),
-]
-
-# 预编译的私有字节码（canonical，即未 XOR key 的纯私有指令流）。
-# 这 4 个方法是 ylyk 固定方法，其私有字节码与输入 APK 无关，故在开发环境用
-# androguard 一次性编译后内嵌；运行时只需用 per-build key 重新 XOR 包裹即可。
-# 这是让 VMP 在打包 exe 中可用、又不必把 androguard 打进 bundle 的关键。
-# 新增自定义白名单目标时（非常规 ylyk 加固）才退回 androguard 实时编译（开发期）。
-PRECOMPILED_VMP = {
-    ('Lcom/zhuomogroup/ylyk/beans/a;', 'a', '(J)I'):
-        {"code": bytes.fromhex('0100200000000d0002000a0202000203021b031803'), "param_reg": 2},
-    ('Lcom/zhuomogroup/ylyk/utils/r0;', 'g', '(C)Z'):
-        {"code": bytes.fromhex('0100610000000f0100161c00000001007a00000010010016380000000100410000000f0100164300000001005a000000110100164300000001010100000015490000000101000000001801'), "param_reg": 1},
-    ('Lcom/zhuomogroup/ylyk/utils/r0;', 'h', '(C)Z'):
-        {"code": bytes.fromhex('0100610000000f0100161c00000001007a000000100100168e0000000100410000000f0100163800000001005a000000100100168e000000010027000000130100168e000000010019200000130100168e00000001002d000000130100168e0000000100300000000f010016830000000100390000001101001683000000158e00000001010000000015940000000101010000001801'), "param_reg": 1},
-    ('Lcom/zhuomogroup/ylyk/utils/p0;', 'n', '(Z)I'):
-        {"code": bytes.fromhex('010f0000000013000f16190000000100c500067f151f0000000100f900067f1800'), "param_reg": 0},
-}
+# 通用自动发现：不再有硬编码包名白名单/预编译 blob。
+# 唯一可调旋钮是「单包最多虚拟化多少方法」——防止 .so / shim C 体积爆炸。
+# ylyk 实测安全子集约 5900 个方法；上限 300 时 shim C 约 1MB、编译耗时可控。
+MAX_VMP_METHODS = int(os.environ.get("JG_VMP_MAX_METHODS", "300"))
+# 过于短小的方法（几条指令）虚拟化收益低、风险不低，设下限。
+MIN_VMP_INSNS = int(os.environ.get("JG_VMP_MIN_INSNS", "4"))
 
 ACC_NATIVE = 0x100
 ACC_ABSTRACT = 0x400
@@ -50,26 +32,28 @@ ACC_CONSTRUCTOR = 0x200  # 顺手清掉, 避免 native+constructor 冲突
 TYPE_CLASS_DATA_ITEM = 0x2000  # 注意：0x1000 是 MAP_LIST，CLASS_DATA_ITEM 是 0x2000（踩过坑）
 
 
-# ---------- VMP 编译器（仅 --vmp 时按需懒加载） ----------
+# ---------- VMP 编译器（懒加载，零 androguard 依赖） ----------
 def _ensure_vmp_compiler():
-    """返回 experiments/vmp_lite/vmp_from_dex.compile_method。
-
-    仅在 --vmp 加固路径调用。生产 exe 未打包 androguard/实验脚本，
-    若在此环境请求 VMP 会抛清晰错误而非模块加载崩溃。
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.join(here, "experiments", "vmp_lite")
-    if cand not in sys.path:
-        sys.path.insert(0, cand)
+    """返回 vmp_compile 模块。vmp_compile 依赖 vmp_arch2（纯 Python，位于
+    experiments/vmp_lite/），这里做 sys.path 兜底，打包 exe 也能 import。"""
     try:
-        from vmp_from_dex import compile_method
+        import vmp_compile
+        return vmp_compile
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "experiments", "vmp_lite"), here):
+        if cand not in sys.path:
+            sys.path.insert(0, cand)
+    try:
+        import vmp_compile
+        return vmp_compile
     except ImportError as e:
         raise RuntimeError(
-            "VMP 编译依赖开发期脚本 vmp_from_dex（需要 androguard + experiments/vmp_lite）。"
-            "当前运行环境（打包 exe / 未安装 androguard）不支持 VMP 加固。"
-            "请改用源码开发环境，或在 GUI/CLI 中关闭 VMP 选项。"
+            "VMP 编译依赖 vmp_compile.py + vmp_arch2.py（两者均为纯 Python，无 androguard 依赖）。"
+            "当前运行环境找不到这两个模块，无法启用 VMP——请在 GUI/CLI 中关闭 VMP 选项，"
+            "或确认打包时已包含 experiments/vmp_lite/vmp_arch2.py。原始错误: %s" % e
         ) from e
-    return compile_method
 
 
 # ---------- DEX 基础读写 ----------
@@ -440,129 +424,164 @@ def patch_single_dex(dex_bytes, targets):
 ACC_STATIC = 0x8
 
 
-def _discover_native(dex_names, orig_dexes, whitelist):
-    """无 androguard：用 vmp_protect 自带 DEX 解析器在 orig_dexes 中定位白名单方法。
-    仅对 PRECOMPILED_VMP 内的固定方法生效（常规 ylyk 加固走这条，exe 无 androguard 也可用）。"""
-    found = []
-    name_count = {}                      # (cls, name) -> 同名方法个数
-    hit_map = {}                        # (cls, name, desc) -> (dex_idx, static)
-    for di, db in enumerate(orig_dexes):
-        if b"zhuomogroup" not in db:
+def _desc_safe(desc):
+    """描述符闸门：拒绝 float/double 的返回或参数。
+
+    F/D 无法用 int64 私有寄存器位精确表示 —— shim 里 (int64_t)p 是「值转换」而非
+    「位重解释」，虚拟化后会静默算出错误结果。对象/数组参数是纯指针，位精确，允许。
+    """
+    try:
+        rp = desc.rindex(')')
+        ret = desc[rp + 1:]
+        body = desc[desc.index('(') + 1:rp]
+    except ValueError:
+        return False
+    if 'F' in ret or 'D' in ret:
+        return False
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == '[':
+            i += 1
             continue
+        if c == 'L':
+            j = body.find(';', i)
+            if j < 0:
+                return False
+            i = j + 1
+            continue
+        if c in 'FD':
+            return False
+        i += 1
+    return True
+
+
+def _discover_auto(dex_names, orig_dexes, max_methods=None, only=None):
+    """通用自动发现：扫描全部 DEX 的全部方法，用 vmp_compile 的安全子集闸门筛选。
+
+    与包名无关（不再有 zhuomogroup 之类硬编码），任意 App 勾选 VMP 都生效。
+    返回 [{dex_idx,cls,name,desc,code_off,static,overloaded}]。
+    """
+    if max_methods is None:
+        max_methods = MAX_VMP_METHODS
+    vc = _ensure_vmp_compiler()
+
+    # 一遍遍历：统计同名重载(JNI 符号需要) + 收集「有方法体」的候选
+    name_count = {}
+    cands = []
+    dex_cache = {}
+    for di, db in enumerate(orig_dexes):
         dex = bytearray(db)
-        cdo, cds = _classdef_off(dex), _classdef_size(dex)
+        dex_cache[di] = dex
+        try:
+            cdo, cds = _classdef_off(dex), _classdef_size(dex)
+        except Exception:
+            continue
         for ci in range(cds):
             cd_pos = cdo + ci * 32
-            cls_name = _type_name(dex, _u32(dex, cd_pos))
-            cd_off = _u32(dex, cd_pos + 0x18)
+            try:
+                cls_name = _type_name(dex, _u32(dex, cd_pos))
+                cd_off = _u32(dex, cd_pos + 0x18)
+            except Exception:
+                continue
             if cd_off == 0:
                 continue
-            st, _ = _parse_class_data(dex, cd_off)
+            try:
+                st, _ = _parse_class_data(dex, cd_off)
+            except Exception:
+                continue
             for lst in (st["dm"], st["vm"]):
                 for (midx, af, co) in lst:
-                    nm, ds = _method_name_desc(dex, midx)
+                    try:
+                        nm, ds = _method_name_desc(dex, midx)
+                    except Exception:
+                        continue
                     name_count[(cls_name, nm)] = name_count.get((cls_name, nm), 0) + 1
-                    if (cls_name, nm, ds) in whitelist:
-                        hit_map[(cls_name, nm, ds)] = (di, bool(af & ACC_STATIC))
-    for (cls, name, desc) in whitelist:
-        if (cls, name, desc) in hit_map:
-            di, static = hit_map[(cls, name, desc)]
-            found.append({"dex_idx": di, "cls": cls, "name": name, "desc": desc,
-                          "static": static,
-                          "overloaded": name_count.get((cls, name), 1) > 1,
-                          "method": None})
-        else:
-            print("[VMP] 警告: 白名单方法 %s.%s%s 在当前 APK 未找到, 跳过" % (cls, name, desc))
-    return found
+                    if co == 0 or (af & ACC_ABSTRACT):
+                        continue
+                    if only is not None and (cls_name, nm, ds) not in only:
+                        continue
+                    cands.append((di, cls_name, nm, ds, af, co))
 
-
-def _discover_androguard(dex_names, orig_dexes, whitelist):
-    """开发期回退：白名单含自定义（非预编译）目标时，用 androguard 定位含 method 对象。"""
-    try:
-        from androguard.misc import AnalyzeDex
-    except ImportError as e:
-        raise RuntimeError(
-            "VMP 白名单含非预编译的自定义目标，需 androguard 实时编译。"
-            "当前环境未安装 androguard，仅预编译的 ylyk 白名单方法可离线强化（含 exe）。"
-        ) from e
-    import tempfile
-    idx = {}
-    name_count = {}
-    for di, db in enumerate(orig_dexes):
-        if b"zhuomogroup" not in db:
-            continue
-        t = tempfile.mktemp(suffix=".dex")
-        open(t, "wb").write(db)
-        try:
-            ret = AnalyzeDex(t)
-            vm = [x for x in ret if hasattr(x, "get_classes")][0]
-            for c in vm.get_classes():
-                cn = c.get_name()
-                for m in c.get_methods():
-                    key = (di, cn, m.get_name(), m.get_descriptor())
-                    idx[key] = m
-                    name_count[(cn, m.get_name())] = name_count.get((cn, m.get_name()), 0) + 1
-        finally:
-            try:
-                os.remove(t)
-            except OSError:
-                pass
     found = []
-    for (cls, name, desc) in whitelist:
-        hit = next(((k[0], m) for k, m in idx.items()
-                    if k[1] == cls and k[2] == name and k[3] == desc), None)
-        if hit:
-            found.append({"dex_idx": hit[0], "cls": cls, "name": name, "desc": desc,
-                          "method": hit[1],
-                          "static": bool(hit[1].get_access_flags() & ACC_STATIC),
-                          "overloaded": name_count.get((cls, name), 1) > 1})
-        else:
-            print("[VMP] 警告: 白名单方法 %s.%s%s 在当前 APK 未找到, 跳过" % (cls, name, desc))
+    skipped = {}
+    for (di, cls_name, nm, ds, af, co) in cands:
+        if len(found) >= max_methods:
+            break
+        dex = dex_cache[di]
+        if not _desc_safe(ds):
+            skipped['float/double 描述符'] = skipped.get('float/double 描述符', 0) + 1
+            continue
+        try:
+            if _u16(dex, co + 6) != 0:      # tries_size != 0 -> 带 try/catch，异常语义无法还原
+                skipped['try/catch'] = skipped.get('try/catch', 0) + 1
+                continue
+            ok, reason = vc.classify(dex, co)
+        except Exception as e:
+            ok, reason = False, 'exc:%s' % e
+        if not ok:
+            key = str(reason).split(':')[0]
+            skipped[key] = skipped.get(key, 0) + 1
+            continue
+        try:
+            _r, insns, _isz = vc.decode_method(dex, co)
+        except Exception as e:
+            skipped['decode:%s' % type(e).__name__] = skipped.get('decode:%s' % type(e).__name__, 0) + 1
+            continue
+        if len(insns) < MIN_VMP_INSNS:
+            skipped['过短(<insns)'] = skipped.get('过短(<insns)', 0) + 1
+            continue
+        found.append({"dex_idx": di, "cls": cls_name, "name": nm, "desc": ds,
+                      "code_off": co,
+                      "static": bool(af & ACC_STATIC),
+                      "overloaded": name_count.get((cls_name, nm), 1) > 1})
+
+    print("[VMP] 自动扫描完成: 有体方法 %d, 安全子集命中 %d (上限 %d, 最短 %d 指令)"
+          % (len(cands), len(found), max_methods, MIN_VMP_INSNS))
+    if skipped:
+        top = sorted(skipped.items(), key=lambda kv: -kv[1])[:6]
+        print("[VMP] 未命中原因 top: " + ", ".join("%s=%d" % kv for kv in top))
     return found
 
 
-def discover_targets(dex_names, orig_dexes, whitelist=None):
-    """在 orig_dexes 里找到白名单方法, 返回 [{dex_idx,cls,name,desc,method,static,overloaded}]。
+def discover_targets(dex_names, orig_dexes, whitelist=None, max_methods=None):
+    """在 orig_dexes 里找到可虚拟化方法, 返回 [{dex_idx,cls,name,desc,code_off,static,overloaded}]。
 
-    若白名单全部落在 PRECOMPILED_VMP（常规 ylyk 加固）则走原生解析器，无需 androguard；
-    否则回退 androguard（开发期自定义目标）。这保证 exe 打包环境也能正常 VMP 加固。
+    默认（whitelist=None）= 通用自动发现：任意 App 都生效，无需硬编码包名。
+    whitelist 仅作调试/回归用：显式指定时只考虑这些 (cls,name,desc)。
     """
-    if whitelist is None:
-        whitelist = DEFAULT_WHITELIST
-    precompiled = {(c, n, d) for (c, n, d) in PRECOMPILED_VMP}
-    if all((c, n, d) in precompiled for (c, n, d) in whitelist):
-        return _discover_native(dex_names, orig_dexes, whitelist)
-    return _discover_androguard(dex_names, orig_dexes, whitelist)
+    if whitelist:
+        return _discover_auto(dex_names, orig_dexes, max_methods=max_methods,
+                              only=set(whitelist))
+    return _discover_auto(dex_names, orig_dexes, max_methods=max_methods)
 
 
-def compile_targets(targets, keys):
-    """把目标方法编译成私有 blob。keys[i] = 第 i 个方法的 per-build XOR key。
+def compile_targets(targets, keys, orig_dexes):
+    """把目标方法现场编译成私有 blob。keys[i] = 第 i 个方法的 per-build XOR key。
 
-    预编译目标直接取出 canonical code 并用 per-build key 重新包裹（保留每构建 key 不同）；
-    自定义目标回退 androguard 实时编译。返回 [{cls,name,desc,blob,param_reg,static,overloaded}]。
+    返回 [{cls,name,desc,blob,param_reg,static,overloaded}]。
     注: key 必须 per-method 且 per-build 不同 —— 固定 0xC2 会让所有构建产物
     的 .rodata 出现同一字节流, 成为跨版本 diff 的锚点。
     """
+    vc = _ensure_vmp_compiler()
     out = []
+    dex_cache = {}
     for i, t in enumerate(targets):
         key = keys[i] & 0xFF
-        pre = PRECOMPILED_VMP.get((t["cls"], t["name"], t["desc"]))
-        if pre is not None:
-            code = pre["code"]
-            blob = bytes([0xFD, 0xC2, key]) + bytes(b ^ key for b in code)
-            preg = pre["param_reg"]
-        else:
-            # 自定义目标：开发期回退 androguard 实时编译
-            compile_method = _ensure_vmp_compiler()
-            blob, _m, preg = compile_method(t["cls"], t["name"], t["desc"],
-                                            xor_key=key, method=t["method"])
+        di = t["dex_idx"]
+        if di not in dex_cache:
+            dex_cache[di] = bytearray(orig_dexes[di])
+        try:
+            blob, preg = vc.compile(dex_cache[di], t["code_off"], t["desc"], key)
+        except Exception as e:
+            print("[VMP] 跳过 %s.%s%s: 编译失败 (%s: %s)"
+                  % (t["cls"], t["name"], t["desc"], type(e).__name__, e))
+            continue
         out.append({"cls": t["cls"], "name": t["name"], "desc": t["desc"],
                     "blob": blob, "param_reg": preg,
                     "static": t["static"], "overloaded": t["overloaded"]})
-        print("[VMP] 编译 %s.%s%s -> blob %d 字节, param_reg=%d, key=0x%02x%s"
-              % (t["cls"].split("/")[-1], t["name"], t["desc"],
-                 len(blob), preg, blob[2],
-                 "" if t["static"] else "  [非static: this 占 reg %d]" % (preg - 1)))
+    print("[VMP] 编译完成: %d/%d 个方法 -> 私有字节码 (总 %d 字节)"
+          % (len(out), len(targets), sum(len(m["blob"]) for m in out)))
     return out
 
 
@@ -591,6 +610,10 @@ def _param_regs(desc):
     res = []
     i = 0
     while i < len(params):
+        if params[i] == "L":
+            i = params.index(";", i) + 1
+            res.append(("jobject", 1))
+            continue
         if params[i] == "[":
             while params[i] == "[":
                 i += 1
@@ -633,7 +656,31 @@ def _ret_cast(desc):
 
 
 def _jni_mangle(s):
-    return s.replace("_", "_1").replace("/", "_").replace(";", "_2").replace("[", "_3")
+    """JNI 全名修饰（JNI spec 同名规则）。
+
+    ⚠ 踩过的坑: 之前只处理 _ / ; [ / ，漏了内部类的 '$'。
+    ART 查找 native 实现时用的是 Java_androidx_..._ItemTouchHelper_00024Callback_xxx，
+    若符号里保留裸 '$' 则注册/查找不到 -> 运行期 UnsatisfiedLinkError 崩溃。
+    规则: 字母数字保留；'/' '.' -> '_'；'_'->'_1' ';'->'_2' '['->'_3'；
+    其它字符 -> '_0' + UTF-16 码元的 4 位十六进制（如 '$' -> _00024）。
+    """
+    out = []
+    for ch in s:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch in "/.":
+            out.append("_")
+        elif ch == "_":
+            out.append("_1")
+        elif ch == ";":
+            out.append("_2")
+        elif ch == "[":
+            out.append("_3")
+        else:
+            b = ch.encode("utf-16-be")
+            for i in range(0, len(b), 2):
+                out.append("_0%04x" % ((b[i] << 8) | b[i + 1]))
+    return "".join(out)
 
 
 def _jni_name(cls, name, desc=None, overloaded=False):
@@ -681,7 +728,10 @@ def gen_shim_c(compiled, out_path):
             lines.append("    seed[%d] = (int64_t)(intptr_t)thiz;" % (m["param_reg"] - 1))
             nargs = max(nargs, m["param_reg"])
         for j, (ct, rs, w) in enumerate(layout):
-            lines.append("    seed[%d] = (int64_t)p%d;" % (m["param_reg"] + rs, j))
+            # 对象/数组参数是纯指针：先转 intptr_t 再转 int64_t，避免 32 位 ABI 上
+            # 指针直接转 int64_t 的符号扩展差异（真机会拿到错误的寄存器种子值）。
+            cast = "(int64_t)(intptr_t)p%d" if ct == "jobject" else "(int64_t)p%d"
+            lines.append("    seed[%d] = %s;" % (m["param_reg"] + rs, cast % j))
             nargs = max(nargs, m["param_reg"] + rs + w)
         lines.append("    size_t n; uint8_t* code = jg_vmp_deobfuscate("
                      "kJG_VMP_BLOB_%d, sizeof(kJG_VMP_BLOB_%d), &n);" % (i, i))
@@ -704,37 +754,44 @@ def apply_vmp(dex_names, orig_dexes, key_fn, work_dir, whitelist=None):
     """
     tg = discover_targets(dex_names, orig_dexes, whitelist)
     if not tg:
-        print("[VMP] 无可虚拟化目标（白名单方法均未命中），跳过")
+        print("[VMP] 当前 APK 未发现可虚拟化的安全子集方法，跳过")
         return None
     keys = [key_fn(i) & 0xFF for i in range(len(tg))]
-    compiled = compile_targets(tg, keys)
-    patched = patch_dexes(orig_dexes, tg)
+    compiled = compile_targets(tg, keys, orig_dexes)
+    if not compiled:
+        print("[VMP] 全部目标编译失败，跳过 VMP")
+        return None
+    # ⚠ 关键：只翻转「真正编译成功」的方法为 native。
+    # 若把编译失败的方法也翻成 native，运行时会找不到 JNI 实现 -> UnsatisfiedLinkError 崩溃。
+    ok_keys = {(m["cls"], m["name"], m["desc"]) for m in compiled}
+    patch_tg = [t for t in tg if (t["cls"], t["name"], t["desc"]) in ok_keys]
+    patched = patch_dexes(orig_dexes, patch_tg)
     os.makedirs(work_dir, exist_ok=True)
     shim = os.path.join(work_dir, "jg_vmp_shim.c")
     gen_shim_c(compiled, shim)
-    methods = [(m["cls"], m["name"], m["desc"], len(m["blob"]), keys[i])
-               for i, m in enumerate(compiled)]
+    methods = [(m["cls"], m["name"], m["desc"], len(m["blob"]), m["blob"][2])
+               for m in compiled]
     return {"dexes": patched, "shim": shim, "methods": methods, "count": len(compiled)}
 
 
 if __name__ == "__main__":
-    # 独立自测: 直接在 ylyk 原始 DEX 上验证修补器(不进 harden)。
+    # 独立自测: 直接在 APK 原始 DEX 上跑「自动发现 -> 编译 -> 修补 -> 生成 shim」全链路。
     import zipfile
     APK = "D:/APK/ylyk_5.9.4/app-Ptest-5.9.4-2026-08-04.apk"
     apk = os.environ.get("VMP_APK", APK)
     z = zipfile.ZipFile(apk)
-    names = sorted(n for n in z.namelist() if n.endswith(".dex") and b"zhuomogroup" in z.read(n))
+    names = sorted(n for n in z.namelist() if n.endswith(".dex"))
     orig = [z.read(n) for n in names]
-    # 自测用 key：与生产同样走 per-method 不同 key（生产由 harden 的 HKDF 派生）
-    keys = [(0x5A + i * 37) & 0xFF for i in range(64)]
-    tg = discover_targets(names, orig)
-    comp = compile_targets(tg, keys)
-    patched = patch_dexes(orig, tg)
-    # 验证: 修补后 DEX 不复包含原 dalvik 方法体(14 字节 a(J)I)
-    import binascii
-    needle = bytes.fromhex("13002000a5000200c20284230f03")
-    for di, (o, p) in enumerate(zip(orig, patched)):
-        print("dex[%d] orig=%d patched=%d  dalvik-needle-in-patched=%s"
-              % (di, len(o), len(p), needle in p))
-    gen_shim_c(comp, os.path.join(HERE, "experiments", "vmp_lite", "jg_vmp_shim_test.c"))
-    print("[OK] 自测完成")
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    res = apply_vmp(names, orig, (lambda i: (0x5A + i * 37) & 0xFF),
+                    os.path.join(HERE, "experiments", "vmp_lite"))
+    if not res:
+        print("[FAIL] 未发现任何可虚拟化方法")
+        raise SystemExit(1)
+    print("[VMP] 虚拟化 %d 个方法:" % res["count"])
+    for (cls, nm, ds, blen, key) in res["methods"][:10]:
+        print("    %s.%s%s  blob=%dB key=0x%02x" % (cls, nm, ds, blen, key))
+    for di, (o, p) in enumerate(zip(orig, res["dexes"])):
+        print("dex[%d] orig=%d patched=%d changed=%s" % (di, len(o), len(p), o != p))
+    print("[OK] 自测完成 -> %s" % res["shim"])

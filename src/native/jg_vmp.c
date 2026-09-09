@@ -17,7 +17,11 @@ enum {
     OP_SHL=0x0B, OP_SHR=0x0C, OP_USHR=0x0D, OP_NEG=0x0E,
     OP_CMP_LT=0x0F, OP_CMP_LE=0x10, OP_CMP_GT=0x11, OP_CMP_GE=0x12,
     OP_CMP_EQ=0x13, OP_CMP_NE=0x14, OP_JMP=0x15, OP_JNZ=0x16, OP_JZ=0x17,
-    OP_RET=0x18, OP_INT32=0x19, OP_INT16=0x1A, OP_WIDE=0x1B
+    OP_RET=0x18, OP_INT32=0x19, OP_INT16=0x1A, OP_WIDE=0x1B,
+    OP_SEXT32=0x1C, OP_ZEXT16=0x1D, OP_SEXT16=0x1E, OP_MOV_RI64=0x1F,
+    OP_ZEXT32=0x20   /* rd   r[rd] &= 0xFFFFFFFF (零扩展32位) —— dalvik ushr-int 必需:
+                        寄存器存的是符号扩展后的 64 位值, 直接 USHR 会把高 32 位符号位
+                        一起移进来, 负数结果全错。不能用 OP_INT32 代替: 那个是符号扩展。 */
 };
 
 static int64_t jg_vmp_r[16];
@@ -96,6 +100,16 @@ int64_t jg_vmp_run(const uint8_t *code, size_t len, const int64_t *args, int nar
             case OP_INT32: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(int64_t)(int32_t)jg_vmp_r[rd]; break; }
             case OP_INT16: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(int64_t)(int32_t)(jg_vmp_r[rd]&0xFFFF); break; }
             case OP_WIDE: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(uint64_t)jg_vmp_r[rd]; break; }
+            case OP_SEXT32: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(int64_t)(int32_t)(jg_vmp_r[rd]&0xFFFFFFFFULL); break; }
+            case OP_ZEXT16: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(jg_vmp_r[rd]&0xFFFFULL); break; }
+            case OP_SEXT16: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(int64_t)(int16_t)(jg_vmp_r[rd]&0xFFFFULL); break; }
+            case OP_ZEXT32: { uint8_t rd=code[pc++]; jg_vmp_r[rd]=(int64_t)((uint64_t)jg_vmp_r[rd]&0xFFFFFFFFULL); break; }
+            case OP_MOV_RI64: {
+                uint8_t rd=code[pc++];
+                int64_t imm; memcpy(&imm, code+pc, 8); pc += 8;
+                jg_vmp_r[rd] = imm;
+                break;
+            }
             default:
                 fprintf(stderr, "JG_VMP: unknown opcode 0x%02x at pc=%zu\n", op, pc-1);
                 return -1;

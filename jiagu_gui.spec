@@ -61,7 +61,9 @@ else:
 
 a = Analysis(
     ['jiagu_gui.py'],
-    pathex=[ROOT],
+    # experiments/vmp_lite 需在模块搜索路径里：VMP 通用化后 vmp_compile.py(根目录)
+    # 依赖 vmp_arch2.py(该目录)。两者都是纯 Python，无需 androguard，exe 内可用。
+    pathex=[ROOT, os.path.join(ROOT, "experiments", "vmp_lite")],
     binaries=[],
     datas=_datas,
     hiddenimports=[
@@ -76,6 +78,8 @@ a = Analysis(
         'config',
         'axml_editor',
         'vmp_protect',
+        'vmp_compile',
+        'vmp_arch2',
     ],
     hookspath=[],
     hooksconfig={},
