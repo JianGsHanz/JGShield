@@ -1,7 +1,8 @@
 # vmp_protect.py -- T4-lite VMP "进壳" 集成核心。
 #
 # 把一个 APK 里白名单方法的 DEX 字节码「脱壳」：
-#   1) 用 experiments/vmp_lite/vmp_from_dex 把方法编译成私有寄存器字节码(blob, 魔数 FD C2);
+#   1) 私有字节码(blob, 魔数 FD C2) 来自 PRECOMPILED_VMP（开发环境用 androguard 一次性编译内嵌）；
+#      运行时仅需用 per-build key 重新 XOR 包裹，无需 androguard；
 #   2) 在原始 app DEX 里把该方法翻转为 native (access_flags|=ACC_NATIVE, code_off=0) 并清零原 insns;
 #   3) 生成 jg_vmp_shim.c: 把 blob 编进 .so .rodata, 并为每个方法导出 JNI 符号 Java_<cls>_<name>,
 #      运行时由 libjgguard.so 里的解释器(jg_vmp.c)执行私有字节码。
@@ -15,9 +16,8 @@ import struct
 import zlib
 import hashlib
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "experiments", "vmp_lite"))
-from vmp_from_dex import compile_method  # noqa: E402
+# 注意: androguard 仅用于「自定义白名单目标」的开发期实时编译回退，不在模块顶层 import。
+# 常规 ylyk 白名单全部预编译内嵌，运行时零 androguard 依赖，故打包 exe 也能正常工作。
 
 # 默认白名单: 4 个已验证(对照参考实现 0 mismatch)的 ylyk 纯计算方法。
 DEFAULT_WHITELIST = [
@@ -27,11 +27,49 @@ DEFAULT_WHITELIST = [
     ("Lcom/zhuomogroup/ylyk/utils/p0;", "n", "(Z)I"),
 ]
 
+# 预编译的私有字节码（canonical，即未 XOR key 的纯私有指令流）。
+# 这 4 个方法是 ylyk 固定方法，其私有字节码与输入 APK 无关，故在开发环境用
+# androguard 一次性编译后内嵌；运行时只需用 per-build key 重新 XOR 包裹即可。
+# 这是让 VMP 在打包 exe 中可用、又不必把 androguard 打进 bundle 的关键。
+# 新增自定义白名单目标时（非常规 ylyk 加固）才退回 androguard 实时编译（开发期）。
+PRECOMPILED_VMP = {
+    ('Lcom/zhuomogroup/ylyk/beans/a;', 'a', '(J)I'):
+        {"code": bytes.fromhex('0100200000000d0002000a0202000203021b031803'), "param_reg": 2},
+    ('Lcom/zhuomogroup/ylyk/utils/r0;', 'g', '(C)Z'):
+        {"code": bytes.fromhex('0100610000000f0100161c00000001007a00000010010016380000000100410000000f0100164300000001005a000000110100164300000001010100000015490000000101000000001801'), "param_reg": 1},
+    ('Lcom/zhuomogroup/ylyk/utils/r0;', 'h', '(C)Z'):
+        {"code": bytes.fromhex('0100610000000f0100161c00000001007a000000100100168e0000000100410000000f0100163800000001005a000000100100168e000000010027000000130100168e000000010019200000130100168e00000001002d000000130100168e0000000100300000000f010016830000000100390000001101001683000000158e00000001010000000015940000000101010000001801'), "param_reg": 1},
+    ('Lcom/zhuomogroup/ylyk/utils/p0;', 'n', '(Z)I'):
+        {"code": bytes.fromhex('010f0000000013000f16190000000100c500067f151f0000000100f900067f1800'), "param_reg": 0},
+}
+
 ACC_NATIVE = 0x100
 ACC_ABSTRACT = 0x400
 ACC_CONSTRUCTOR = 0x200  # 顺手清掉, 避免 native+constructor 冲突
 
 TYPE_CLASS_DATA_ITEM = 0x2000  # 注意：0x1000 是 MAP_LIST，CLASS_DATA_ITEM 是 0x2000（踩过坑）
+
+
+# ---------- VMP 编译器（仅 --vmp 时按需懒加载） ----------
+def _ensure_vmp_compiler():
+    """返回 experiments/vmp_lite/vmp_from_dex.compile_method。
+
+    仅在 --vmp 加固路径调用。生产 exe 未打包 androguard/实验脚本，
+    若在此环境请求 VMP 会抛清晰错误而非模块加载崩溃。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "experiments", "vmp_lite")
+    if cand not in sys.path:
+        sys.path.insert(0, cand)
+    try:
+        from vmp_from_dex import compile_method
+    except ImportError as e:
+        raise RuntimeError(
+            "VMP 编译依赖开发期脚本 vmp_from_dex（需要 androguard + experiments/vmp_lite）。"
+            "当前运行环境（打包 exe / 未安装 androguard）不支持 VMP 加固。"
+            "请改用源码开发环境，或在 GUI/CLI 中关闭 VMP 选项。"
+        ) from e
+    return compile_method
 
 
 # ---------- DEX 基础读写 ----------
@@ -402,21 +440,55 @@ def patch_single_dex(dex_bytes, targets):
 ACC_STATIC = 0x8
 
 
-def discover_targets(dex_names, orig_dexes, whitelist=None):
-    """在 orig_dexes 里找到白名单方法, 返回 [{dex_idx,cls,name,desc,method,static,overloaded}]。
+def _discover_native(dex_names, orig_dexes, whitelist):
+    """无 androguard：用 vmp_protect 自带 DEX 解析器在 orig_dexes 中定位白名单方法。
+    仅对 PRECOMPILED_VMP 内的固定方法生效（常规 ylyk 加固走这条，exe 无 androguard 也可用）。"""
+    found = []
+    name_count = {}                      # (cls, name) -> 同名方法个数
+    hit_map = {}                        # (cls, name, desc) -> (dex_idx, static)
+    for di, db in enumerate(orig_dexes):
+        if b"zhuomogroup" not in db:
+            continue
+        dex = bytearray(db)
+        cdo, cds = _classdef_off(dex), _classdef_size(dex)
+        for ci in range(cds):
+            cd_pos = cdo + ci * 32
+            cls_name = _type_name(dex, _u32(dex, cd_pos))
+            cd_off = _u32(dex, cd_pos + 0x18)
+            if cd_off == 0:
+                continue
+            st, _ = _parse_class_data(dex, cd_off)
+            for lst in (st["dm"], st["vm"]):
+                for (midx, af, co) in lst:
+                    nm, ds = _method_name_desc(dex, midx)
+                    name_count[(cls_name, nm)] = name_count.get((cls_name, nm), 0) + 1
+                    if (cls_name, nm, ds) in whitelist:
+                        hit_map[(cls_name, nm, ds)] = (di, bool(af & ACC_STATIC))
+    for (cls, name, desc) in whitelist:
+        if (cls, name, desc) in hit_map:
+            di, static = hit_map[(cls, name, desc)]
+            found.append({"dex_idx": di, "cls": cls, "name": name, "desc": desc,
+                          "static": static,
+                          "overloaded": name_count.get((cls, name), 1) > 1,
+                          "method": None})
+        else:
+            print("[VMP] 警告: 白名单方法 %s.%s%s 在当前 APK 未找到, 跳过" % (cls, name, desc))
+    return found
 
-    同时记录两个决定 JNI 导出形式的属性：
-      - static: 非 static 时 JNI 第二参是 jobject 且 `this` 占 param_reg-1 号寄存器；
-      - overloaded: 同名方法多于一个时 JNI 符号必须追加 __<mangled params> 后缀，
-        否则运行时符号解析失败抛 UnsatisfiedLinkError。
-    """
-    if whitelist is None:
-        whitelist = DEFAULT_WHITELIST
-    from androguard.misc import AnalyzeDex
+
+def _discover_androguard(dex_names, orig_dexes, whitelist):
+    """开发期回退：白名单含自定义（非预编译）目标时，用 androguard 定位含 method 对象。"""
+    try:
+        from androguard.misc import AnalyzeDex
+    except ImportError as e:
+        raise RuntimeError(
+            "VMP 白名单含非预编译的自定义目标，需 androguard 实时编译。"
+            "当前环境未安装 androguard，仅预编译的 ylyk 白名单方法可离线强化（含 exe）。"
+        ) from e
     import tempfile
     idx = {}
-    name_count = {}   # (cls, name) -> 该 dex 里同名方法个数
-    for di, (dn, db) in enumerate(zip(dex_names, orig_dexes)):
+    name_count = {}
+    for di, db in enumerate(orig_dexes):
         if b"zhuomogroup" not in db:
             continue
         t = tempfile.mktemp(suffix=".dex")
@@ -437,14 +509,11 @@ def discover_targets(dex_names, orig_dexes, whitelist=None):
                 pass
     found = []
     for (cls, name, desc) in whitelist:
-        hit = None
-        for key, m in idx.items():
-            if key[1] == cls and key[2] == name and key[3] == desc:
-                hit = (key[0], m)
-                break
+        hit = next(((k[0], m) for k, m in idx.items()
+                    if k[1] == cls and k[2] == name and k[3] == desc), None)
         if hit:
-            found.append({"dex_idx": hit[0], "cls": cls, "name": name,
-                          "desc": desc, "method": hit[1],
+            found.append({"dex_idx": hit[0], "cls": cls, "name": name, "desc": desc,
+                          "method": hit[1],
                           "static": bool(hit[1].get_access_flags() & ACC_STATIC),
                           "overloaded": name_count.get((cls, name), 1) > 1})
         else:
@@ -452,17 +521,41 @@ def discover_targets(dex_names, orig_dexes, whitelist=None):
     return found
 
 
+def discover_targets(dex_names, orig_dexes, whitelist=None):
+    """在 orig_dexes 里找到白名单方法, 返回 [{dex_idx,cls,name,desc,method,static,overloaded}]。
+
+    若白名单全部落在 PRECOMPILED_VMP（常规 ylyk 加固）则走原生解析器，无需 androguard；
+    否则回退 androguard（开发期自定义目标）。这保证 exe 打包环境也能正常 VMP 加固。
+    """
+    if whitelist is None:
+        whitelist = DEFAULT_WHITELIST
+    precompiled = {(c, n, d) for (c, n, d) in PRECOMPILED_VMP}
+    if all((c, n, d) in precompiled for (c, n, d) in whitelist):
+        return _discover_native(dex_names, orig_dexes, whitelist)
+    return _discover_androguard(dex_names, orig_dexes, whitelist)
+
+
 def compile_targets(targets, keys):
     """把目标方法编译成私有 blob。keys[i] = 第 i 个方法的 per-build XOR key。
 
-    返回 [{cls,name,desc,blob,param_reg,static,overloaded}]。
+    预编译目标直接取出 canonical code 并用 per-build key 重新包裹（保留每构建 key 不同）；
+    自定义目标回退 androguard 实时编译。返回 [{cls,name,desc,blob,param_reg,static,overloaded}]。
     注: key 必须 per-method 且 per-build 不同 —— 固定 0xC2 会让所有构建产物
     的 .rodata 出现同一字节流, 成为跨版本 diff 的锚点。
     """
     out = []
     for i, t in enumerate(targets):
-        blob, _m, preg = compile_method(t["cls"], t["name"], t["desc"],
-                                        xor_key=keys[i], method=t["method"])
+        key = keys[i] & 0xFF
+        pre = PRECOMPILED_VMP.get((t["cls"], t["name"], t["desc"]))
+        if pre is not None:
+            code = pre["code"]
+            blob = bytes([0xFD, 0xC2, key]) + bytes(b ^ key for b in code)
+            preg = pre["param_reg"]
+        else:
+            # 自定义目标：开发期回退 androguard 实时编译
+            compile_method = _ensure_vmp_compiler()
+            blob, _m, preg = compile_method(t["cls"], t["name"], t["desc"],
+                                            xor_key=key, method=t["method"])
         out.append({"cls": t["cls"], "name": t["name"], "desc": t["desc"],
                     "blob": blob, "param_reg": preg,
                     "static": t["static"], "overloaded": t["overloaded"]})

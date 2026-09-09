@@ -75,6 +75,7 @@ a = Analysis(
         'batch_harden',
         'config',
         'axml_editor',
+        'vmp_protect',
     ],
     hookspath=[],
     hooksconfig={},
