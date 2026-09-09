@@ -17,7 +17,7 @@ import verify
 
 def run_batch(input_dir=None, output_dir=None, keep=False,
                ks=None, ks_alias=None, ks_pass=None, ks_keypass=None,
-               skip_verify=False):
+               skip_verify=False, vmp=False):
     """可被 GUI 直接调用的批量加固入口。返回 (ok_count, total, results)。"""
     inp = os.path.abspath(input_dir or config.SAMPLES_DIR)
     out = os.path.abspath(output_dir or config.OUTPUT_DIR)
@@ -55,7 +55,8 @@ def run_batch(input_dir=None, output_dir=None, keep=False,
             out_apk = harden.harden(apk, keep=keep,
                                     ks=ks, ks_alias=ks_alias,
                                     ks_pass=ks_pass, ks_keypass=ks_keypass,
-                                    output_apk=os.path.join(out, "hardened_" + name))
+                                    output_apk=os.path.join(out, "hardened_" + name),
+                                    vmp=vmp)
             if not skip_verify:
                 ok, res = verify.verify(out_apk, apk, keep=keep)
                 if not ok:
@@ -100,6 +101,8 @@ def main():
     ap.add_argument("--ksPass", help="密钥库密码")
     ap.add_argument("--ksKeyPass", help="密钥密码(默认同密钥库密码)")
     ap.add_argument("--skip-verify", action="store_true", help="跳过静态回测（大幅提速）")
+    ap.add_argument("--vmp", action="store_true",
+                    help="T4-lite VMP 方法虚拟化（opt-in）：把白名单纯计算方法转私有字节码+原生解释器")
     ap.add_argument("--ollvm-ndk", metavar="DIR",
                     help="OLLVM NDK 的 bin 目录（clang 混淆版）；指定后壳 native 启用 OLLVM 混淆")
     ap.add_argument("--ollvm-passes", metavar="PASS...",
@@ -112,7 +115,7 @@ def main():
         os.environ["JGSHIELD_OLLVM_PASSES"] = args.ollvm_passes
     ok_count, total, _ = run_batch(args.input_dir, args.output_dir, args.keep,
                                    args.ks, args.ksAlias, args.ksPass, args.ksKeyPass,
-                                   skip_verify=args.skip_verify)
+                                   skip_verify=args.skip_verify, vmp=args.vmp)
     sys.exit(0 if total > 0 and ok_count == total else 1)
 
 if __name__ == "__main__":

@@ -243,6 +243,17 @@ class JGShieldApp(tk.Tk):
         ttk.Checkbutton(row, text="保留中间文件（便于排查，位于 work/）",
                         variable=self.harden_keep, style="Card.TCheckbutton").pack(side="left")
 
+        # 方法虚拟化 VMP（可选，opt-in）
+        ttk.Label(card, text="方法虚拟化 VMP（可选，把白名单计算方法转私有字节码 + 原生解释器）",
+                  style="Card.TLabel").pack(anchor="w", pady=(12, 2))
+        self.vmp_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(card, text="启用 T4-lite VMP（被保护方法在内存里无 dalvik 明文，root dd 抽到的是私有指令）",
+                        variable=self.vmp_on, style="Card.TCheckbutton").pack(anchor="w")
+        ttk.Label(card,
+                  text="作用域：当前硬编码 ylyk 白名单 4 个 static 纯计算方法，其他 App 不生效（勾选但不命中则静默跳过）。"
+                       "仅抬逆向成本，不阻断确定性逆向；解释器未上 OLLVM 前可被还原。",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(4, 0))
+
         # 签名证书（可选，留空则用内置）
         ttk.Label(card, text="签名证书（可选，留空则使用内置默认证书）",
                   style="Card.TLabel").pack(anchor="w", pady=(12, 2))
@@ -476,6 +487,9 @@ class JGShieldApp(tk.Tk):
         if d.get("keep") is not None:
             try: self.harden_keep.set(bool(d["keep"]))
             except Exception: pass
+        if d.get("vmp_on") is not None:
+            try: self.vmp_on.set(bool(d["vmp_on"]))
+            except Exception: pass
         # OLLVM 配置回填
         if d.get("ollvm_on") is not None:
             try: self.ollvm_on.set(bool(d["ollvm_on"]))
@@ -528,6 +542,7 @@ class JGShieldApp(tk.Tk):
             "input": self.harden_input_var.get().strip(),
             "output": self.harden_out_var.get().strip(),
             "keep": bool(self.harden_keep.get()),
+            "vmp_on": bool(self.vmp_on.get()),
             "remember_sign": remember,
             "ollvm_on": bool(self.ollvm_on.get()),
             "ollvm_ndk": self.ollvm_ndk_var.get().strip(),
@@ -673,6 +688,7 @@ class JGShieldApp(tk.Tk):
         inp = self.harden_input_var.get().strip()
         out = self.harden_out_var.get().strip() or os.path.join(ROOT, "output")
         keep = ["--keep"] if self.harden_keep.get() else []
+        vmp_args = ["--vmp"] if self.vmp_on.get() else []
         # 签名证书（可选）
         ks = self.ks_var.get().strip()
         ks_alias = self.ks_alias_var.get().strip()
@@ -739,14 +755,14 @@ class JGShieldApp(tk.Tk):
                 return
             base = os.path.basename(inp)
             out_apk = os.path.join(out, "hardened_" + base)
-            cmd = RUNNER + ["harden", inp, "-o", out_apk] + keep + sign_args + ollvm_args
+            cmd = RUNNER + ["harden", inp, "-o", out_apk] + keep + sign_args + ollvm_args + vmp_args
             label = "加固 %s" % base
         else:
             if not os.path.isdir(inp):
                 messagebox.showerror("错误", "输入目录不存在。", parent=self)
                 return
             cmd = RUNNER + ["batch_harden", "--input-dir", inp,
-                            "--output-dir", out] + keep + sign_args + ollvm_args
+                            "--output-dir", out] + keep + sign_args + ollvm_args + vmp_args
             label = "批量加固 %s" % os.path.basename(inp.rstrip("/\\"))
         self._run_cmd(cmd, label)
 
