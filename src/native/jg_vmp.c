@@ -24,8 +24,14 @@ enum {
                         一起移进来, 负数结果全错。不能用 OP_INT32 代替: 那个是符号扩展。 */
 };
 
-static int64_t jg_vmp_r[16];
-static int jg_vmp_cond;
+/* 2026-09-10: 必须为「线程局部」。VMP 通用化后一次会虚拟化数百个方法, 且分布在
+ * glide / ExoPlayer / 推送等**多线程**代码路径上。寄存器区与条件位若是全局的,
+ * 两个线程并发执行虚拟化方法会互相踩: A 的 memset 把 B 的入参清零、B 把 A 的
+ * 中间结果覆盖 -> 返回垃圾值(静默算错, 极端情况下越界崩溃)。
+ * 4 个方法的白名单时代几乎不会并发命中, 所以这个缺陷一直没暴露。
+ * __thread 在 arm64 是原生 TLS; armeabi-v7a 走 emutls(NDK 已内置), 开销可接受。 */
+static __thread int64_t jg_vmp_r[16];
+static __thread int jg_vmp_cond;
 
 static int64_t jg_vmp_signed64(uint64_t x){
     /* two's-complement targets (all Android ABIs): the cast is well-defined. */

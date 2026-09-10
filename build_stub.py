@@ -576,7 +576,11 @@ def _build_native(st, vmp_shim=None):
         subprocess.check_call(
             [clang, "--shared", "-fPIC", "-O2", "-fno-ident"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
-            ["-Wl,-s", "-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
+            # -Wl,--no-undefined: ELF 共享库默认【允许】未定义符号，链接会"成功"，
+            # 直到真机 dlopen 才炸（2026-09-10 事故：漏 include jg_rawsys.h 导致
+            # jg_read_file_raw 未定义 -> dlopen failed -> bootstrap UnsatisfiedLinkError
+            # -> App 启动即崩）。加这个开关把该类问题前移到构建期。
+            ["-Wl,-s", "-Wl,--no-undefined", "-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
         print("[*] native 构建完成%s (%s): %s" % (obf_tag, abi, out))
     if not built:
