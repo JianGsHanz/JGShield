@@ -35,7 +35,6 @@ import traceback
 import config
 import verify_payload
 import dex_obf as dex_obf_mod
-import vmp_protect as vmp_mod  # T4-lite VMP 方法虚拟化（--vmp，opt-in 默认关）
 
 # Windows 下 --windowed exe 调起 console 子进程（java/aapt/adb/zipalign/keytool
 # 均为 console 子系统）会为其单独分配控制台窗口 → 加固时黑窗频闪。加此 flag
@@ -614,7 +613,7 @@ def harden(input_apk, output_apk=None, keep=False,
            assets_encrypt=False, method_extract=False,
            ssl_pins=None, strengthen="log", rebuild_stub=True,
            wb_kdf=False, antidump=False, antifrida=False, dex_obf=False,
-           dex_rename=False, dex_cfg=False, vmp=False):
+           dex_rename=False, dex_cfg=False):
     _t0 = time.time()
     sw = {"t": _t0}
     input_apk = os.path.abspath(input_apk)
@@ -727,34 +726,6 @@ def harden(input_apk, output_apk=None, keep=False,
     else:
         print("[*] 种子=HKDF-Extract(salt=随机32B, ikm=SHA256(内置证书 common))："
               "证书绑定+每次构建随机，换签即解密失败", flush=True)
-    # 3.0) T4-lite VMP 方法虚拟化（opt-in，默认关）：白名单方法在 *加密进载荷之前* 被
-    #      翻转为 native（access_flags|=ACC_NATIVE、code_off=0、原 insns 清零），运行时由
-    #      libjgguard.so 里的 jg_vmp.c 解释器执行嵌入 .rodata 的私有字节码（魔数 0xFD 0xC2）。
-    #      → 被保护方法在进程内存里没有 dalvik 明文，root dd /proc/pid/mem 抽到的是私有指令。
-    #      必须在 P3.1 方法抽取之前：native 方法 code_off=0，extract_methods 会自然跳过它们。
-    #      per-method XOR key 由 seed 派生（label="vmp"+idx），故每次构建的 .rodata 字节流都不同。
-    #      诚实边界：抬升逆向成本，不等价于"不可还原"——解释执行时私有指令仍是明文，
-    #      需配 OLLVM 混淆解释器本体（见 DESIGN.md）。
-    if vmp:
-        print("[3.0] T4-lite VMP 方法虚拟化（opt-in）：编译私有字节码 + 翻转 native ...",
-              flush=True)
-        def _vmp_key(i):
-            k = derive_key(seed, i, b"vmp")[0]
-            return k if k else 0x5A   # 0 号 key 等于没 XOR，兜底换一个非零值
-        vmp_res = vmp_mod.apply_vmp(dex_names, orig_dexes, _vmp_key, work)
-        if vmp_res:
-            orig_dexes = vmp_res["dexes"]
-            # 必须把包含 blob+JNI shim 的 .so 按本次 APK 重编（blob 是 APK 特定的）。
-            # 注意 build_stub 在 harden 里是局部导入（仅 rebuild_stub=True 时），此处必须自己导，
-            # 否则 rebuild_stub=False + --vmp 会 NameError。
-            import json
-            import build_stub as _bs
-            import stamp as _stamp
-            with open(_stamp.STAMP_PATH, encoding="utf-8") as _f:
-                _st = json.load(_f)
-            _bs._build_native(_st, vmp_shim=vmp_res["shim"])
-            print("[3.0] 虚拟化方法数: %d %s | native 已按 APK 重编（含 VMP 解释器+私有 blob）"
-                  % (vmp_res["count"], vmp_res["methods"]), flush=True)
     # P3.1 方法级指令抽取（默认关闭）：把每个方法的 insns 抽走加密、DEX 内原位回填 NOP。
     # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，待 P3.3 运行时还原。
     # 注意：开启后产物在 P3.3 之前不可独立运行（方法体为空），仅用于验证抽取链路。
@@ -887,12 +858,6 @@ def main():
                          "寄存器并插入「无用条件分支+死块」，改变 CFG 形状、干扰线性反编译，但不影响语义、"
                          "不崩 ART。⚠ 这是弱版，强度远低于 OLLVM；真·CFG 平坦化留给 B2(native/OLLVM)。"
                          "默认关，需真机验证后才用于生产。")
-    ap.add_argument("--vmp", action="store_true",
-                    help="T4-lite VMP 方法虚拟化（opt-in，默认关闭）：把白名单纯计算方法在加密进载荷之前"
-                         "翻转为 native（code_off=0、原 dalvik 体清零），运行时由 libjgguard.so 里的解释器"
-                         "执行嵌入 .rodata 的私有字节码 → 进程内存里这些方法没有 dalvik 明文，"
-                         "root dd /proc/pid/mem 抽到的是私有指令。会按本次 APK 重编 native。"
-                         "⚠ 抬升逆向成本 ≠ 不可还原：解释执行时私有指令仍是明文，需配 OLLVM 混淆解释器。")
     ap.add_argument("--ollvm-ndk", metavar="DIR",
                     help="OLLVM 混淆 NDK 的 clang bin 目录（如 D:/Android/AndoridSDK/ndk/27.2.../"
                          "toolchains/llvm/prebuilt/windows-x86_64/bin）。指定后壳 native 编译改用该 OLLVM "
@@ -943,8 +908,7 @@ def main():
                antifrida=args.antifrida,
                dex_obf=args.dex_obf,
                dex_rename=args.dex_rename,
-               dex_cfg=args.dex_cfg,
-               vmp=args.vmp)
+               dex_cfg=args.dex_cfg)
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)

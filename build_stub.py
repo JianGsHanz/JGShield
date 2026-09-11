@@ -189,7 +189,6 @@ NATIVE_COMPILE = [
     "jg_anti_frida.c",
     "jg_ptrace_guard.c",   # P0-0904 持久 self-ptrace 防护（堵 root /proc/pid/mem 直读）
     "jg_preload.c",        # P0-B 0907 OpenCommon 入口预载校验（赢 spawn 竞态的唯一窗口）
-    "jg_vmp.c",            # T4-lite VMP 解释器核心（私有字节码执行；per-APK shim 由 harden 生成）
 ]
 
 # 内联 hook 子系统仅 AArch64 编入（jg_hook_bridge.S 为纯 AArch64 汇编）
@@ -502,7 +501,7 @@ def _bake_whitebox_kdf(st):
     print("[*] 白盒 KDF 已烘焙 WB_STATE 进 whitebox_kdf.h")
 
 
-def _build_native(st, vmp_shim=None):
+def _build_native(st):
     shutil.rmtree(TMP_NATIVE, ignore_errors=True)
     shutil.copytree(NATIVE_SRC, TMP_NATIVE)
     _regen_vectors(st)
@@ -522,12 +521,7 @@ def _build_native(st, vmp_shim=None):
     g += _obf_native_c(st)
     with open(guard_path, "w", encoding="utf-8") as f:
         f.write(g)
-    # VMP shim: 由 harden 按 APK 生成的 JNI 导出 + 私有 blob, 编进同一 .so。
-    # 故意不进 NATIVE_COMPILE（否则会被 _sed_native 处理）, 但拷贝进 TMP_NATIVE 随库编译。
     extra_srcs = []
-    if vmp_shim and os.path.isfile(vmp_shim):
-        shutil.copy(vmp_shim, os.path.join(TMP_NATIVE, "jg_vmp_shim.c"))
-        extra_srcs.append("jg_vmp_shim.c")
 
     # 远端 OLLVM（路线 B）：本地完成源码随机化后，传给 Ubuntu VM 编译
     if _resolve_ollvm_remote():
