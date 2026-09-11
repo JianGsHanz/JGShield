@@ -137,13 +137,36 @@ def _resolve_ollvm_remote_passes():
         flags += ["-mllvm", "-%s" % n]
     return flags
 
+def _ssh_opts():
+    """远端 ssh/scp 的额外选项（2026-09-11）。
+
+    默认加 -o StrictHostKeyChecking=accept-new：首次连接一台 VM（known_hosts 里没有该主机）
+    时不再因 "Host key verification failed" 直接 exit 255（用户实际踩过的「SSH 255」一类问题：
+    远端重装/换 IP/换网络后 known_hosts 不匹配）。
+    accept-new 语义 = 只对【首次见到】的主机自动接受；主机密钥【变更】仍拒绝 —— 安全性不降。
+    受控环境下（如 known_hosts 不可读写）可用环境变量覆盖，例如：
+      JGSHIELD_OLLVM_REMOTE_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/kh"
+    """
+    raw = os.environ.get("JGSHIELD_OLLVM_REMOTE_SSH_OPTS")
+    if raw is None:
+        return ["-o", "StrictHostKeyChecking=accept-new"]
+    return [x for x in raw.replace(",", " ").split() if x]
+
+
 def _remote_bins():
     # 优先系统 PATH 的 ssh/scp（Git for Windows 自带）；否则退 .exe
     ssh = shutil.which("ssh") or "ssh.exe"
     scp = shutil.which("scp") or "scp.exe"
     return ssh, scp
 
-def _run_remote(cmd):
+def _run_remote(cmd, hint=""):
+    """执行远端命令。失败时给出可诊断的错误，而不是裸 CalledProcessError。
+
+    2026-09-10：远端 VM 关机/换 IP 时，ssh 返回 255 并抛
+    subprocess.CalledProcessError 裸 traceback，用户只看到一行
+    `ssh ... mkdir -p ...` 完全不知道是「网络不通」还是「代码有 bug」。
+    这里统一转成带诊断信息的 RuntimeError。
+    """
     # Windows 下 ssh/scp 走 Git-Bash 的 MSYS 运行时，会自动把形似 Windows 路径的参数
     # 转换（如 E:/jiagu/... → /e/jiagu/...）。本地源路径本是 Windows 路径、远端目标
     # ~/xxx 不应被转 → 统一禁掉 MSYS 路径转换，让 scp/ssh 收到字面量（与 adb 处理一致）。
@@ -151,8 +174,94 @@ def _run_remote(cmd):
     if sys.platform.startswith("win"):
         env = dict(os.environ)
         env["MSYS_NO_PATHCONV"] = "1"
-    print("[remote] %s" % " ".join(cmd))
-    subprocess.check_call(cmd, creationflags=_SUBPROC_FLAGS, env=env)
+    disp = " ".join(cmd)
+    print("[remote] %s" % disp)
+    try:
+        subprocess.check_call(cmd, creationflags=_SUBPROC_FLAGS, env=env)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "远端 OLLVM 编译失败：找不到 ssh/scp 可执行文件。\n"
+            "  命令: %s\n"
+            "  原因: %s\n"
+            "  处理: 确认已安装 OpenSSH 客户端（Windows 可选功能），或用环境变量 "
+            "PATH 指向 Git for Windows 自带的 ssh.exe。" % (disp, e)) from None
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(_remote_fail_reason(cmd, e.returncode, disp, hint)) from None
+
+
+def _precheck_remote(ssh, port, host, timeout=12):
+    """远端连通性预检：跑一条最轻量的远端命令，快速失败并给出诊断。
+
+    放在所有 scp/编译之前 —— 远端关机时 scp 也要等超时，让用户白等几十秒。
+    """
+    print("[remote] 连通性预检: %s (port %s) ..." % (host, port))
+    try:
+        p = subprocess.run(
+            [ssh, "-p", port, "-o", "ConnectTimeout=%d" % timeout,
+             "-o", "BatchMode=yes"] + _ssh_opts() + [host, "echo JGSHIELD_REMOTE_OK"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=_SUBPROC_FLAGS, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "远端 OLLVM 编译失败：连接 %s:%s 超时（%ds）。\n"
+            "  ── 远端命令【根本没有执行】，不是加固代码的 bug ──\n"
+            "  排查: 1) 远端 VM 是否开机  2) IP 是否变了（在远端执行 `ip addr` 核对）\n"
+            "        3) 是否在同一网络  4) 先用 `ping %s` 确认可达\n"
+            "  处理: 若不需要 OLLVM 混淆，可在 GUI 中关闭「远端 OLLVM 编译」。"
+            % (host, port, timeout, host)) from None
+    except FileNotFoundError:
+        raise RuntimeError(
+            "远端 OLLVM 编译失败：找不到 ssh 可执行文件。\n"
+            "  处理: 确认已安装 OpenSSH 客户端（Windows 可选功能）。") from None
+
+    if p.returncode != 0:
+        err = (p.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(_remote_fail_reason(
+            [ssh, "-p", port, host, "echo ..."], p.returncode,
+            "%s -p %s %s echo JGSHIELD_REMOTE_OK" % (ssh, port, host),
+            hint=("ssh 输出: %s" % err) if err else ""))
+    print("[remote] 连通性预检通过")
+
+
+def _remote_fail_reason(cmd, rc, disp, hint=""):
+    """把 ssh/scp 的退出码翻译成人能看懂的诊断。
+
+    ssh 的退出码约定（OpenSSH）：
+      255 = ssh 自身错误（连不上/认证失败/超时），远端命令根本没执行
+      非 0 且非 255 = 远端命令自己返回的码
+    """
+    prog = os.path.basename(cmd[0]).lower()
+    lines = ["远端 OLLVM 编译失败（退出码 %d）" % rc, "  命令: %s" % disp]
+    if rc == 255:
+        host = "?"
+        for i in range(len(cmd) - 1):
+            if cmd[i].startswith("-") and cmd[i][1:] in ("p", "P"):
+                continue
+            if "@" in cmd[i] and not cmd[i].startswith("-"):
+                host = cmd[i]
+                break
+        lines += [
+            "  ── 这是 ssh 自身错误（255），远端命令【根本没有执行】，不是加固代码的 bug ──",
+            "  目标主机: %s" % host,
+            "  常见原因与排查（按顺序）：",
+            "    1) 远端 VM 未开机 / 不在同一网络 —— 先 ping 该 IP 确认可达",
+            "    2) IP 变了（DHCP 续租/换网络）—— 确认 GUI 里填的 IP 与远端 `ip addr` 一致",
+            "    3) SSH 服务未启动 —— 远端执行: sudo systemctl status ssh",
+            "    4) 端口不对 —— 默认为 22，若改过需同步 GUI 的端口设置",
+            "    5) 密钥/密码变更或首次连接未接受 host key —— 可手动执行一次上述命令验证",
+        ]
+    else:
+        lines += [
+            "  ── 远端命令自身返回了非 0 退出码（ssh 已连上，命令执行了但失败）──",
+            "  常见原因：",
+            "    1) 远端 NDK 路径不对（GUI 里的「远端 NDK bin 目录」）",
+            "    2) 远端 clang 未注入 OLLVM pass",
+            "    3) 远端磁盘满 / 无写权限",
+        ]
+    if hint:
+        lines.append("  补充: %s" % hint)
+    lines.append("  处理: 若不需要 OLLVM 混淆，可在 GUI 中关闭「远端 OLLVM 编译」改用本地编译。")
+    return "\n".join(lines)
 
 # 远端 Linux 下 NDK clang 无 .cmd 扩展名
 _REMOTE_CLANG = {
@@ -521,11 +630,11 @@ def _build_native(st):
     g += _obf_native_c(st)
     with open(guard_path, "w", encoding="utf-8") as f:
         f.write(g)
-    extra_srcs = []
 
     # 远端 OLLVM（路线 B）：本地完成源码随机化后，传给 Ubuntu VM 编译
     if _resolve_ollvm_remote():
-        return _build_native_remote(st)
+        _build_native_remote(st)
+        return
 
     # 内联 hook 子系统（jg_inline_hook.c / jg_method_restore_hook.c / jg_hook_bridge.S）
     # 是 AArch64 专属、仅 opt-in 的实验特性（P3.3，默认关闭）。其中 jg_hook_bridge.S
@@ -565,8 +674,6 @@ def _build_native(st):
         out = os.path.join(out_dir, "lib%s.so" % st["lib_name"])
         srcs = [os.path.join(TMP_NATIVE, f) for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _hook_files]
-        for es in extra_srcs:
-            srcs.append(os.path.join(TMP_NATIVE, es))
         subprocess.check_call(
             [clang, "--shared", "-fPIC", "-O2", "-fno-ident"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
@@ -581,7 +688,7 @@ def _build_native(st):
         raise RuntimeError("未构建任何 ABI 的 native 库")
 
 
-def _build_native_remote(st, extra_srcs=()):
+def _build_native_remote(st):
     """路线 B：本地已完成源码随机化，scp 到 Ubuntu VM，ssh 调远端注入 OLLVM 的 NDK clang
     编出 4 ABI 的 lib<lib_name>.so，再 scp 回 tools/libjgguard/<abi>/。保留每次随机化。"""
     host = _resolve_ollvm_remote_host()
@@ -611,14 +718,18 @@ def _build_native_remote(st, extra_srcs=()):
     # 编译器一行报错都看不到（踩过的坑，只能靠端到端跑才暴露）。
     remote_native = remote_base + "/" + os.path.basename(TMP_NATIVE.rstrip("/\\"))
 
-    # 0) 建远端目录（父目录必须先存在，否则首次运行 scp -r 会失败）
-    _run_remote([ssh, "-p", port, host, "mkdir -p %s" % remote_base])
-    # 0.1) 预检：远端 clang 是否存在（早失败，别等 4 次编译才报错）
+    # 0) 连通性预检：先确认远端可达（早失败，别等 scp 大目录才报错）
+    _precheck_remote(ssh, port, host)
+    # 0.1) 建远端目录（父目录必须先存在，否则首次运行 scp -r 会失败）
+    _run_remote([ssh, "-p", port] + _ssh_opts() + [host, "mkdir -p %s" % remote_base])
+    # 0.2) 预检：远端 clang 是否存在（早失败，别等 4 次编译才报错）
     _probe = posixpath.join(ndk_bin, _REMOTE_CLANG["arm64-v8a"])
-    _run_remote([ssh, "-p", port, host, "ls -l %s && ls -d %s" % (_probe, sysroot)])
+    _run_remote([ssh, "-p", port] + _ssh_opts()
+                + [host, "ls -l %s && ls -d %s" % (_probe, sysroot)])
 
     # 1) 传随机化后的源码到远端
-    _run_remote([scp, "-P", port, "-r", TMP_NATIVE, "%s:%s" % (host, remote_base)])
+    _run_remote([scp, "-P", port] + _ssh_opts()
+                + ["-r", TMP_NATIVE, "%s:%s" % (host, remote_base)])
 
     # 2) 逐 ABI 远端编译 + 回传
     built = 0
@@ -626,7 +737,6 @@ def _build_native_remote(st, extra_srcs=()):
         clang = posixpath.join(ndk_bin, _REMOTE_CLANG[abi])
         srcs = [f for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _HOOK_FILES]
-        srcs = srcs + list(extra_srcs)
         out_name = "lib%s.so" % st["lib_name"]
         wb = "-DWB_KDF" if st.get("wb_kdf") else ""
         # -unwindlib=none 必须显式给：upstream clang 对 Android 目标无条件追加
@@ -636,19 +746,20 @@ def _build_native_remote(st, extra_srcs=()):
         cmd = ("cd %s && %s --sysroot=%s -unwindlib=none --shared -fPIC -O2 %s %s -o %s %s -llog -lz"
                % (remote_native, clang, sysroot, " ".join(obf_flags), wb,
                   out_name, " ".join(srcs)))
-        _run_remote([ssh, "-p", port, host, cmd])
+        _run_remote([ssh, "-p", port] + _ssh_opts() + [host, cmd])
 
         out_dir = os.path.join(config.LIBJGGUARD_DIR, abi)
         os.makedirs(out_dir, exist_ok=True)
         for old in glob.glob(os.path.join(out_dir, "lib*.so")):
             os.remove(old)
-        _run_remote([scp, "-P", port, "%s:%s/%s" % (host, remote_native, out_name),
-                     os.path.join(out_dir, out_name)])
+        _run_remote([scp, "-P", port] + _ssh_opts()
+                    + ["%s:%s/%s" % (host, remote_native, out_name),
+                       os.path.join(out_dir, out_name)])
         built += 1
         print("[*] native 构建完成 [REMOTE OLLVM] (%s): %s" % (abi, out_name))
 
     # 3) 清理远端临时目录
-    _run_remote([ssh, "-p", port, host, "rm -rf %s" % remote_base])
+    _run_remote([ssh, "-p", port] + _ssh_opts() + [host, "rm -rf %s" % remote_base])
     if not built:
         raise RuntimeError("未构建任何 ABI 的 native 库")
 

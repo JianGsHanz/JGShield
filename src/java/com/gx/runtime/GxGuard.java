@@ -47,6 +47,45 @@ public final class GxGuard {
 
     private static native void nativeStart();
     private static native void nativeSetResponse(String mode);
+    private static native void nativeHardExit();
+    private static native void nativePreloadCheck();
+
+    /**
+     * P0-B（2026-09-07 四步打穿复盘）：OpenCommon 入口预载校验。
+     * 必须在解密任何业务 DEX 之前调用——spawn 注入的 hook 必然先于壳代码运行，
+     * 此时校验能发现入口跳板并直接在 native 内裸 syscall 自毁（业务 DEX 尚未
+     * 解密，攻击者零收获）。这是唯一能赢 spawn 竞态的窗口（实测 OpenCommon
+     * 1-3s 落盘 vs 检测型探针 3.9s 杀进程）。
+     * fail-safe：.so 未加载/任何异常 → 跳过，绝不影响正常启动。
+     */
+    static void preloadCheck() {
+        ensureLoaded();
+        if (!loaded) return;
+        try {
+            nativePreloadCheck();
+        } catch (Throwable t) {
+            Log.w(TAG, "preload check skipped", t);
+        }
+    }
+
+    /** 裸 syscall 自毁（绕开 libc，frida hook kill/exit/raise/abort 拦不住）。
+     *  所有硬信号（外部 tracer / frida 端口+线程名 / 入口跳板 / env+完整性）统一走这里。
+     *  .so 未加载时退化到 System.exit（干净启动不应走到这，且 frida 未注入前拦截无意义）。 */
+    static void hardExit() {
+        ensureLoaded();
+        if (!loaded) {
+            // native 未加载：反篡改层已失效。绝不应回落到可被 frida hook 的 libc 路径
+            // （System.exit/raise/abort 均拦得住），否则反而暴露"检测已触发"且自毁被废。
+            // 仅记录，交给其余检测层。
+            Log.w(TAG, "hardExit: native guard not loaded, skip (no hookable exit path)");
+            return;
+        }
+        try {
+            nativeHardExit();   // 裸 syscall 自毁，frida 拦不住
+        } catch (Throwable t) {
+            Log.w(TAG, "hardExit: nativeHardExit failed", t);
+        }
+    }
 
     /** 把 Java 侧统一的响应开关传给 native（native 据此决定命中后是退出还是仅记录）。
      *  必须在 GxGuard.start() 之前调用，确保 native 守护线程启动即读到正确模式。 */
@@ -98,11 +137,42 @@ public final class GxGuard {
         if (!hit) return;
         if (!"exit".equals(GxApp.STRENGTHEN_RESPONSE)) return;
         try {
-            Log.w(TAG, what + " -> System.exit (STRENGTHEN_RESPONSE=exit)");
-            System.exit(1);
+            Log.w(TAG, what + " -> hardExit (raw syscall, STRENGTHEN_RESPONSE=exit)");
+            hardExit();
         } catch (Throwable ignored) {}
     }
 
+    /**
+     * P0-0904 持久 self-ptrace 防护：fork 守护子进程持续 trace 本进程全部线程，
+     * 使外部（含 root）的 /proc/pid/mem 直读、process_vm_readv、frida-server
+     * 注入、gdb attach 全部 EPERM —— 堵死 5.9.5 实测被拿走全部 4 dex 的那条通道。
+     * 守护死亡(EXITKILL)则本进程被内核 SIGKILL，防「杀守护再 dump」。
+     * 阻塞（握手最长 3s），调用方必须放在后台线程。
+     * 返回守护 pid（>0=生效）；0=启动失败降级（不影响 App）；-1=启动时已检测到外部 tracer。
+     */
+    static int ptraceGuardStart() {
+        ensureLoaded();
+        if (!loaded) return 0;
+        try {
+            int pid = nativePtraceGuardStart();
+            if (pid > 0) {
+                Log.i(TAG, "ptrace guard active, tracer pid=" + pid);
+            } else if (pid == -1) {
+                // 硬信号（0904 三次报告①分级响应）：启动时已存在【外部】tracer
+                // （frida spawn 先于壳代码注入的必经状态），正常设备恒不出现 → 无条件 exit。
+                Log.w(TAG, "ptrace guard: external tracer at start -> hardExit (raw syscall, hard signal)");
+                hardExit();
+            } else {
+                Log.w(TAG, "ptrace guard start failed, degrade (rc=0)");
+            }
+            return pid;
+        } catch (Throwable t) {
+            Log.w(TAG, "ptrace guard unavailable, skip", t);
+            return 0;
+        }
+    }
+
+    private static native int nativePtraceGuardStart();
     private static native int nativeEnvCheck();
     private static native int nativeIntegrityScan();
 }

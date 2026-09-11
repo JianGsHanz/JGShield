@@ -28,6 +28,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
+
+/* g_seed / g_seed_set 的唯一定义（本文件，全 ABI 编入）。壳解密阶段把种子写入，
+ * 供运行期各 native 模块复用（原 VMP 解释器曾复用，现主要用于 DEX 还原等）。
+ * nativeRestoreInit（仅 arm64 hook）也会写入。 */
+uint8_t g_seed[32];
+int     g_seed_set = 0;
+
+/* 把 Java 传来的 32 字节 seed 写入共享 g_seed。失败忽略（长度非 32 视为异常）。 */
+static void _capture_seed(JNIEnv *env, jbyteArray seedArr, jbyte *seedp) {
+    if (!seedp) return;
+    jsize sl = (*env)->GetArrayLength(env, seedArr);
+    if (sl == 32) { memcpy(g_seed, seedp, 32); g_seed_set = 1; }
+}
 #include <zlib.h>
 #include <android/log.h>
 
@@ -89,87 +102,68 @@ int jg_restore_methods(uint8_t *dex, size_t dex_len,
     if (p + 4 > payload_len) return 0;   /* 无方法段：无需还原 */
     uint32_t mdc = jg_rd32(payload, p); p += 4;
     if (mdc == 0) return 0;
-    int writes = 0;
 
+    /* P3.4 逐方法格式：每 dex 段 [dex_idx][ec][ (method_idx,code_off,insns_size,
+     * blob_len,blob) ]...；blob=iv(12)+AES-GCM(zlib(insns))+tag(16)，per-method 密钥
+     * JG|m{dex}.{method}。加载期批量写回全部方法保 A9 校验。 */
     for (uint32_t s = 0; s < mdc; s++) {
         uint32_t dex_idx = jg_rd32(payload, p); p += 4;
         uint32_t ec = jg_rd32(payload, p); p += 4;
-        uint32_t sln = jg_rd32(payload, p); p += 4;
-        const uint8_t *sblob = payload + p; p += sln;
-        uint32_t mlen = jg_rd32(payload, p); p += 4;
-        const uint8_t *meta_blob = payload + p; p += mlen;
         if (want_dex >= 0 && (int)dex_idx != want_dex) {
-            /* 跳过非目标 dex 段：stream_blob + meta_blob，指针推进须一致 */
+            /* 跳过整段：逐条目按 (method_idx,code_off,insns_size,blob_len) 推进指针 */
+            for (uint32_t e = 0; e < ec; e++) {
+                p += 4 + 4 + 4;                 /* method_idx + code_off + insns_size */
+                uint32_t bln = jg_rd32(payload, p); p += 4; p += bln;
+            }
             continue;
         }
-        if (sln < 28) return -1;                 /* iv12 + tag16 至少 28 */
-        /* 解析压缩后的方法元数据表：每行 (method_idx,code_off,insns_size) 共 12B */
-        uint8_t *meta = (uint8_t *)malloc(ec ? (size_t)ec * 12 : 1);
-        if (!meta) return -1;
-        size_t metagot = 0;
-        if (mlen > 0) {
-            if (jg_inflate_zlib(meta_blob, mlen, meta, ec ? (size_t)ec * 12 : 1, &metagot) != 0
-                || metagot != (size_t)ec * 12) {
-                free(meta); return -1;
-            }
-        }
-        /* 预扫 meta 求拼流总长（= 所有 len_in_stream 之和），用于分配 inflate 缓冲 */
-        size_t total = 0;
         for (uint32_t e = 0; e < ec; e++) {
-            uint32_t insns_size = jg_rd32(meta, (size_t)e * 12 + 8);
-            total += (size_t)insns_size * 2;
-        }
-        /* per-dex 密钥：HMAC(seed, key_prefix+"m"+dexIdx)，整 dex 方法码一次 GCM
-         * （label 中的 "JG|m" 已由 build_stub 注入随机 key_prefix） */
-        char label[64];
-        int ll = snprintf(label, sizeof(label), "JG|m%u", dex_idx);
-        uint8_t key[32];
+            uint32_t method_idx = jg_rd32(payload, p); p += 4;
+            uint32_t code_off   = jg_rd32(payload, p); p += 4;
+            uint32_t insns_size = jg_rd32(payload, p); p += 4;
+            uint32_t bln = jg_rd32(payload, p); p += 4;
+            const uint8_t *blob = payload + p; p += bln;
+            if (bln < 28) continue;            /* iv12 + tag16 至少 28 */
+            /* per-method 密钥 JG|m{dex}.{method} */
+            char label[64];
+            int ll = snprintf(label, sizeof(label), "JG|m%u.%u", dex_idx, method_idx);
+            uint8_t key[32];
 #ifdef WB_KDF
-        /* P0-B 真白盒：final = SHA256_cont(WB_STATE, HMAC(seed, label)) */
-        wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
+            wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
 #else
-        jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
+            jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
 #endif
-        const uint8_t *iv = sblob;
-        const uint8_t *ct = sblob + 12;
-        size_t ctlen = (size_t)sln - 12 - 16;
-        const uint8_t *tag = sblob + sln - 16;
-        uint8_t *comp = (uint8_t *)malloc(ctlen ? ctlen : 1);
-        if (!comp) { free(meta); return -1; }
-        memcpy(comp, ct, ctlen);
-        uint8_t *plain = (uint8_t *)malloc(ctlen ? ctlen : 1);
-        if (!plain) { free(meta); free(comp); return -1; }
-        if (jg_aes256gcm_decrypt(key, iv, 12, comp, ctlen, tag, plain) != 0) {
-            free(meta); free(comp); free(plain); return -1;
-        }
-        uint8_t *buf = (uint8_t *)malloc(total ? total : 1);
-        if (!buf) { free(meta); free(comp); free(plain); return -1; }
-        size_t got = 0;
-        if (jg_inflate_zlib(plain, ctlen, buf, total, &got) != 0 || got != total) {
-            free(meta); free(comp); free(plain); free(buf); return -1;
-        }
-        free(comp); free(plain);
-        /* 逐方法按 offset/len 写回（offset 由 insns_size 累计推得） */
-        size_t run = 0;
-        for (uint32_t e = 0; e < ec; e++) {
-            uint32_t method_idx = jg_rd32(meta, (size_t)e * 12 + 0); (void)method_idx;
-            uint32_t code_off   = jg_rd32(meta, (size_t)e * 12 + 4);
-            uint32_t insns_size = jg_rd32(meta, (size_t)e * 12 + 8);
-            uint32_t offset     = (uint32_t)run;
-            uint32_t length     = insns_size * 2;
-            run += length;
-            size_t ins_off = (size_t)code_off + 16;
-            if (ins_off + (size_t)length > dex_len) {
-                __android_log_print(ANDROID_LOG_ERROR, TAG,
-                    "OOB dex_idx=%u code_off=%u ins_off=%zu len=%u dex_len=%zu",
-                    dex_idx, code_off, ins_off, length, dex_len);
-                free(meta); free(buf); return -1;
+            const uint8_t *iv = blob;
+            const uint8_t *ct = blob + 12;
+            size_t ctlen = (size_t)bln - 12 - 16;
+            const uint8_t *tag = blob + bln - 16;
+            uint8_t *comp = (uint8_t *)malloc(ctlen ? ctlen : 1);
+            if (!comp) return -1;
+            memcpy(comp, ct, ctlen);
+            uint8_t *plain = (uint8_t *)malloc(ctlen ? ctlen : 1);
+            if (!plain) { free(comp); return -1; }
+            if (jg_aes256gcm_decrypt(key, iv, 12, comp, ctlen, tag, plain) != 0) {
+                free(comp); free(plain); return -1;
             }
-            memcpy(dex + ins_off, buf + offset, length);
-            writes++;
+            free(comp);
+            uint8_t *insns = (uint8_t *)malloc(insns_size ? insns_size * 2 : 1);
+            if (!insns) { free(plain); return -1; }
+            size_t got = 0;
+            if (jg_inflate_zlib(plain, ctlen, insns, (size_t)insns_size * 2, &got) != 0
+                || got != (size_t)insns_size * 2) {
+                free(plain); free(insns); return -1;
+            }
+            free(plain);
+            size_t ins_off = (size_t)code_off + 16;
+            if (ins_off + (size_t)insns_size * 2 > dex_len) {
+                __android_log_print(ANDROID_LOG_ERROR, TAG,
+                    "OOB dex_idx=%u method_idx=%u code_off=%u ins_off=%zu len=%u dex_len=%zu",
+                    dex_idx, method_idx, code_off, ins_off, insns_size * 2, dex_len);
+                free(insns); return -1;
+            }
+            memcpy(dex + ins_off, insns, (size_t)insns_size * 2);
+            free(insns);
         }
-        free(buf);
-        free(meta);
     }
     return 0;
 }
@@ -214,79 +208,61 @@ int jg_verify_methods(const uint8_t *dex, size_t dex_len,
     uint32_t mdc = jg_rd32(payload, p); p += 4;
     if (mdc == 0) return 0;
     int mism = 0;
+    /* P3.4 逐方法格式：每方法独立解密比对（不写回），可重复调用做抽样/全量体检。 */
     for (uint32_t s = 0; s < mdc; s++) {
         uint32_t dex_idx = jg_rd32(payload, p); p += 4;
         uint32_t ec = jg_rd32(payload, p); p += 4;
-        uint32_t sln = jg_rd32(payload, p); p += 4;
-        const uint8_t *sblob = payload + p; p += sln;
-        uint32_t mlen = jg_rd32(payload, p); p += 4;
-        const uint8_t *meta_blob = payload + p; p += mlen;
         if (want_dex >= 0 && (int)dex_idx != want_dex) {
+            for (uint32_t e = 0; e < ec; e++) {
+                p += 4 + 4 + 4;
+                uint32_t bln = jg_rd32(payload, p); p += 4; p += bln;
+            }
             continue;
         }
-        if (sln < 28) { mism++; continue; }
-        /* 解析压缩后的方法元数据表：每行 (method_idx,code_off,insns_size) 共 12B */
-        uint8_t *meta = (uint8_t *)malloc(ec ? (size_t)ec * 12 : 1);
-        if (!meta) return -2;
-        size_t metagot = 0;
-        if (mlen > 0) {
-            if (jg_inflate_zlib(meta_blob, mlen, meta, ec ? (size_t)ec * 12 : 1, &metagot) != 0
-                || metagot != (size_t)ec * 12) {
-                free(meta); mism++; continue;
-            }
-        }
-        /* 预扫求拼流总长 */
-        size_t total = 0;
-        for (uint32_t e = 0; e < ec; e++) {
-            uint32_t insns_size = jg_rd32(meta, (size_t)e * 12 + 8);
-            total += (size_t)insns_size * 2;
-        }
-        char label[64];
-        int ll = snprintf(label, sizeof(label), "JG|m%u", dex_idx);
-        uint8_t key[32];
-#ifdef WB_KDF
-        /* P0-B 真白盒：final = SHA256_cont(WB_STATE, HMAC(seed, label)) */
-        wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
-#else
-        jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
-#endif
-        const uint8_t *iv = sblob;
-        const uint8_t *ct = sblob + 12;
-        size_t ctlen = (size_t)sln - 12 - 16;
-        const uint8_t *tag = sblob + sln - 16;
-        uint8_t *comp = (uint8_t *)malloc(ctlen ? ctlen : 1);
-        if (!comp) { free(meta); return -2; }
-        memcpy(comp, ct, ctlen);
-        uint8_t *plain = (uint8_t *)malloc(ctlen ? ctlen : 1);
-        if (!plain) { free(meta); free(comp); return -2; }
-        if (jg_aes256gcm_decrypt(key, iv, 12, comp, ctlen, tag, plain) != 0) {
-            free(meta); free(comp); free(plain); mism++; continue;
-        }
-        uint8_t *buf = (uint8_t *)malloc(total ? total : 1);
-        if (!buf) { free(meta); free(comp); free(plain); return -2; }
-        size_t got = 0;
-        if (jg_inflate_zlib(plain, ctlen, buf, total, &got) != 0 || got != total) {
-            free(meta); free(comp); free(plain); free(buf); mism++; continue;
-        }
-        free(comp); free(plain);
         uint32_t verified = 0;
-        size_t run = 0;
         for (uint32_t e = 0; e < ec; e++) {
-            uint32_t method_idx = jg_rd32(meta, (size_t)e * 12 + 0); (void)method_idx;
-            uint32_t code_off   = jg_rd32(meta, (size_t)e * 12 + 4);
-            uint32_t insns_size = jg_rd32(meta, (size_t)e * 12 + 8);
-            uint32_t offset     = (uint32_t)run;
-            uint32_t length     = insns_size * 2;
-            run += length;
-            /* 已达本 dex 预算：跳过昂贵比对，但指针已前进（保持段对齐） */
+            uint32_t method_idx = jg_rd32(payload, p); p += 4;
+            uint32_t code_off   = jg_rd32(payload, p); p += 4;
+            uint32_t insns_size = jg_rd32(payload, p); p += 4;
+            uint32_t bln = jg_rd32(payload, p); p += 4;
+            const uint8_t *blob = payload + p; p += bln;
             if (max_per_dex > 0 && verified >= (uint32_t)max_per_dex) continue;
             verified++;
+            if (bln < 28) { mism++; continue; }
+            char label[64];
+            int ll = snprintf(label, sizeof(label), "JG|m%u.%u", dex_idx, method_idx);
+            uint8_t key[32];
+#ifdef WB_KDF
+            wb_key_for(seed, (const uint8_t *)label, (size_t)ll, key);
+#else
+            jg_hmac_sha256(seed, 32, (const uint8_t *)label, (size_t)ll, key);
+#endif
+            const uint8_t *iv = blob;
+            const uint8_t *ct = blob + 12;
+            size_t ctlen = (size_t)bln - 12 - 16;
+            const uint8_t *tag = blob + bln - 16;
+            uint8_t *comp = (uint8_t *)malloc(ctlen ? ctlen : 1);
+            if (!comp) return -2;
+            memcpy(comp, ct, ctlen);
+            uint8_t *plain = (uint8_t *)malloc(ctlen ? ctlen : 1);
+            if (!plain) { free(comp); return -2; }
+            if (jg_aes256gcm_decrypt(key, iv, 12, comp, ctlen, tag, plain) != 0) {
+                free(comp); free(plain); mism++; continue;
+            }
+            free(comp);
+            uint8_t *insns = (uint8_t *)malloc(insns_size ? insns_size * 2 : 1);
+            if (!insns) { free(plain); return -2; }
+            size_t got = 0;
+            if (jg_inflate_zlib(plain, ctlen, insns, (size_t)insns_size * 2, &got) != 0
+                || got != (size_t)insns_size * 2) {
+                free(plain); free(insns); mism++; continue;
+            }
+            free(plain);
             size_t ins_off = (size_t)code_off + 16;
-            if (ins_off + (size_t)length > dex_len) { free(meta); free(buf); mism++; continue; }
-            if (memcmp(dex + ins_off, buf + offset, length) != 0) mism++;
+            if (ins_off + (size_t)insns_size * 2 > dex_len) { free(insns); mism++; continue; }
+            if (memcmp(dex + ins_off, insns, (size_t)insns_size * 2) != 0) mism++;
+            free(insns);
         }
-        free(meta);
-        free(buf);
     }
     return mism;
 }
@@ -342,6 +318,7 @@ Java_com_gx_runtime_GxDecryptor_nativeVerifyDex(JNIEnv *env, jclass clazz,
         (*env)->ReleaseByteArrayElements(env, payloadArr, payloadp, JNI_ABORT);
         return -3;
     }
+    _capture_seed(env, seedArr, seedp);
     int rc = jg_verify_methods(dex, (size_t)dexLen,
                                (const uint8_t *)payloadp, (size_t)payLen,
                                (const uint8_t *)seedp, (int)dexIdx, (int)maxPerDex);

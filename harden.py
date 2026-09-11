@@ -740,8 +740,8 @@ def harden(input_apk, output_apk=None, keep=False,
             extracted_dexes.append(ex)
             method_sections.append((i, blob, entries))
             total_methods += len(entries)
-        print("[3.1] 抽取方法指令数: %d（需 P3.3 运行时还原，当前产物不可独立运行）" % total_methods,
-              flush=True)
+        print("[3.1] ⚠⚠ 方法级抽取已启用（实验性，2026-09-10 真机实测：产物会间歇性启动失败，"
+              "勿用于交付）——抽取方法指令数: %d" % total_methods, flush=True)
     if dex_obf:
         # 解密器 obf.dex 以独立条目随载荷加载（与 App DEX 同一 classloader），运行时被
         # App 的 const-string->ObfStr.d 调用解析。不做方法抽取（否则破坏解密器自身）。
@@ -793,6 +793,23 @@ def harden(input_apk, output_apk=None, keep=False,
     print("[完成] 已生成加固 APK:", output_apk)
     return output_apk
 
+def _is_env_error(e):
+    """判断异常是否为「运行环境问题」而非加固逻辑 bug。
+
+    这类错误的文案里已经内嵌了排查步骤（见 build_stub._remote_fail_reason），
+    不需要再叠一层 traceback 干扰用户。
+    """
+    if not isinstance(e, RuntimeError):
+        return False
+    s = str(e)
+    markers = (
+        "远端 OLLVM 编译失败",
+        "远端 OLLVM 模式已启用，但未设置",
+        "找不到 ssh/scp 可执行文件",
+    )
+    return any(m in s for m in markers)
+
+
 def main():
     ap = argparse.ArgumentParser(description="JGShield 单 APK 加固")
     ap.add_argument("input", help="输入 APK 路径")
@@ -807,8 +824,14 @@ def main():
                          "部分 ROM/高版本可能因隐藏 API 限制导致还原失败（App 缺资源），"
                          "遇此情况请去掉本参数重新加固")
     ap.add_argument("--method-extract", action="store_true",
-                    help="P3.1 方法级指令抽取（实验性）：抽取每个方法的指令并加密，DEX 内原位回填 NOP，"
-                         "运行时需 P3.3 native 还原才能执行；当前产物不可独立运行，仅用于验证抽取链路。默认关闭。")
+                    help="P3.1 方法级指令抽取（实验性，⚠当前已知不可用）：抽取每个方法的指令并加密，"
+                         "DEX 内原位回填 NOP，运行时需还原才能执行。"
+                         "【2026-09-10 真机实测结论】开启后产物会间歇性启动失败，故默认关闭、请勿用于交付："
+                         "① hook 关：6/6 必现 Java ArrayIndexOutOfBoundsException"
+                         "（bootShell 反射调 GxApp.boot 时异常，属执行到未还原/被破坏的方法体）；"
+                         "② hook 开：约 2/6 崩于 ART FaultManager 处理 fault 时解析出非法 ArtMethod"
+                         "（PrettyMethod(NULL) / found_virtual abort）。"
+                         "未开本开关的默认加固包不受影响（已验证 58/58 冷启动零崩溃）。")
     ap.add_argument("--pins", help="SSL 证书固定：host=sha256/Base64;host2=sha256/Base64（与 OkHttp "
                                     "CertificatePinner 同构）。例：api.example.com=sha256/ABCD... 。"
                                     "配置后壳在运行期做按主机证书固定，挡 root+系统证书 MITM。不指定则不启用。")
@@ -910,7 +933,16 @@ def main():
                dex_rename=args.dex_rename,
                dex_cfg=args.dex_cfg)
     except Exception as e:
-        traceback.print_exc()
+        # 环境类错误（远端不可达等）已经带了可操作的诊断文本，直接打出来即可；
+        # 其余才是真 bug，需要完整 traceback 定位。
+        # 2026-09-10：此前一律 print_exc()，远端 VM 关机时用户只看到一坨
+        # CalledProcessError 堆栈，误以为加固代码坏了。
+        if _is_env_error(e):
+            print("")
+            print("✘ " + str(e))
+            print("")
+        else:
+            traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":

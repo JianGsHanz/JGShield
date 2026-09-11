@@ -128,6 +128,73 @@ static int _list_tids(pid_t proc, pid_t *out, int maxn) {
     return n;
 }
 
+/* ---- 读某线程的 comm（/proc/<pid>/task/<tid>/comm）。
+ * 纯 syscall 实现（本函数在 fork 出的守护子进程里调用，零堆分配约束）。
+ * 成功时 com 写入线程名（已去尾换行），返回 0；失败返回 -1。 ---- */
+static int _read_comm(pid_t proc, pid_t tid, char *com, int cap) {
+    char path[64];
+    int len = 0;
+    memcpy(path, "/proc/", 6); len = 6;
+    len += _utoa_pos(path + len, (int)proc);
+    memcpy(path + len, "/task/", 6); len += 6;
+    len += _utoa_pos(path + len, (int)tid);
+    memcpy(path + len, "/comm", 6); len += 5;
+    path[len] = '\0';
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = (int)read(fd, com, cap - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    com[n] = '\0';
+    for (int i = 0; i < n; i++) {
+        if (com[i] == '\n' || com[i] == '\r') { com[i] = '\0'; break; }
+    }
+    return 0;
+}
+
+/* ---- 该线程是否【系统/运行时线程】，必须跳过 ATTACH。
+ *
+ * 2026-09-10 真机根因（MIX2 A9，用户抓到的原始日志）：
+ *   Fatal signal 11 (SIGSEGV), code 0 (SI_USER) in tid 31544 (Signal Catcher)
+ *   crash_dump64: failed to attach to thread 31544, already traced by 31711 (com.zhuomogroup.ylyk)
+ *   libc: crash_dump helper failed to exec
+ * `code 0 (SI_USER)` 不是内存访问错，是【被投递信号】；`already traced by 31711` 的
+ * 31711 正是我们的守护子进程。即：守护按「全线程 ATTACH」策略把这个 ART 信号处理
+ * 线程也 ATTACH 了，之后守护任何异常退场/未及 DETACH，内核连带处理该线程 ——
+ * 表现是「进首页后等一会才崩」（守护延迟启动，所以不是立刻崩），并且 crash_dump
+ * 抢不到 trace 位 → 拿不到 tombstone，现场更难查。
+ *
+ * 为什么跳过是【安全且不降防】的：
+ *   - 防护的本体是「守护先占住 trace 位」这一事实（外部 tracer 会拿到 EPERM），
+ *     不需要 attach 到每一个线程；业务线程仍全量 ATTACH。
+ *   - 这些线程在 App 运行期【总是存在】，且名字固定；frida/注入器不会用它们的名字。
+ *     换句话说：ATTACH 它们对「发现外部 tracer」零贡献，只带来连带风险。
+ *   - 与 0907 已确立的原则一致：EXITKILL 会静默闪退，故去掉 EXITKILL；
+ *     本次是同一类「连带杀伤」的收敛，不是删机制。
+ *
+ * 保守起见只按【精确名】跳过（不做前缀匹配），避免误伤业务线程（业务线程名形如
+ * glide-disk-cach / RenderThread 等，不在下表内）。
+ * 注：「Signal Catcher」含空格，comm 允许（内核 task->comm 不去空格）。 ---- */
+static int _is_system_thread(const char *com) {
+    static const char *skip[] = {
+        "Signal Catcher",   /* ART 信号处理线程：被 ATTACH 后收信号行为错乱 -> SI_USER 崩 */
+        "JDWP",             /* 调试器协议线程 */
+        "ADB-JDWP Connec",  /* adb JDWP 连接线程（名字被内核截断为 15 字符） */
+        "Jit thread pool",  /* ART JIT 工作线程 */
+        "Profile Saver",    /* ART profile 落盘线程 */
+        "HeapTaskDaemon",   /* ART 堆任务守护 */
+        "ReferenceQueueD",  /* ART 引用队列守护（名字被截断） */
+        "FinalizerDaemon",  /* ART 终结器线程 */
+        "FinalizerWatchd",  /* ART 终结器看门狗 */
+        NULL
+    };
+    for (int i = 0; skip[i]; i++) {
+        if (strcmp(com, skip[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+
 /* ---- 判定 tpid 是否本进程 fork 出的守护子进程（读 /proc/<tpid>/status 的 PPid）。
  * 供父进程侧各检测层过滤自身守护误报；比记全局 pid 更稳（握手超时等场景也对）。
  * 在父进程（App 进程）内执行，可用 stdlib。
@@ -196,6 +263,15 @@ static void _guard_main(pid_t parent, int wfd) {
     int n = _list_tids(parent, tids, GX_TASK_MAX);
     if (n <= 0) _exit(7);
     for (int i = 0; i < n; i++) {
+        /* 2026-09-10：跳过系统/运行时线程（Signal Catcher / JDWP 等，见
+         * _is_system_thread 注释）。ATTACH 它们对发现外部 tracer 零贡献，
+         * 却会在守护异常退场时连带杀伤（SI_USER 崩 + tombstone 丢失）。
+         * 读名字失败【不跳过】（保守：宁可 attach 也不漏业务线程）。 */
+        char com[24];
+        if (_read_comm(parent, tids[i], com, sizeof(com)) == 0
+            && _is_system_thread(com)) {
+            continue;
+        }
         int rc = _attach_one(tids[i]);
         if (rc == -1) {
             if (errno == EPERM) _exit(3);   /* 已被外部 tracer（frida/gdb）持有 */
@@ -229,6 +305,13 @@ static void _guard_main(pid_t parent, int wfd) {
                         if (attached[j] == tids[i]) { known = 1; break; }
                     }
                     if (known) continue;
+                    /* 2026-09-10：补 attach 同样跳过系统线程，否则周期扫描会把
+                     * 初始阶段跳过的 Signal Catcher / JDWP 又捞回来，前功尽弃。 */
+                    char com[24];
+                    if (_read_comm(parent, tids[i], com, sizeof(com)) == 0
+                        && _is_system_thread(com)) {
+                        continue;
+                    }
                     if (_attach_one(tids[i]) == 0) {
                         if (na < GX_TASK_MAX) attached[na++] = tids[i];
                     }

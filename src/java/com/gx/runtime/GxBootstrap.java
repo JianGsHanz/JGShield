@@ -91,6 +91,18 @@ public class GxBootstrap extends Application {
         // 但此处独立实现以避免依赖 GxApp 类）。使用固定派生：与原壳 seed 派生一致。
         byte[] shellDex = aesGcmDecrypt(deriveShellKey(base), enc);
 
+        // 2026-09-10 修复（MIX2/A9 冷启动约 4% 必崩的根因）：把壳自身 DEX 的长度登记给
+        // native，令 anti-dump v3 完全跳过这份 dex。壳 DEX 是 ART 正在执行 GxApp 的
+        // 【活 dex】：对它做 L2 string_ids 表换位 / L3 map 擦除，会与 ART 的惰性解析
+        // 并发撕裂元数据——实测表现为 boot 栈帧全部丢失、异常穿过 catch(Throwable)、
+        // 冒出 Byte.valueOf 之类的污染帧，最终 "Unable to instantiate application" 起不来。
+        // 壳 DEX 内容并不机密（APK 内即密文且本地可解），保它可执行远比擦它的 magic 值钱。
+        try {
+            nativeMarkOwnDex(shellDex.length);
+        } catch (Throwable t) {
+            Log.w(TAG, "markOwnDex skipped", t);
+        }
+
         // fileless 注入 sysLoader（复用系统公开 API，无磁盘明文）
         ByteBuffer buf = ByteBuffer.allocateDirect(shellDex.length);
         buf.put(shellDex);
@@ -207,6 +219,9 @@ public class GxBootstrap extends Application {
 
     /** native 白盒壳密钥派生（jg_guard.c，编译期经 OLLVM 混淆）。 */
     private static native byte[] nativeDeriveShellKey(byte[] certDer, byte[] payload);
+
+    /** 登记壳自身 DEX 长度：anti-dump v3 据此整份跳过该 dex（它是正在执行中的活 dex）。 */
+    private static native void nativeMarkOwnDex(int len);
 
     private static byte[] readPayload(Context ctx, String entry) throws Exception {
         String apk = ctx.getApplicationInfo().sourceDir;
