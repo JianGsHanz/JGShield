@@ -23,15 +23,23 @@ test_apks/
 gen_samples/
 
 # ---- External tool binaries (not source; place locally to run harden.py) ----
-tools/
-# libjgguard.so 是加固壳强依赖的 native 产物，必须与 jg_guard.c 同步，强制入库
-!tools/libjgguard/
-!tools/libjgguard/*.so
+# 2026-09-11 修两件事：
+#  (1) 原写法是 `tools/`（尾斜杠 = 排除整个目录）+ `!tools/xxx` 例外，**那个例外对「未跟踪」
+#      文件根本不起效** —— git 规定「父目录被排除时无法再包含其中文件」，当年那些 .so 其实是靠
+#      `git add -f` 才进的库，例外行只是看着像有用。改成排除「目录里的条目」`tools/*`，
+#      后面的 ! 才真正放行（已用 git check-ignore 逐条验证）。
+#  (2) `tools/libjgguard/` 已查明是**历史遗留目录**：config.LIBJGGUARD_DIR 指向
+#      `<EXEC_DIR>/build/libjgguard`（每次构建产出、可重建），运行时根本不读 tools/；
+#      目录里只剩 2026-08-24 的 libfjpjy.so（旧 stamp 名）这类陈旧二进制。
+#      故不再为新文件开例外；已 tracked 的文件保留现状（gitignore 不改变已跟踪状态）。
+tools/*
+# 可复用诊断/验收脚本（每轮加固都要用；丢在 _wk_diag/ 里会被当垃圾清掉，故收敛入库）
+!tools/diag/
 # shell_ollvm_audit.py 是 OLLVM 应用判定的可复现取证工具（裸 clang 串 + .text 膨胀 + 反汇编分支数），
-# 属源码级验证脚本，与 libjgguard.so 同等需强制入库（tools/ 整目录默认不入库）
+# 属源码级验证脚本，必须入库（tools/ 整目录默认不入库）
 !tools/shell_ollvm_audit.py
 # obf.dex 是 --dex-obf 功能强依赖的解密器，由源码 src/java/com/jiagu/obf/ObfStr.java 编译。
-# 因 tools/ 整目录被忽略，用 `git add -f tools/obf.dex` 强制入库（与 libjgguard.so 同等强依赖）。
+# 因 tools/ 整目录被忽略，用 `git add -f tools/obf.dex` 强制入库。
 
 # ---- Keystores (never commit keys) ----
 *.jks
@@ -85,3 +93,21 @@ android-ndk-*.zip
 llvm-project-llvmorg-*/
 ollvm-14/
 tools/gen_security_keys.py
+
+# ===== 根目录一次性调试/验收脚本（保留本地复跑，不入库） =====
+# 2026-09-11：收敛成通配。以前是逐个列名（_baseline_test.sh / _fx9_detail.sh /
+# _fx11_accept.sh ...），每修一轮就得手工往里加一行 —— 迟早漏掉一个把临时脚本混进提交，
+# 事实上本次清理前就漏了 6 个（_acc.sh / _fx15_accept.sh / _patch_*.py）。
+# 约定：**根目录下以 `_` 开头的脚本一律视为临时产物**。
+# 需要入库的根目录脚本请不要用 `_` 前缀（当前所有 tracked 根脚本都符合此约定）。
+/_*.py
+/_*.sh
+# 临时日志/快照目录（每轮几十个文件）
+_boot_diag/
+_boot_test/
+_wk_diag/
+# 编译验证产生的游离 native 产物（源码级验证用，可随时重编）
+src/native/verify_jgguard.so
+src/native/*.o
+
+# ===== 可复用诊断工具：见上方 tools/* 与 !tools/diag/ 例外 =====
