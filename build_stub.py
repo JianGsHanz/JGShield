@@ -293,6 +293,7 @@ ABIS = {
 }
 # 编入单一 .so 的源文件（test_method_restore.c 为独立自测，不编入）
 NATIVE_COMPILE = [
+    "jg_strcrypt.c",       # P4: XOR(0x37) 编码表 + 运行时解码（独立 TU，防 -O2 常量折叠）
     "jg_guard.c", "jg_method_restore.c", "jg_integrity.c",
     "jg_inline_hook.c", "jg_method_restore_hook.c", "jg_hook_bridge.S",
     "jg_anti_frida.c",
@@ -613,6 +614,25 @@ def _bake_whitebox_kdf(st):
 def _build_native(st):
     shutil.rmtree(TMP_NATIVE, ignore_errors=True)
     shutil.copytree(NATIVE_SRC, TMP_NATIVE)
+    # P3: 导出符号版本脚本——只暴露 JNI 入口，其余全隐藏，废掉 readelf 功能地图。
+    # 关键：_sed_native 会把 Java_com_gx_runtime_<Class>_ 重命名为
+    # Java_<pkg_us>_<randomClass>_（GxAntiFrida 类名不随机、仅换包前缀），
+    # 故版本脚本必须按 st 的随机名生成，否则 JNI 入口被 local:* 隐藏 → 真机 UnsatisfiedLinkError。
+    _pkg_us = st["pkg_underscore"]
+    _renamed = {
+        "GxGuard": st["classes"]["GxGuard"],
+        "GxKeys": st["classes"]["GxKeys"],
+        "GxDecryptor": st["classes"]["GxDecryptor"],
+        "GxBootstrap": st["classes"]["GxBootstrap"],
+        "Obf": st["classes"]["Obf"],
+    }
+    _globals = ["JNI_OnLoad"]
+    for _old, _new in _renamed.items():
+        _globals.append("Java_%s_%s_*" % (_pkg_us, _new))
+    # GxAntiFrida 类名保持原样（_sed_native 不随机其类名），仅包前缀 com_gx_runtime → pkg_us
+    _globals.append("Java_%s_GxAntiFrida_*" % _pkg_us)
+    with open(os.path.join(TMP_NATIVE, "exports.map"), "w") as _ef:
+        _ef.write("{\n  global:\n    " + ";\n    ".join(_globals) + ";\n  local:\n    *;\n};\n")
     _regen_vectors(st)
     if st.get("wb_kdf"):
         _bake_whitebox_kdf(st)
@@ -675,13 +695,14 @@ def _build_native(st):
         srcs = [os.path.join(TMP_NATIVE, f) for f in NATIVE_COMPILE
                 if abi == "arm64-v8a" or f not in _hook_files]
         subprocess.check_call(
-            [clang, "--shared", "-fPIC", "-O2", "-fno-ident"] + obf_flags + ["-o", out] + srcs +
+            [clang, "--shared", "-fPIC", "-O2", "-fno-ident", "-fvisibility=hidden"] + obf_flags + ["-o", out] + srcs +
             (["-DWB_KDF"] if st.get("wb_kdf") else []) +
             # -Wl,--no-undefined: ELF 共享库默认【允许】未定义符号，链接会"成功"，
             # 直到真机 dlopen 才炸（2026-09-10 事故：漏 include jg_rawsys.h 导致
             # jg_read_file_raw 未定义 -> dlopen failed -> bootstrap UnsatisfiedLinkError
             # -> App 启动即崩）。加这个开关把该类问题前移到构建期。
-            ["-Wl,-s", "-Wl,--no-undefined", "-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
+            ["-Wl,-s", "-Wl,--version-script=%s" % os.path.join(TMP_NATIVE, "exports.map"),
+             "-Wl,--no-undefined", "-llog", "-lz"], creationflags=_SUBPROC_FLAGS)
         built += 1
         print("[*] native 构建完成%s (%s): %s" % (obf_tag, abi, out))
     if not built:
@@ -743,7 +764,7 @@ def _build_native_remote(st):
         # -l:libunwind.a（clang/lib/Driver/ToolChains/CommonArgs.cpp 的 AddUnwindLibrary），
         # 而 NDK r23+ 的 sysroot 已移除 libunwind → 不关掉就链接失败。
         # NDK 自带的 clang 有私有补丁规避，我们自编的 stock LLVM 没有。
-        cmd = ("cd %s && %s --sysroot=%s -unwindlib=none --shared -fPIC -O2 %s %s -o %s %s -llog -lz"
+        cmd = ("cd %s && %s --sysroot=%s -unwindlib=none --shared -fPIC -O2 -fvisibility=hidden %s %s -o %s %s -Wl,-s -Wl,--version-script=exports.map -llog -lz"
                % (remote_native, clang, sysroot, " ".join(obf_flags), wb,
                   out_name, " ".join(srcs)))
         _run_remote([ssh, "-p", port] + _ssh_opts() + [host, cmd])

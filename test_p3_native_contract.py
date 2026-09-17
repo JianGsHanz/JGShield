@@ -85,11 +85,13 @@ def simulate_native_writeback(seed, payload, orig_dexes):
         mlen = u32(payload, p); p += 4
         meta_blob = payload[p:p + mlen]; p += mlen
         entries = []
-        if mlen > 0 and ec > 0:
+        if mlen > 0:
             raw = zlib.decompress(meta_blob)
-            # 每行 (method_idx, code_off, insns_size) 共 12B；offset/len 由累计推得（P6）
+            # 整段：每 dex 仅 1 条 stream+meta（ec=1），meta 内含 n 个 (method_idx,
+            # code_off, insns_size) 三元组（12B/条）；offset/len 由 insns_size 累计推得。
             run = 0
-            for k in range(ec):
+            n = len(raw) // 12
+            for k in range(n):
                 base = k * 12
                 method_idx = struct.unpack_from("<I", raw, base)[0]
                 code_off = struct.unpack_from("<I", raw, base + 4)[0]
@@ -141,9 +143,9 @@ def main():
         msecs = []
         nop_dexes = []
         for i, d in enumerate(orig_dexes):
-            nop_d, blob, entries = harden.extract_methods(seed, i, d)
+            nop_d, stream_blob, meta_blob, entries = harden.extract_methods(seed, i, d)
             nop_dexes.append(nop_d)
-            msecs.append((i, blob, entries))
+            msecs.append((i, stream_blob, meta_blob, entries))
         payload = harden.build_payload(seed, nop_dexes, None, msecs)
         ok, msg = simulate_native_writeback(seed, payload, orig_dexes)
         status = "PASS" if ok else "FAIL"

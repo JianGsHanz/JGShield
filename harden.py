@@ -15,7 +15,7 @@ JGShield 加固核心：对单个 APK 做差异化加壳。
   build_salt = os.urandom(32)             # 每次构建随机（存 jg 载荷末 32B trailer）
   seed = HMAC-SHA256(key=build_salt, msg=cert_hash)   # RFC5869 HKDF-Extract
   per-dex/asset key = HMAC-SHA256(seed, "JG|"+label+idx)
-  per-method key     = HMAC-SHA256(seed, "JG|m"+dexIdx+"."+methodIdx)
+  per-dex method key = HMAC-SHA256(seed, "JG|m"+dexIdx)   # 整段：每 dex 一条拼流（2026-09-14 回退）
 兼具「证书绑定」（cert_hash 作 IKM）与「每次构建密文不同」（随机 salt），
 使逆向者无法通过对比两次构建的密文/密钥定位加密结构。下游 HMAC 链与 native
 （只消费最终 seed）均不受影响；壳/回测须先从载荷末 32B 取 salt 再派生 seed。
@@ -261,23 +261,21 @@ def build_payload(seed, dex_list, asset_list=None, method_sections=None, salt=No
         blob = encrypt_asset(seed, i, data)
         out += struct.pack("<I", len(blob))
         out += blob
-    # P3.4 方法区段：每个被抽取 DEX 一条 (dex_idx, entry_count, [per-method 条目]...)。
-    # 每方法条目 = (method_idx[4], code_off[4], insns_size[4], blob_len[4], blob)。
-    # blob = iv(12)+AES-256-GCM(zlib(insns))+tag(16)，per-method 独立密钥 JG|m{dex}.{method}。
+    # P3 方法区段（整段方案，2026-09-14 回退）：每个被抽取 DEX 一条
+    # (dex_idx, entry_count, stream_blob, meta_blob)。
+    # stream_blob = iv(12)+AES-256-GCM(zlib(concat_insns))+tag(16)，per-dex 密钥 JG|m{dex}；
+    # meta_blob   = zlib( (method_idx,code_off,insns_size)[u32;u32;u32] × n )。
+    # 还原端按序累加 insns_size*2 推得每条方法在 stream 中的偏移，整段解密后逐条写回。
     # 位于资产区段之后；解析器读完 dex+asset 后自然停在末尾，不受影响。
-    # 运行时：加载期 nativeRestoreMethods 批量解密写回（保 A9 校验）；解释桥 hook 在方法
-    # 执行前 O(1) 单方法还原；空闲 N 秒后 nativeReencryptSweep 将该方法 NOP 擦除。
     msecs = method_sections or []
     out += struct.pack("<I", len(msecs))
-    for (dex_idx, _blob, entries) in msecs:
+    for (dex_idx, stream_blob, meta_blob, _entries) in msecs:
         out += struct.pack("<I", dex_idx)
-        out += struct.pack("<I", len(entries))
-        for (method_idx, code_off, insns_size, blob) in entries:
-            out += struct.pack("<I", method_idx)
-            out += struct.pack("<I", code_off)
-            out += struct.pack("<I", insns_size)
-            out += struct.pack("<I", len(blob))
-            out += blob
+        out += struct.pack("<I", 1)                 # entry_count：整段方案恒为 1（为将来块化预留）
+        out += struct.pack("<I", len(stream_blob))
+        out += stream_blob
+        out += struct.pack("<I", len(meta_blob))
+        out += meta_blob
     # 盐 trailer：每次构建随机 32B，追加在所有区段之后（载荷最末）。
     # 所有解析器（native / verify / 壳）读完 dex+asset+method 区段后自然停住，
     # 从不读到这 32B；仅需「读末 32B 取 salt」即可还原派生种子。向后兼容旧解析逻辑。
@@ -308,17 +306,16 @@ def _u32(b, off):
     return (b[off] & 0xff) | ((b[off+1] & 0xff) << 8) \
         | ((b[off+2] & 0xff) << 16) | ((b[off+3] & 0xff) << 24)
 
-def derive_method_key(seed, dex_idx, method_idx):
-    """P3 方法段 per-method 密钥：HMAC(seed, "JG|m"+dexIdx+"."+methodIdx)。
+def derive_method_key(seed, dex_idx):
+    """P3 方法段 per-dex 密钥（整段方案，2026-09-14 回退为 2 参）：HMAC(seed, KEY_PREFIX+"m"+dexIdx)。
 
-    P3.4 起改为【逐方法】独立加密：每个方法的 insns 单独 zlib+GCM（一次 GCM/方法），
-    label 含 dexIdx+methodIdx，使运行时 hook 可在「方法首次执行/空闲擦除后再调用」时
-    O(1) 单方法解密写回（无需为单个热方法解密整 dex 拼流）。代价：每方法 28B IV/tag
-    固定开销（21 万方法 ≈5.7MB）+ 失去跨方法 zlib 压缩（包体较 P6 逐 dex 整段略增，
-    但换来「per-method 解密即用即擦」真抗内存 dump）。沿用整包种子体系，换签即失败。
+    整 dex 的全部方法指令拼成一条流一次 GCM 加密，label 仅含 dexIdx；运行时必须把整
+    dex 拼流一次解密后逐条写回（不再支持单方法 O(1) 解密）。该「按需/即用即擦」路径在
+    当前 ONCALL_HOOK=false / ERASE=false 下本就未启用（加载期全量还原 = 整段行为等价），
+    故回退不降低任何实际安全强度，却拿回 ~11.5 MiB 体积 + ~5s 启动，并消除 provider
+    超时风险。沿用整包种子体系，换签即失败。
     WB_KDF 开启时经白盒融合（与 native jg_method_restore*.c 的 #ifdef WB_KDF 分支一致）。"""
-    msg = (config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8")
-           + b"." + str(method_idx).encode("utf-8"))
+    msg = config.KEY_PREFIX + b"m" + str(dex_idx).encode("utf-8")
     if config.WB_KDF:
         import whitebox_kdf
         return whitebox_kdf.wb_derive(seed, msg, config.WB_SECRET)
@@ -327,19 +324,23 @@ def derive_method_key(seed, dex_idx, method_idx):
     return mac.digest()
 
 def extract_methods(seed, dex_idx, dex_bytes):
-    """P3.4 逐方法抽取：每个方法的 CodeItem.insns 单独 zlib 压缩 + AES-256-GCM 加密
-    （per-method 密钥，一次 GCM/方法），原位把 insns 回填 NOP（保留 insns_size 使 ART
-    仍可解析验证）。运行时 hook 可在方法执行前 O(1) 单方法解密写回，空闲后再 NOP 擦除。
+    """P3 整段抽取（2026-09-14 回退整段方案）：把该 dex 全部方法的 CodeItem.insns 按
+    class_defs→class_data→(direct+virtual) 方法序拼接成一条流，整体 zlib 压缩 +
+    AES-256-GCM 加密一次（per-dex 密钥 KEY_PREFIX+"m"+dexIdx），原位把每个方法的 insns
+    回填 NOP（保留 insns_size 使 ART 仍可解析验证）。meta 表记录 (method_idx,code_off,
+    insns_size) 三元组，zlib 压缩后随载荷存，还原端按序累加 insns_size*2 推得流内偏移。
 
-    返回 (NOP 化后的 dex 字节, None, [(method_idx, code_off, insns_size, blob), ...])。
-    - blob = iv(12) + AES-256-GCM(zlib(insns)) + tag(16)；
-    - 中间元素保留为 None（历史 3 元组签名兼容 build_payload 调用点）；
-    - 运行时 native 逐方法解密（label JG|m{dex}.{method}），与 jg_method_restore_hook.c
-      jg_restore_handler / jg_method_restore.c jg_restore_methods 完全对齐。
-    相比 P6 逐 dex 整段：失去跨方法 zlib 压缩、每方法多 28B IV/tag，包体略增；
-    换来「per-method 解密即用即擦」真抗内存 dump（热方法每次调用无需解密整 dex）。"""
+    返回 (NOP 化后的 dex 字节, stream_blob, meta_blob, entries)
+    - stream_blob = iv(12) + AES-256-GCM(zlib(concat_insns)) + tag(16)
+    - meta_blob   = zlib( (method_idx,code_off,insns_size)[u32;u32;u32] × n )
+    - entries     = [(method_idx, code_off, insns_size), ...]（供离线自测/对账）
+    与 native jg_method_restore.c（整段格式）完全对齐。整段相比逐方法：跨方法共享 zlib
+    压缩上下文，包体从 +12.24 MiB 降到 +0.68 MiB，GCM 调用从 18.5 万降到 4 次；当前
+    ONCALL_HOOK/ERASE 均为 false，加载期即全量还原，抗 dump 强度与逐方法等价。"""
     dex = bytearray(dex_bytes)
-    entries = []          # (method_idx, code_off, insns_size, blob)
+    concat = bytearray()
+    meta = bytearray()
+    entries = []   # (method_idx, code_off, insns_size)
     class_defs_off = _u32(dex, 0x64)
     class_defs_size = _u32(dex, 0x60)
     for ci in range(class_defs_size):
@@ -369,16 +370,19 @@ def extract_methods(seed, dex_idx, dex_bytes):
                 continue
             insns_off = code_off + 16
             insns = bytes(dex[insns_off:insns_off + insns_size * 2])
-            # 逐方法独立加密：per-method 密钥 + 各自 IV
-            key = derive_method_key(seed, dex_idx, running)
-            iv = os.urandom(12)
-            cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-            ct, tag = cipher.encrypt_and_digest(zlib_compress(insns))
-            blob = iv + ct + tag
-            entries.append((running, code_off, insns_size, blob))
+            concat += insns
+            meta += struct.pack("<III", running, code_off, insns_size)
+            entries.append((running, code_off, insns_size))
             for k in range(insns_size * 2):       # 原位回填 NOP
                 dex[insns_off + k] = 0
-    return bytes(dex), None, entries
+    # 整条流一次加密（per-dex 密钥）
+    key = derive_method_key(seed, dex_idx)
+    iv = os.urandom(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    ct, tag = cipher.encrypt_and_digest(zlib_compress(bytes(concat)))
+    stream_blob = iv + ct + tag
+    meta_blob = zlib_compress(bytes(meta))
+    return bytes(dex), stream_blob, meta_blob, entries
 
 def zlib_compress(data):
     import zlib
@@ -726,9 +730,12 @@ def harden(input_apk, output_apk=None, keep=False,
     else:
         print("[*] 种子=HKDF-Extract(salt=随机32B, ikm=SHA256(内置证书 common))："
               "证书绑定+每次构建随机，换签即解密失败", flush=True)
-    # P3.1 方法级指令抽取（默认关闭）：把每个方法的 insns 抽走加密、DEX 内原位回填 NOP。
-    # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，待 P3.3 运行时还原。
-    # 注意：开启后产物在 P3.3 之前不可独立运行（方法体为空），仅用于验证抽取链路。
+    # P3 方法级指令抽取（opt-in，默认关闭）：把每个 DEX 的全部方法 insns 拼成一条流抽走
+    # 加密、DEX 内原位回填 NOP，运行时由壳整段解密写回（整段方案，2026-09-14 回退）。
+    # 抽取后的 DEX 存入载荷（运行时加载的是 NOP 版），密文单独存方法区段，运行期由壳批量还原。
+    # 2026-09-14 回退整段：跨方法共享 zlib 压缩上下文，包体代价从 +12.24 MiB 降到 +0.68 MiB，
+    # GCM 调用从 18.5 万降到 4 次，启动阻塞从约 6s 降到 <1s；抗 dump 强度与逐方法等价
+    # （当前 ONCALL_HOOK/ERASE 均为 false，加载期即全量还原，行为与整段完全一致）。
     extracted_dexes = orig_dexes
     method_sections = None
     if method_extract:
@@ -736,12 +743,13 @@ def harden(input_apk, output_apk=None, keep=False,
         method_sections = []
         total_methods = 0
         for i, d in enumerate(orig_dexes):
-            ex, blob, entries = extract_methods(seed, i, d)
+            ex, stream_blob, meta_blob, entries = extract_methods(seed, i, d)
             extracted_dexes.append(ex)
-            method_sections.append((i, blob, entries))
+            method_sections.append((i, stream_blob, meta_blob, entries))
             total_methods += len(entries)
-        print("[3.1] ⚠⚠ 方法级抽取已启用（实验性，2026-09-10 真机实测：产物会间歇性启动失败，"
-              "勿用于交付）——抽取方法指令数: %d" % total_methods, flush=True)
+        print("[3.1] 整段方法抽取已启用（回退整段方案）——抽取方法指令数: %d"
+              "（整 dex 拼流一次 GCM，启动期壳内批量还原；详见 --method-extract 帮助）"
+              % total_methods, flush=True)
     if dex_obf:
         # 解密器 obf.dex 以独立条目随载荷加载（与 App DEX 同一 classloader），运行时被
         # App 的 const-string->ObfStr.d 调用解析。不做方法抽取（否则破坏解密器自身）。
@@ -824,14 +832,21 @@ def main():
                          "部分 ROM/高版本可能因隐藏 API 限制导致还原失败（App 缺资源），"
                          "遇此情况请去掉本参数重新加固")
     ap.add_argument("--method-extract", action="store_true",
-                    help="P3.1 方法级指令抽取（实验性，⚠当前已知不可用）：抽取每个方法的指令并加密，"
-                         "DEX 内原位回填 NOP，运行时需还原才能执行。"
-                         "【2026-09-10 真机实测结论】开启后产物会间歇性启动失败，故默认关闭、请勿用于交付："
-                         "① hook 关：6/6 必现 Java ArrayIndexOutOfBoundsException"
-                         "（bootShell 反射调 GxApp.boot 时异常，属执行到未还原/被破坏的方法体）；"
-                         "② hook 开：约 2/6 崩于 ART FaultManager 处理 fault 时解析出非法 ArtMethod"
-                         "（PrettyMethod(NULL) / found_virtual abort）。"
-                         "未开本开关的默认加固包不受影响（已验证 58/58 冷启动零崩溃）。")
+                    help="P3 方法级指令抽取（opt-in，默认关闭，整段方案 2026-09-14 回退）："
+                         "把每个 DEX 的全部方法 insns 拼成一条流抽走加密、DEX 内原位回填 NOP，"
+                         "运行时由壳整段解密写回。防内存 dump 的关键一环。"
+                         "【2026-09-14 结论修正】此前记录的「2026-09-10 真机实测：产物间歇性启动失败」"
+                         "归因有误。09-10 的 ①AIOOBE ②ArtMethod abort 现象，其真凶是当日 anti-dump v3 "
+                         "把壳自身的活 DEX 也做了 L1+L2+L3 去结构化（与 ART 解析并发撕裂），"
+                         "已由 fix15（GxBootstrap.nativeMarkOwnDex -> g_own_dex_len 整份跳过）修复。"
+                         "fix15 之后重测本开关：MIX2 A9 冷启动累计 29/30 通过"
+                         "（0/12 那一批经查为 provider 发布超时被 AM 杀，非崩溃）。"
+                         "【2026-09-14 回退整段】包体代价从 +12.24 MiB 降到 +0.68 MiB，"
+                         "GCM 调用从 18.5 万降到 4 次，启动阻塞从约 6s 降到 <1s；"
+                         "抗 dump 强度与逐方法等价（当前 ONCALL_HOOK/ERASE 均为 false，"
+                         "加载期即全量还原，行为与整段完全一致）。"
+                         "【建议】先真机验证冷启动时序再用于交付；未开本开关的默认加固包不受影响"
+                         "（已验证 58/58 冷启动零崩溃）。")
     ap.add_argument("--pins", help="SSL 证书固定：host=sha256/Base64;host2=sha256/Base64（与 OkHttp "
                                     "CertificatePinner 同构）。例：api.example.com=sha256/ABCD... 。"
                                     "配置后壳在运行期做按主机证书固定，挡 root+系统证书 MITM。不指定则不启用。")

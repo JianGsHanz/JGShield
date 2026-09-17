@@ -29,6 +29,7 @@
 #include <elf.h>
 #include <android/log.h>
 #include "jg_rawsys.h"
+#include "jg_strcrypt.h"  /* P4: 明文锚点 XOR(0x37) 编码，运行时解码 */
 
 #define PTAG "JG-Preload"
 
@@ -78,7 +79,9 @@ int jg_entry_is_trampoline(const void *fn) {
  * 输出：bias（首个 libart.so 映射起始 = load_bias）、path（磁盘路径）。
  * 返回 0 成功，-1 失败。 */
 static int _find_libart(long *bias_out, char *path_out, int path_cap) {
-    long fd = jg_open_ro("/proc/self/maps");
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    long fd = jg_open_ro(path);
     if (fd < 0) return -1;
     char chunk[16 * 1024];
     char carry[512];
@@ -343,8 +346,9 @@ Java_com_gx_runtime_GxGuard_nativePreloadCheck(JNIEnv *env, jclass clazz) {
     }
     /* spawn 竞态兜底：agent 线程先于 app 代码存在（挂起期注入） */
     if (jg_af_thread_names()) {
-        __android_log_print(ANDROID_LOG_WARN, PTAG,
-            "frida agent threads present BEFORE dex decrypt -> raw exit (P0-B2)");
+        char s[96];
+        jgx_dec(JGX_LOG_AGENT, s, sizeof(s));
+        __android_log_print(ANDROID_LOG_WARN, PTAG, s);
         jg_hard_exit();
     }
 }

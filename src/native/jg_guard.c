@@ -35,6 +35,7 @@
 #include <android/log.h>
 #include "jg_crypto.h"
 #include "jg_rawsys.h"   /* P0-A：检测 IO 裸 syscall 化（frida hook libc 读不到真数据） */
+#include "jg_strcrypt.h"  /* P4: 明文锚点 XOR(0x37) 编码，运行时解码 */
 #ifdef WB_KDF
 /* P0-B 真白盒：仅 -DWB_KDF 时引入白盒 KDF（WB_STATE 已烘焙进该头）。 */
 #include "whitebox_kdf.h"
@@ -45,12 +46,9 @@
 /* 扩展特征库：覆盖改名后的 frida-gadget / magisk / 各类 hook 框架。
  * 注意：不放 "libmsaoaidsec"——那是 MSA(移动安全联盟) OAID SDK 的合法库，
  * 集成 OAID 的包自己 maps 里必有，出现≠被攻击（0904 报告①误杀分析：留着只会在
- * exit 模式下 100% 误杀集成 OAID 的全部真实用户，永远不会抓到攻击者）。 */
-static const char *MAP_KEYWORDS[] = {
-    "frida", "gadget", "libfrida", "frida-agent", "substrate",
-    "xposed", "libsandhook", "libnativehook",
-    "cydia", "magisk", "re.frida", "frida-server", NULL
-};
+ * exit 模式下 100% 误杀集成 OAID 的全部真实用户，永远不会抓到攻击者）。
+ * P4: 检测关键字表改为运行时解码（jg_strcrypt.h 的 JGX_MAP_KEYWORDS），
+ * 见 scan_maps()，逐条 jgx_tbl 解码后 strstr 比对，原语义不变。 */
 
 static const int FRIDA_PORTS[] = {27042, 27043};
 static const int POLL_MS = 2000;          /* 周期轮询间隔 */
@@ -71,15 +69,19 @@ static int read_file(const char *path, char *buf, size_t buflen) {
     return jg_read_file_raw(path, buf, (int)buflen);
 }
 
-/* 逐行扫描 maps，命中任一关键字即视为篡改 */
+/* 逐行扫描 maps，命中任一关键字即视为篡改（P4：路径与关键字均运行时解码） */
 static int scan_maps(void) {
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
     char buf[16384];
-    if (read_file("/proc/self/maps", buf, sizeof(buf)) < 0) return 0;
+    if (read_file(path, buf, sizeof(buf)) < 0) return 0;
     char *p = buf;
+    char kw[32];
     while (*p) {
-        for (int k = 0; MAP_KEYWORDS[k]; k++) {
-            if (strstr(p, MAP_KEYWORDS[k])) {
-                __android_log_print(ANDROID_LOG_WARN, TAG, "maps hit: %s", MAP_KEYWORDS[k]);
+        for (int k = 0; k < (int)JGX_MAP_KEYWORDS_N; k++) {
+            jgx_tbl(JGX_MAP_KEYWORDS, k, kw, sizeof(kw));
+            if (strstr(p, kw)) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "maps hit: %s", kw);
                 return 1;
             }
         }
@@ -120,17 +122,22 @@ static int check_status_tracerpid(const char *path) {
 /* 检查自身进程与所有线程的 TracerPid（裸 syscall 遍历 /proc/self/task） */
 static int _status_tracer_cb(const char *name, void *ud) {
     int *hit = (int *)ud;
-    char path[96];
-    snprintf(path, sizeof(path), "/proc/self/task/%s/status", name);
+    char fmt[96], path[128];
+    jgx_dec(JGX_TASK_STATUS, fmt, sizeof(fmt));
+    snprintf(path, sizeof(path), fmt, name);
     if (check_status_tracerpid(path)) { *hit = 1; return 1; }
     return 0;
 }
 
 static int check_tracerpid(void) {
-    if (check_status_tracerpid("/proc/self/status")) return 1;
+    char self_status[64];
+    jgx_dec(JGX_STATUS, self_status, sizeof(self_status));
+    if (check_status_tracerpid(self_status)) return 1;
     /* 遍历 /proc/self/task/<tid>/status，任一线程被 trace 即视为篡改 */
+    char task[64];
+    jgx_dec(JGX_TASK, task, sizeof(task));
     int hit = 0;
-    jg_for_each_dir("/proc/self/task", _status_tracer_cb, &hit);
+    jg_for_each_dir(task, _status_tracer_cb, &hit);
     return hit;
 }
 
@@ -142,7 +149,9 @@ static int probe_port(int port) {
     int r = (jg_connect_local((int)fd, (unsigned short)port) == 0) ? 1 : 0;
     jg_close((int)fd);
     if (r == 1) {
-        __android_log_print(ANDROID_LOG_WARN, TAG, "frida port %d open", port);
+        char s[96];
+        jgx_dec(JGX_LOG_PORT_OPEN, s, sizeof(s));
+        __android_log_print(ANDROID_LOG_WARN, TAG, s, port);
         return 1;
     }
     return 0;
@@ -150,10 +159,14 @@ static int probe_port(int port) {
 
 static int check_frida_server_file(void) {
     /* 裸 syscall openat 探测存在性（替代 libc stat，防 PLT hook） */
-    long fd = jg_open_ro("/data/local/tmp/re.frida.server");
+    char srv[64];
+    jgx_dec(JGX_FRIDA_SRV, srv, sizeof(srv));
+    long fd = jg_open_ro(srv);
     if (fd >= 0) {
         jg_close((int)fd);
-        __android_log_print(ANDROID_LOG_WARN, TAG, "frida server file exists");
+        char s[96];
+        jgx_dec(JGX_LOG_SRV, s, sizeof(s));
+        __android_log_print(ANDROID_LOG_WARN, TAG, s);
         return 1;
     }
     return 0;
@@ -201,15 +214,20 @@ struct jg_gum_ctx { int hit; };
 
 static int _gum_comm_cb(const char *name, void *ud) {
     struct jg_gum_ctx *ctx = (struct jg_gum_ctx *)ud;
-    char path[96];
-    snprintf(path, sizeof(path), "/proc/self/task/%s/comm", name);
+    char fmt[96], path[128];
+    jgx_dec(JGX_TASK_COMM, fmt, sizeof(fmt));
+    snprintf(path, sizeof(path), fmt, name);
     char comm[64];
     if (jg_read_file_raw(path, comm, (int)sizeof(comm)) < 0) return 0;
     size_t n = strlen(comm);
     while (n > 0 && (comm[n-1] == '\n' || comm[n-1] == '\r')) comm[--n] = 0;
-    if (strncmp(comm, "gum-js-loop", 12) == 0 ||
-        strncmp(comm, "pool-frida", 11) == 0 ||
-        strncmp(comm, "frida", 6) == 0) {
+    char g[32], p[32], f[32];
+    jgx_dec(JGX_GUM, g, sizeof(g));
+    jgx_dec(JGX_POOL, p, sizeof(p));
+    jgx_dec(JGX_FRIDA, f, sizeof(f));
+    if (strncmp(comm, g, 12) == 0 ||
+        strncmp(comm, p, 11) == 0 ||
+        strncmp(comm, f, 6) == 0) {
         ctx->hit = 1;
         return 1;
     }
@@ -218,7 +236,9 @@ static int _gum_comm_cb(const char *name, void *ud) {
 
 static int check_gum_thread(void) {
     struct jg_gum_ctx ctx = {0};
-    jg_for_each_dir("/proc/self/task", _gum_comm_cb, &ctx);
+    char task[64];
+    jgx_dec(JGX_TASK, task, sizeof(task));
+    jg_for_each_dir(task, _gum_comm_cb, &ctx);
     return ctx.hit;
 }
 
@@ -228,8 +248,9 @@ static int check_gum_thread(void) {
 static void hard_exit_on_frida_port(void) {
     int hit = probe_port(FRIDA_PORTS[0]) || probe_port(FRIDA_PORTS[1]) || check_gum_thread();
     if (!hit) return;
-    __android_log_print(ANDROID_LOG_WARN, TAG,
-        "frida port/thread detected (hard signal) -> raw exit");
+    char s[96];
+    jgx_dec(JGX_LOG_HARD_PT, s, sizeof(s));
+    __android_log_print(ANDROID_LOG_WARN, TAG, s);
     jg_hard_exit();
 }
 
@@ -238,8 +259,9 @@ static void hard_exit_on_frida_port(void) {
  * 独立于 Java 路径，即使 Java 侧被 hook 失效，native 守护线程仍能在下一轮轮询（2s）内击杀。 */
 static void hard_exit_on_frida_port_any(void) {
     if (!jg_af_frida_port_any()) return;
-    __android_log_print(ANDROID_LOG_WARN, TAG,
-        "frida port (any) via handshake detected (hard signal) -> raw exit");
+    char s[96];
+    jgx_dec(JGX_LOG_HARD_PA, s, sizeof(s));
+    __android_log_print(ANDROID_LOG_WARN, TAG, s);
     jg_hard_exit();
 }
 

@@ -35,8 +35,13 @@
  *   dlopen failed: cannot locate symbol "jg_read_file_raw" referenced by libxxx.so
  * 进而 bootstrap 报 No implementation found -> App 启动即崩。 */
 #include "jg_rawsys.h"
+#include "jg_strcrypt.h"  /* P4: 明文锚点 XOR(0x37) 编码，运行时解码 */
 #include <sys/mman.h>
 #include <dlfcn.h>
+
+/* 复用 jg_anti_frida.c 的跳板检测（同 .so，extern 声明即可）。
+ * 返回 1 表示 libc/libart 入口已被 frida/LSPosed 下跳板。 */
+extern int jg_af_hook_patched(void);
 #include <android/log.h>
 #include <stdio.h>
 #include <elf.h>
@@ -59,7 +64,9 @@
  * 都在文件里，与运行时映射无关），按名匹配符号，运行时地址 = libart 加载基址 + st_value。
  */
 static uintptr_t find_lib_base(const char *name, char *pathbuf, size_t pathlen) {
-    FILE *f = fopen("/proc/self/maps", "r");
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    FILE *f = fopen(path, "r");
     if (!f) return 0;
     char line[600];
     uintptr_t base = 0;
@@ -327,7 +334,9 @@ static int prot_query(uintptr_t addr) {
     size_t cap = 1u << 19;                 /* 512KB，足够覆盖 maps */
     char *buf = (char *)malloc(cap);
     if (!buf) return -1;
-    int n = jg_read_file_raw("/proc/self/maps", buf, (int)cap - 1);
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    int n = jg_read_file_raw(path, buf, (int)cap - 1);
     if (n <= 0) { free(buf); return -1; }
     buf[n] = '\0';
     char *p = buf;
@@ -672,6 +681,18 @@ static void try_install_hook(void) {
             "no extracted methods in payload -> skip hook (nothing to restore lazily), pure P3.2 batch");
         free(g_entries); g_entries = NULL;
         g_hook_mode = 0;
+        return;
+    }
+
+    /* 防 double-hook 自爆（2026-09-16 修复）：已检测到 frida/LSPosed 对 libc/libart
+     * 入口下跳板时，不再安装我们的 inline hook（在被 hook 目标上叠加跳板会跳飞 SIGSEGV），
+     * 直接回退纯 P3.2 批量还原。与"diagnostic-only 不杀"策略一致；MIX2+frida 在场时必须跳过。 */
+    if (jg_af_hook_patched()) {
+        char msg[160];
+        jgx_dec(JGX_HOOK_SKIP_GLOBAL, msg, sizeof(msg));
+        __android_log_print(ANDROID_LOG_WARN, TAG, "%s", msg);
+        free(g_entries); g_entries = NULL; g_hook_mode = 0;
+        for (int r = 0; r < g_nrange; r++) batch_restore_one(r);
         return;
     }
 
@@ -1054,7 +1075,9 @@ l1_only:
 /* maps 自扫：遍历本进程全部匿名映射，处理其中的 dex（deep=1 时含 L2/L3）。
  * 2026-09-11：改为「每 VMA 必探起始页 + 仅 <= 32MB 的 VMA 逐页扫」。 */
 static int scramble_dex_copies_in_maps(int deep) {
-    FILE *f = fopen("/proc/self/maps", "r");
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    FILE *f = fopen(path, "r");
     if (!f) return 0;
     char line[512];
     int n = 0;
@@ -1198,7 +1221,9 @@ static int force_dex_regions_writable(void) {
     size_t cap = 1u << 19;                 /* 512KB，足够覆盖 maps */
     char *buf = (char *)malloc(cap);
     if (!buf) return 0;
-    int n = jg_read_file_raw("/proc/self/maps", buf, (int)cap - 1);
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    int n = jg_read_file_raw(path, buf, (int)cap - 1);
     if (n <= 0) { free(buf); return 0; }
     buf[n] = '\0';
 

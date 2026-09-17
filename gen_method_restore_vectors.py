@@ -56,25 +56,25 @@ def main():
     # ---- sample1：完整写回向量（FULL_PAYLOAD + NOP_DEX + ORIG_DEX）----
     with zipfile.ZipFile(SAMPLE1) as z:
         orig1 = z.read("classes.dex")
-    nop1, blob1, entries1 = harden.extract_methods(seed, 0, orig1)
-    payload1 = harden.build_payload(seed, [nop1], None, [(0, blob1, entries1)])
+    nop1, stream_blob1, meta_blob1, entries1 = harden.extract_methods(seed, 0, orig1)
+    payload1 = harden.build_payload(seed, [nop1], None, [(0, stream_blob1, meta_blob1, entries1)])
     # 取 dex0 整条流 blob 的 GCM 向量（per-dex 密钥 "JG|m0"）
     m0 = entries1[0]
     midx0 = m0[0]
-    iv, ct, tag = gcm_blob_parts(blob1)
+    iv, ct, tag = gcm_blob_parts(stream_blob1)
     insns0 = orig1[(m0[1] + 16):(m0[1] + 16 + m0[2] * 2)]
-    plain0 = stream_plain(blob1, seed, 0)  # AES-GCM 明文 = zlib(concat_insns)
+    plain0 = stream_plain(stream_blob1, seed, 0)  # AES-GCM 明文 = zlib(concat_insns)
     key0 = verify_payload.derive_method_key(seed, 0)
 
     # ---- sample4：第二个 GCM 向量（同 dex0 per-dex 密钥，不同密文）----
     with zipfile.ZipFile(SAMPLE4) as z:
         orig4 = z.read("classes.dex")
-    nop4, blob4, entries4 = harden.extract_methods(seed, 0, orig4)
+    nop4, stream_blob4, meta_blob4, entries4 = harden.extract_methods(seed, 0, orig4)
     m4 = entries4[0]
     midx4 = m4[0]
-    iv4, ct4, tag4 = gcm_blob_parts(blob4)
+    iv4, ct4, tag4 = gcm_blob_parts(stream_blob4)
     insns4 = orig4[(m4[1] + 16):(m4[1] + 16 + m4[2] * 2)]
-    plain4 = stream_plain(blob4, seed, 0)
+    plain4 = stream_plain(stream_blob4, seed, 0)
     key4 = verify_payload.derive_method_key(seed, 0)
 
     # HMAC 向量：label = KEY_PREFIX+"m0"（per-dex 密钥，与 build_stub._regen_vectors 一致）

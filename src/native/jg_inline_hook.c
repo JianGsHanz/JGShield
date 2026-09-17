@@ -25,6 +25,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <android/log.h>
+#include "jg_strcrypt.h"  /* P4: 明文锚点 XOR(0x37) 编码，运行时解码 */
 
 /* process_vm_writev 在 Bionic 里【到 API 23 才提供】，而本项目 min-api=21。
  * 直接调用有两个后果：
@@ -145,6 +146,24 @@ static int is_pc_relative(uint32_t insn) {
     return 0;
 }
 
+/* 识别 frida / LSPosed(Zygisk) 的 inline hook 跳板首部：
+ *   MOVZ xN, #imm        (0xD2800000 | (imm16<<5) | Rd)
+ *   MOVK xN, #imm, ...   (0xF2A00000 | ... | Rd)
+ * 这类形态 is_pc_relative() 认不出（非 B/BL/BR/ADRP 类），会在【已被 hook 的目标】
+ * 上叠加我们的跳板 -> 续跑点 target+4 落在 frida 残留 trampoline 中段 -> 跳飞 SIGSEGV。
+ * 命中即放弃本目标，交由调用方回退批量还原（不 double-hook）。 */
+static int is_frida_trampoline(uintptr_t target) {
+    uint32_t first  = *(const uint32_t *)target;
+    uint32_t second = *(const uint32_t *)(target + 4);
+    int rd1 = first  & 0x1F;
+    int rd2 = second & 0x1F;
+    if (((first  & 0xFFE00000u) == 0xD2800000u) &&   /* MOVZ */
+        ((second & 0xFFE00000u) == 0xF2A00000u) &&   /* MOVK */
+        (rd1 == rd2))                                /* 同一寄存器：地址加载序列 */
+        return 1;
+    return 0;
+}
+
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
@@ -166,7 +185,9 @@ static void *mmap_near(uintptr_t target) {
     uintptr_t hi = target + 0x07FFFFF0u;
     if (hi < target) hi = (uintptr_t)-4096;          /* 溢出保护 */
     uintptr_t r[2048]; int nr = 0;
-    FILE *f = fopen("/proc/self/maps", "r");
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    FILE *f = fopen(path, "r");
     if (f) {
         char line[512];
         while (fgets(line, sizeof(line), f) && nr < 1024) {
@@ -210,6 +231,14 @@ int jg_inline_hook_install(uintptr_t target, jg_hook_handler_t handler,
     if (is_pc_relative(first)) {
         __android_log_print(ANDROID_LOG_ERROR, TAG,
             "first insn 0x%08x is PC-relative, abort hook", first);
+        return -2;
+    }
+    /* 防 double-hook 自爆：frida/LSPosed 已对本目标下 MOVZ/MOVK+BR 跳板时，
+     * 不再叠加我们自己的跳板（否则续跑点 target+4 落进 frida 残留 trampoline 中段）。 */
+    if (is_frida_trampoline(target)) {
+        char msg[128];
+        jgx_dec(JGX_HOOK_SKIP_TRAMP, msg, sizeof(msg));
+        __android_log_print(ANDROID_LOG_WARN, TAG, msg, (void*)target);
         return -2;
     }
 
@@ -259,17 +288,22 @@ int jg_inline_hook_install(uintptr_t target, jg_hook_handler_t handler,
 
     int written_ok = 0;
 
-    /* 路径1：/proc/self/mem（FOLL_FORCE 写只读/执行页，绕 W^X） */
-    int fd = open("/proc/self/mem", O_RDWR);
+    /* 路径1：/proc/self/mem（FOLL_FORCE 写只读/执行页，绕 W^X）。路径串运行时解码，不落明文 */
+    char mempath[32];
+    jgx_dec(JGX_SELF_MEM, mempath, sizeof(mempath));
+    int fd = open(mempath, O_RDWR);
     if (fd >= 0) {
         ssize_t n = pwrite(fd, &b_to_tramp, 4, (off_t)(intptr_t)target);
         close(fd);
-        __android_log_print(ANDROID_LOG_INFO, TAG,
-            "[hook] /proc/self/mem pwrite rc=%ld target=%p b_to_tramp=%08x",
+        char logpw[128];
+        jgx_dec(JGX_LOG_HOOK_MEM_PW, logpw, sizeof(logpw));
+        __android_log_print(ANDROID_LOG_INFO, TAG, logpw,
             (long)n, (void*)target, b_to_tramp);
         if (n == 4) written_ok = 1;
     } else {
-        __android_log_print(ANDROID_LOG_WARN, TAG, "[hook] open /proc/self/mem failed (errno), try process_vm_writev");
+        char logfail[128];
+        jgx_dec(JGX_LOG_HOOK_MEM_FAIL, logfail, sizeof(logfail));
+        __android_log_print(ANDROID_LOG_WARN, TAG, logfail);
     }
 
     /* 路径2：process_vm_writev 自进程（同样 FOLL_FORCE）

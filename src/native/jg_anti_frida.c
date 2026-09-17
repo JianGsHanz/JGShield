@@ -82,8 +82,30 @@ static void _decode_sig(const unsigned char* enc, char* out, int outsz);
 /* 分块读 /proc/self/maps 并扫描签名表（XOR 表逐条解码后匹配）。
  * 分块带 64B 尾部衔接，防签名恰好跨块。 */
 #define _MAPS_CHUNK (16 * 1024)
+/* P4: 路径/线程名明文锚点 XOR(0x37) 解码（与 FRIDA_SIGS 同密钥），避免 .so 内明文被 strings+grep 命中。
+ * noinline + 上方 k* 数组 volatile：强制解码在运行时从内存读编码字节，防 -O2 常量折叠把明文落 .rodata。 */
+static void __attribute__((noinline)) jg_xdec(char *out, const unsigned char *enc, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) out[i] = (char)(enc[i] ^ 0x37);
+    out[n] = '\0';
+}
+
+/* P4: 编码后的路径/线程名（XOR 0x37，运行时解码，.so 二进制内无明文）。
+ * volatile：阻止编译器把编码字节当编译期常量直接折叠出明文。 */
+static const volatile unsigned char kProcSelfMaps[]   = {0x18,0x47,0x45,0x58,0x54,0x18,0x44,0x52,0x5B,0x51,0x18,0x5A,0x56,0x47,0x44};  /* /proc/self/maps */
+static const volatile unsigned char kProcSelfStatus[] = {0x18,0x47,0x45,0x58,0x54,0x18,0x44,0x52,0x5B,0x51,0x18,0x44,0x43,0x56,0x43,0x42,0x44};  /* /proc/self/status */
+static const volatile unsigned char kProcTaskComm[]    = {0x18,0x47,0x45,0x58,0x54,0x18,0x44,0x52,0x5B,0x51,0x18,0x43,0x56,0x44,0x5C,0x18,0x12,0x44,0x18,0x54,0x58,0x5A,0x5A};  /* /proc/self/task/%s/comm */
+static const volatile unsigned char kProcSelfTask[]    = {0x18,0x47,0x45,0x58,0x54,0x18,0x44,0x52,0x5B,0x51,0x18,0x43,0x56,0x44,0x5C};  /* /proc/self/task */
+static const volatile unsigned char kProcNetTcp[]      = {0x18,0x47,0x45,0x58,0x54,0x18,0x59,0x52,0x43,0x18,0x43,0x54,0x47};  /* /proc/net/tcp */
+static const volatile unsigned char kProcNetTcp6[]     = {0x18,0x47,0x45,0x58,0x54,0x18,0x59,0x52,0x43,0x18,0x43,0x54,0x47,0x01};  /* /proc/net/tcp6 */
+static const volatile unsigned char kGumJsLoop[]       = {0x50,0x42,0x5A,0x1A,0x5D,0x44,0x1A,0x5B,0x58,0x58,0x47};  /* gum-js-loop */
+static const volatile unsigned char kPoolFrida[]       = {0x47,0x58,0x58,0x5B,0x1A,0x51,0x45,0x5E,0x53,0x56};  /* pool-frida */
+static const volatile unsigned char kFrida[]           = {0x51,0x45,0x5E,0x53,0x56};  /* frida */
+
 static int _raw_scan_maps_sigs(const unsigned char* table, int rows, int rowlen) {
-    long fd = jg_open_ro("/proc/self/maps");
+    char _p_maps[32];
+    jg_xdec(_p_maps, kProcSelfMaps, sizeof(kProcSelfMaps));
+    long fd = jg_open_ro(_p_maps);
     if (fd < 0) return 0;
     char chunk[_MAPS_CHUNK];
     char scan[_MAPS_CHUNK + 64];
@@ -198,7 +220,9 @@ static long _af_now_ms(void) {
  * 例外：TracerPid 是本进程 fork 出的 ptrace 守护子进程（PPid==self）→ 放行。 */
 static int _read_tracer_pid(void) {
     char buf[4096];
-    if (jg_read_file_raw("/proc/self/status", buf, (int)sizeof(buf)) < 0) return 0;
+    char _p_status[32];
+    jg_xdec(_p_status, kProcSelfStatus, sizeof(kProcSelfStatus));
+    if (jg_read_file_raw(_p_status, buf, (int)sizeof(buf)) < 0) return 0;
     const char* p = strstr(buf, "TracerPid:");
     if (!p) return 0;
     return atoi(p + 10);
@@ -296,14 +320,20 @@ static int _scan_ptrace_self(void) {
 static int _comm_cb(const char* name, void* ud) {
     (void)ud;
     char path[96];
-    snprintf(path, sizeof(path), "/proc/self/task/%s/comm", name);
+    char _p_comm[40];
+    jg_xdec(_p_comm, kProcTaskComm, sizeof(kProcTaskComm));
+    snprintf(path, sizeof(path), _p_comm, name);
     char comm[64];
     if (jg_read_file_raw(path, comm, (int)sizeof(comm)) < 0) return 0;
     size_t n = strlen(comm);
     while (n > 0 && (comm[n-1] == '\n' || comm[n-1] == '\r')) comm[--n] = 0;
-    if (strncmp(comm, "gum-js-loop", 12) == 0 ||
-        strncmp(comm, "pool-frida", 11) == 0 ||
-        strncmp(comm, "frida", 6) == 0) {
+    char _t0[16], _t1[16], _t2[16];
+    jg_xdec(_t0, kGumJsLoop, sizeof(kGumJsLoop));
+    jg_xdec(_t1, kPoolFrida, sizeof(kPoolFrida));
+    jg_xdec(_t2, kFrida, sizeof(kFrida));
+    if (strncmp(comm, _t0, 12) == 0 ||
+        strncmp(comm, _t1, 11) == 0 ||
+        strncmp(comm, _t2, 6) == 0) {
         return 1;   /* 命中，终止遍历 */
     }
     return 0;
@@ -314,7 +344,9 @@ static int _comm_cb(const char* name, void* ud) {
  * frida 的 glib 工作线程名。读取全程裸 syscall（getdents64 + openat/read），
  * frida hook libc prctl 改写线程名不影响我们直读内核视角的真实 comm。 */
 static int _scan_thread_names(void) {
-    return jg_for_each_dir("/proc/self/task", _comm_cb, NULL) == 1 ? 1 : 0;
+    char _p_task[32];
+    jg_xdec(_p_task, kProcSelfTask, sizeof(kProcSelfTask));
+    return jg_for_each_dir(_p_task, _comm_cb, NULL) == 1 ? 1 : 0;
 }
 
 /* =========================================================================
@@ -338,7 +370,10 @@ static void _add_port(int p) {
 
 /* 解析 /proc/net/tcp 与 tcp6（裸 syscall 读），收集 LISTEN 状态的本地监听端口 */
 static void _collect_listen_ports(void) {
-    static const char* files[] = {"/proc/net/tcp", "/proc/net/tcp6"};
+    char _f0[24], _f1[24];
+    jg_xdec(_f0, kProcNetTcp, sizeof(kProcNetTcp));
+    jg_xdec(_f1, kProcNetTcp6, sizeof(kProcNetTcp6));
+    const char* files[] = {_f0, _f1};
     char buf[16384];
     for (int f = 0; f < 2; f++) {
         if (jg_read_file_raw(files[f], buf, (int)sizeof(buf)) < 0) continue;

@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/system_properties.h>
 #include <android/log.h>
+#include "jg_strcrypt.h"  /* P4: 明文锚点 XOR(0x37) 编码，运行时解码 */
 
 #define TAG "JG-Integrity"
 
@@ -40,9 +41,11 @@ static void lower(char *s) { for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s += 3
 
 /* ---------- root 检测 ---------- */
 static int check_root(void) {
-    static const char *su[] = {
+    char magisk_core[32];
+    jgx_dec(JGX_MAGISK_CORE, magisk_core, sizeof(magisk_core));
+    const char *su[] = {
         "/system/bin/su", "/system/xbin/su", "/sbin/su",
-        "/su/bin/su", "/magisk/.core", "/data/local/bin/su", NULL
+        "/su/bin/su", magisk_core, "/data/local/bin/su", NULL
     };
     for (int i = 0; su[i]; i++) {
         if (access(su[i], F_OK) == 0) {
@@ -94,15 +97,17 @@ static int check_emulator(void) {
 
 /* ---------- 可疑线程名扫描 ---------- */
 static int scan_threads(void) {
-    static const char *bad[] = { "frida", "gum", "gmain", "magisk", "sandhook", "substrate", "xposed", NULL };
-    DIR *d = opendir("/proc/self/task");
+    char task[64];
+    jgx_dec(JGX_TASK, task, sizeof(task));
+    DIR *d = opendir(task);
     if (!d) return 0;
     int hits = 0;
     struct dirent *e;
-    char path[80], name[32];
+    char fmt[80], path[96], name[32];
+    jgx_dec(JGX_TASK_COMM, fmt, sizeof(fmt));
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') continue;
-        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+        snprintf(path, sizeof(path), fmt, e->d_name);
         FILE *f = fopen(path, "rb");
         if (!f) continue;
         size_t n = fread(name, 1, sizeof(name) - 1, f);
@@ -111,9 +116,11 @@ static int scan_threads(void) {
         while (n > 0 && (name[n-1] == '\n' || name[n-1] == '\0')) name[--n] = '\0';
         name[sizeof(name)-1] = '\0';
         lower(name);
-        for (int k = 0; bad[k]; k++) {
-            if (strstr(name, bad[k])) {
-                __android_log_print(ANDROID_LOG_WARN, TAG, "thread '%s' matches '%s'", name, bad[k]);
+        char kw[32];
+        for (int k = 0; k < (int)JGX_BAD_N; k++) {
+            jgx_tbl(JGX_BAD, k, kw, sizeof(kw));
+            if (strstr(name, kw)) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "thread '%s' matches '%s'", name, kw);
                 hits++; break;
             }
         }
@@ -125,7 +132,9 @@ static int scan_threads(void) {
 /* ---------- libjgguard.so 自身被改为可写（自保护 / 自篡改） ---------- */
 static int check_self_writable(void) {
     char buf[16384];
-    if (read_file("/proc/self/maps", buf, sizeof(buf)) < 0) return 0;
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    if (read_file(path, buf, sizeof(buf)) < 0) return 0;
     char *p = buf;
     int hit = 0;
     while (*p) {
@@ -151,7 +160,9 @@ static int check_self_hook(void) {
     if (!fn) return 0;
     uintptr_t faddr = (uintptr_t)fn;
     char buf[16384];
-    if (read_file("/proc/self/maps", buf, sizeof(buf)) < 0) return 0;
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    if (read_file(path, buf, sizeof(buf)) < 0) return 0;
     uintptr_t so_min = 0, so_max = 0;
     char *p = buf;
     while (*p) {
@@ -188,7 +199,9 @@ static int check_self_hook(void) {
 /* ---------- 全进程 RWX 区域计数（信息性，不计入 issue） ---------- */
 static int count_rwx(void) {
     char buf[16384];
-    if (read_file("/proc/self/maps", buf, sizeof(buf)) < 0) return 0;
+    char path[64];
+    jgx_dec(JGX_MAPS, path, sizeof(path));
+    if (read_file(path, buf, sizeof(buf)) < 0) return 0;
     int n = 0;
     char *p = buf;
     while (*p) {

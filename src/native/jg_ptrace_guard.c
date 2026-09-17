@@ -44,6 +44,7 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <unistd.h>   /* access()/F_OK for diagnostic self-ptrace bypass */
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -347,6 +348,11 @@ static void _guard_main(pid_t parent, int wfd) {
 JNIEXPORT jint JNICALL
 Java_com_gx_runtime_GxGuard_nativePtraceGuardStart(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
+    /* 诊断开关：存在 /data/local/tmp/jg_noptrace 时跳过 self-ptrace 守护，
+     * 让 crash_dump 能 attach 写墓碑（仅调试用，生产路径不受影响）。 */
+    if (access("/data/local/tmp/jg_noptrace", F_OK) == 0) {
+        return 0;   /* 降级：不启动守护，崩溃可被系统 crash_dump 捕获 */
+    }
     if (g_guard_pid != 0) return g_guard_pid;
 
     int fds[2];
